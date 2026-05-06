@@ -6,6 +6,14 @@ bin-release/
 
 # Other files and folders
 .settings/
+build/
+install/
+log/
+src/.trae/
+JetArm/
+landerpi/
+songjia_a1/
+xflz_robot_car1.zip
 
 # Executables
 *.swf
