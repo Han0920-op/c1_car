@@ -21,6 +21,8 @@ xflz_robot_car1/
 在 RViz 中查看机器人模型，通过滑块控制关节运动。
 
 ```bash
+colcon build --packages-select car1_description
+source install/setup.bash
 ros2 launch car1_description display.launch.py
 ```
 
@@ -35,6 +37,8 @@ ros2 launch car1_description display.launch.py
 使用 MoveIt2 进行机械臂运动规划和夹爪控制。
 
 ```bash
+colcon build --packages-select car1_moveit_config
+source install/setup.bash
 ros2 launch car1_moveit_config demo.launch.py
 ```
 
