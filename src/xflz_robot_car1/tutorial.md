@@ -232,7 +232,71 @@ ros2 topic pub /arm_controller/joint_trajectory trajectory_msgs/msg/JointTraject
 
 在 Gazebo 界面中应该能看到机械臂跟随指令运动。
 
-### 3.4 常见问题
+### 3.4 抓取演示 (Pick-and-Place)
+
+在 Gazebo 中完成固定位置的物体抓取与放置，验证机械臂运动学逆解。
+
+#### 启动方式
+
+```bash
+cd ~/xflz_robot_car1_ros2_ws
+colcon build --packages-select car1_description car1_gazebo
+source install/setup.bash
+
+# 默认模式：几何 IK 自动抓取
+ros2 launch car1_gazebo grasp_demo.launch.py
+
+# 手动参考模式：使用预设关节角度抓取
+ros2 launch car1_gazebo grasp_demo.launch.py mode:=manual
+
+# 仅启动环境（用于手动控制调试）
+ros2 launch car1_gazebo grasp_demo.launch.py mode:=none
+```
+
+#### 模式说明
+
+| mode 参数 | 说明 |
+|-----------|------|
+| `ik` (默认) | 使用几何法逆运动学解算，自动计算关节角度完成抓取 |
+| `manual` | 使用手动调试得到的参考关节角度，直接执行抓取序列 |
+| `none` | 仅启动仿真环境（Gazebo + 机器人 + 方块 + 控制器），不执行抓取 |
+
+#### 场景说明
+
+- 红色方块（40mm）放置在机器人正前方 0.25m 处
+- 抓取后放置到右前方 (0.20, 0.10) 位置
+- 完整流程：张开夹爪 → pre-grasp → 下降抓取 → 闭合夹爪 → 提升 → 移动到放置点 → 释放 → 回到零位
+
+#### 手动控制模式
+
+当 `mode:=none` 时，可在另一个终端启动手动控制工具：
+
+```bash
+source ~/xflz_robot_car1_ros2_ws/install/setup.bash
+ros2 run car1_gazebo manual_control.py
+```
+
+手动控制命令：
+
+```
+a j1 j2 j3 j4 j5   — 设置机械臂 5 个关节角度（弧度）
+g value             — 设置夹爪开合（0=闭合, 0.8=张开）
+r                   — 读取当前关节状态
+h                   — 回到零位
+q                   — 退出
+```
+
+示例操作：
+
+```
+>>> g 0.8                       # 张开夹爪
+>>> a 0 -1.05 -1.05 -1.2 0     # 移动到抓取位置
+>>> g 0                         # 闭合夹爪
+>>> a 0 -0.85 -1.05 -1.2 0     # 提升
+>>> h                           # 回到零位
+```
+
+### 3.5 常见问题
 
 #### Q: Mesh 文件找不到（GUI 错误）
 

@@ -45,6 +45,14 @@ def process_urdf(context, *args, **kwargs):
         launch_arguments={'gz_args': ['-r empty.sdf']}.items()
     )
 
+    # Gazebo-ROS 时钟桥接
+    clock_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
+        output='screen'
+    )
+
     # Robot State Publisher
     robot_state_publisher = Node(
         package='robot_state_publisher',
@@ -112,6 +120,7 @@ def process_urdf(context, *args, **kwargs):
     # 返回节点列表
     return [
         gazebo,
+        clock_bridge,
         robot_state_publisher,
         joint_state_publisher,
         spawn_entity,
