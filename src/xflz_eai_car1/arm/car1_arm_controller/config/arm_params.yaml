@@ -1,0 +1,32 @@
+/**:
+  ros__parameters:
+    # 机械臂连杆参数（单位：米）
+    d1: 0.1005      # 底座高度 (arm_base_joint.z + arm_joint1.z = 0.057 + 0.0435)
+    a2: 0.12614     # 大臂长度
+    a3: 0.12614     # 小臂长度
+    a4: 0.151       # joint4 到 tcp_link 距离（夹爪张开时的指尖位置，0.0744 + 0.0762）
+
+    # 关节限位（单位：弧度）
+    joint_limits:
+      arm_joint1: [-3.14, 3.14]
+      arm_joint2: [-3.14, 3.14]
+      arm_joint3: [-3.14, 3.14]
+      arm_joint4: [-3.14, 3.14]
+      arm_joint5: [-3.14, 3.14]
+
+    # 舵机 ID 映射
+    servo_ids:
+      arm_joint1: 1
+      arm_joint2: 2
+      arm_joint3: 3
+      arm_joint4: 4
+      arm_joint5: 5
+      gripper: 10
+
+    # 夹爪参数
+    gripper_open_angle: 0.8    # 张开角度（弧度）
+    gripper_close_angle: 0.0   # 闭合角度（弧度）
+
+    # 运动参数
+    default_duration: 2.0      # 默认运动时间（秒）
+    gripper_duration: 1.0      # 夹爪运动时间（秒）
