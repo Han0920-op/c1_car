@@ -112,7 +112,7 @@ class BaseDriverNode(Node):
                     get_package_share_directory('calibration'), 'config', 'servo_offsets.yaml')
             except Exception:
                 config_path = os.path.expanduser(
-                    '~/ros2_ws/src/xflz_robot_car1/calibration/config/servo_offsets.yaml')
+                    '~/ros2_ws/src/xflz_eai_car1/calibration/config/servo_offsets.yaml')
 
             if not os.path.exists(config_path):
                 return offsets

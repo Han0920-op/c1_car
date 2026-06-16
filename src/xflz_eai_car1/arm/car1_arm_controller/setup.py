@@ -20,7 +20,7 @@ setup(
     zip_safe=True,
     maintainer='TODO',
     maintainer_email='todo@example.com',
-    description='Arm controller for xflz_robot_car1',
+    description='Arm controller for xflz_eai_car1',
     license='TODO',
     tests_require=['pytest'],
     entry_points={

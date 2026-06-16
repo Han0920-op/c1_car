@@ -50,14 +50,11 @@ include_directories(
 )
 
 if(CROSS_COMPILE)
-link_directories(
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/lib/${CROSS_COMPILE}
-)
+set(ASCAMERA_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libs/lib/${CROSS_COMPILE})
 else()
-link_directories(
-  ${CMAKE_CURRENT_SOURCE_DIR}/libs/lib/${gcc_target}
-)
+set(ASCAMERA_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libs/lib/${gcc_target})
 endif()
+link_directories(${ASCAMERA_LIB_DIR})
 
 add_executable(
   ascamera_node 
@@ -91,7 +88,15 @@ target_link_libraries(ascamera_node
   ${PCL_LIBRARIES}
 )
 
+set_target_properties(ascamera_node PROPERTIES
+  BUILD_WITH_INSTALL_RPATH TRUE
+  INSTALL_RPATH "$ORIGIN")
+
 install(TARGETS ascamera_node
+  DESTINATION lib/${PROJECT_NAME})
+
+file(GLOB ASCAMERA_VENDOR_LIBS ${ASCAMERA_LIB_DIR}/*.so)
+install(FILES ${ASCAMERA_VENDOR_LIBS}
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch

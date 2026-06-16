@@ -14,7 +14,7 @@ def generate_launch_description():
         parameters=[
             {"usb_bus_no": -1},
             {"usb_path": "null"},
-            {"confiPath": "/home/iflytek/ros2_ws/src/xflz_robot_car1/examples/camera/HP60C/src/ascamera/configurationfiles"},
+            {"confiPath": "/home/iflytek/ros2_ws/src/xflz_eai_car1/examples/camera/HP60C/src/ascamera/configurationfiles"},
             {"color_pcl": False},
             {"pub_tfTree": True},
             {"depth_width": 640},

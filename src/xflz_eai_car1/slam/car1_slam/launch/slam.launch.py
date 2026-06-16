@@ -18,7 +18,7 @@ def generate_launch_description():
     urdf_file = os.path.join(description_pkg, 'urdf', 'car1.urdf')
     rviz_config = os.path.join(slam_pkg, 'rviz', 'slam.rviz')
     if not os.path.exists(rviz_config):
-        rviz_config = '/home/iflytek/ros2_ws/src/xflz_robot_car1/slam/car1_slam/rviz/slam.rviz'
+        rviz_config = '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/rviz/slam.rviz'
 
     with open(urdf_file, 'r') as f:
         robot_desc = f.read()

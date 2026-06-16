@@ -3,7 +3,7 @@
 <package format="3">
   <name>car1_arm_controller</name>
   <version>0.0.0</version>
-  <description>Arm controller for xflz_robot_car1 - provides high-level arm control interface</description>
+  <description>Arm controller for xflz_eai_car1 - provides high-level arm control interface</description>
   <maintainer email="todo@example.com">TODO</maintainer>
   <license>TODO</license>
 

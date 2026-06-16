@@ -12,7 +12,7 @@ Level 1 验证脚本：IK → 角度 → PWM 完整链路测试
 """
 import sys
 import math
-sys.path.insert(0, '/home/iflytek/ros2_ws/src/xflz_robot_car1/arm/kinematics/kinematics')
+sys.path.insert(0, '/home/iflytek/ros2_ws/src/xflz_eai_car1/arm/kinematics/kinematics')
 
 from transform import angle2pulse, pulse2angle, check_limits, SCALE
 from ik_demo import compute_ik, compute_fk_simple

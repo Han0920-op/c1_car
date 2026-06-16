@@ -1190,6 +1190,64 @@ ros2 run rqt_image_view rqt_image_view
 - **相机无图像**：检查 USB 连接和驱动
 - **点云数据异常**：检查相机内参配置
 
+### 2.2.1 单独验证 HP60C 深度相机（厂商原始案例）
+
+> 上面的 `peripherals.launch.py` 是项目集成入口。如果只想**单独验证相机硬件本身**，可直接用厂商自带的 ascamera 案例启动，这条路径已实测可用。
+
+**首次使用前：配置 udev 权限 + 编译**
+
+```bash
+# 1. USB 设备授权（首次必做）
+cd ~/ros2_ws/src/xflz_eai_car1/examples/camera/HP60C/src/ascamera/scripts
+sudo ./create_udev_rules.sh
+
+# 2. 编译并 source
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select ascamera
+source install/setup.bash
+```
+
+> **编译说明**：原始 CMakeLists 只安装可执行文件、不安装厂商 SDK 动态库，启动会报
+> `libAngstrongCameraSdk.so: cannot open shared object file`（退出码 127）。
+> 已在 `CMakeLists.txt` 修复：把 `libs/lib/<arch>/*.so` 一并装进可执行文件同目录，
+> 并给 `ascamera_node` 设 `INSTALL_RPATH "$ORIGIN"`。重新编译即可正常启动。
+
+**启动相机**
+
+```bash
+ros2 launch ascamera hp60c.launch.py
+```
+
+启动成功的标志：日志依次出现 `attached` → `camera opened` → `start streaming`。
+末尾出现 `stop streaming` 是**正常**的——相机按需推流，没有订阅者时自动停流省资源，
+一旦有节点订阅（如下面的 rqt）会自动重新 `start streaming`。
+中途的 `getMjpegSize ... failed` 紧跟着 `mjpeg size:640x480`，走了 fallback，可忽略。
+
+**用 rqt_image_view 查看图像（已验证可用）**
+
+```bash
+# 另开一个终端
+cd ~/ros2_ws
+source install/setup.bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+在 rqt 窗口左上角的话题下拉框中选择：
+
+| 话题 | 内容 |
+|------|------|
+| `/ascamera_hp60c/camera_publisher/rgb0/image` | RGB 彩色图 |
+| `/ascamera_hp60c/camera_publisher/depth0/image_raw` | 深度图（16UC1，单位 mm，0=无效） |
+
+> **话题命名空间是 `ascamera_hp60c`**（不是项目集成版的 `/depth_cam/...`）。
+> 厂商驱动靠话题名里的 `rgb0`/`depth0` 子串决定开哪路数据流，**切勿 remap 话题名**。
+
+**验证要点**：
+- [ ] `ros2 launch ascamera hp60c.launch.py` 正常启动（出现 `start streaming`）
+- [ ] rqt_image_view 能显示 RGB 图像
+- [ ] rqt_image_view 能显示深度图（近处灰、远处亮，近距 <0.5m 有空洞属正常硬件盲区）
+
 ### 2.3 键盘遥控
 
 ```bash

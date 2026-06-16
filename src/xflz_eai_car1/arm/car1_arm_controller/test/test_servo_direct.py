@@ -427,7 +427,7 @@ def export_yaml(actions, output_path=None):
         desc = input("  描述 (回车跳过): ").strip() or f"{name} action"
         default_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            'src/xflz_robot_car1/arm/car1_arm_controller/config/actions')
+            'src/xflz_eai_car1/arm/car1_arm_controller/config/actions')
         output_path = os.path.join(default_dir, f'{name}.yaml')
     else:
         name = os.path.splitext(os.path.basename(output_path))[0]

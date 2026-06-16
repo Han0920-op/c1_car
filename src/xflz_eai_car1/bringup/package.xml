@@ -3,7 +3,7 @@
 <package format="3">
   <name>car1_bringup</name>
   <version>0.0.0</version>
-  <description>Bringup package for xflz_robot_car1</description>
+  <description>Bringup package for xflz_eai_car1</description>
   <maintainer email="TODO@email.com">TODO</maintainer>
   <license>TODO</license>
 

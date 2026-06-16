@@ -18,7 +18,7 @@ setup(
     zip_safe=True,
     maintainer='TODO',
     maintainer_email='TODO@email.com',
-    description='Bringup package for xflz_robot_car1',
+    description='Bringup package for xflz_eai_car1',
     license='TODO',
     tests_require=['pytest'],
     entry_points={

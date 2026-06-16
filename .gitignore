@@ -15,6 +15,18 @@ landerpi/
 songjia_a1/
 xflz_robot_car1.zip
 
+# Claude Code
+CLAUDE.md
+src/xflz_eai_car1/CLAUDE.md
+.claude/
+
+# Unused source directories
+src/lander_pi/
+
+# HP60C camera examples - only keep ascamera
+src/xflz_eai_car1/examples/camera/HP60C/src/*
+!src/xflz_eai_car1/examples/camera/HP60C/src/ascamera/
+
 # Executables
 *.swf
 *.air
