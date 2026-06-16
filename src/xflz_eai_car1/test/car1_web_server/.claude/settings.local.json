@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ':*)",
+      "Bash(python server_cors.py:*)",
+      "Bash(node -e ':*)",
+      "Bash(node -p ':*)",
+      "Bash(tasklist)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill:*)",
+      "Bash(ls:*)",
+      "Bash(rm:*)",
+      "Bash(awk 'NR>=1640 && NR<=1650' index.html)",
+      "Bash(node -c index.html)",
+      "Bash(node:*)",
+      "Bash(awk '/name=\"j5_joint\"/,/axis/ {print NR\": \"$0}' urdf/car1.urdf)",
+      "Bash(awk '/^function buildFKIKPanel/,/^}$/ {print NR\": \"$0}' index.html)"
+    ]
+  }
+}

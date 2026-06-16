@@ -15,10 +15,13 @@ landerpi/
 songjia_a1/
 xflz_robot_car1.zip
 
-# Claude Code
-CLAUDE.md
-src/xflz_eai_car1/CLAUDE.md
-.claude/
+# Claude Code - ignore runtime/local data, keep engineering config
+.claude/settings.local.json
+.claude/projects/
+.claude/session-backups/
+.claude/logs/
+.claude/cache/
+.claude/conversations/
 
 # Unused source directories
 src/lander_pi/

@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs ls -la)",
+      "Bash(timeout 10 ros2 topic list)",
+      "Bash(timeout 15 ros2 topic *)",
+      "Bash(cat)",
+      "Bash(chmod +x /tmp/monitor_servo.sh)",
+      "Bash(timeout 5 ros2 topic echo /car1_base_driver/bus_servo/set_position)",
+      "Bash(ros2 topic *)",
+      "Read(//dev/**)",
+      "Bash(python3 kinematics/test_fk_ik.py)",
+      "Bash(python3 test_fk_ik.py)",
+      "Bash(python3 *)",
+      "Bash(udevadm info *)",
+      "Bash(grep -E \"\\\\.py$|total\")",
+      "Bash(sudo chmod 666 /dev/ttyUSB0)",
+      "Bash(ros2 service *)",
+      "Bash(ros2 run *)"
+    ]
+  }
+}
