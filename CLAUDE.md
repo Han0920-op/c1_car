@@ -125,7 +125,7 @@ car1_base_driver ──────────▶ car1_servo_controller
 - **simulations/** — `car1_description` (URDF), `car1_gazebo` (worlds + grasp demos), `car1_moveit_config`.
 - **bringup/** — `car1_bringup` (system launch).
 - **examples/** — vendor sensor examples (COIN-D6 lidar, HP60C camera, yahboomcar_*, ORB-SLAM2).
-- **test/** — `car1_web_server` (`server_cors.py` + urdf/meshes/viewer for browser URDF viewing).
+- **test/** — `car1_web_server` (`server_cors.py` + urdf/meshes/viewer for browser URDF viewing); `camera_web_viewer` (Flask+SocketIO server streaming HP60C RGB/Depth/pointcloud to a LAN browser on `0.0.0.0:8000`, with 2D dual view, 3D point cloud, and click-to-measure depth — launch via `ros2 launch camera_web_viewer camera_viewer.launch.py`).
 
 ### Velocity Command Routing
 

@@ -1248,6 +1248,96 @@ ros2 run rqt_image_view rqt_image_view
 - [ ] rqt_image_view 能显示 RGB 图像
 - [ ] rqt_image_view 能显示深度图（近处灰、远处亮，近距 <0.5m 有空洞属正常硬件盲区）
 
+### 2.2.2 HP60C 深度相机 Web 查看器（局域网浏览器）
+
+> 位于 `test/camera_web_viewer/`。它把 HP60C 的 RGB / 深度 / 点云通过浏览器实时显示，
+> 局域网内任何设备（手机、平板、另一台电脑）打开网页即可查看，无需在本机装 RViz/rqt。
+> 支持 2D 双画面、3D 点云、深度点击测距。
+
+**功能一览**：
+
+| 功能 | 说明 |
+|------|------|
+| 2D 视图 | RGB（左）+ Depth（右）并排实时显示，各自带 FPS |
+| 3D 视图 | 点云渲染（Three.js），鼠标可旋转/缩放，支持重置视角、调点大小 |
+| 深度测距 | 点击 Depth 画面任意点，显示该像素 `X / Y / 深度(m)`，并随画面持续刷新；右键清除 |
+| 深度可视化 | TURBO 伪彩色，量程 0–5m |
+| FPS 监控 | 侧边栏显示 RGB / Depth / 点云 / Web 接收四路帧率 |
+
+**一次性依赖安装**（Web 框架）：
+
+```bash
+# 注意：要装到运行 ROS 节点的同一个 Python。launch 入口脚本使用 /usr/bin/python3，
+# 所以这里用系统 python 安装，避免启动时报 ModuleNotFoundError: flask
+/usr/bin/python3 -m pip install flask flask-socketio simple-websocket
+```
+
+> 前端依赖（three.js r128、OrbitControls、pako、socket.io）已随包打包在
+> `static/libs/`，局域网内**无需联网**即可加载。
+
+**编译**：
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select camera_web_viewer --symlink-install
+source install/setup.bash
+```
+
+**启动**（一条命令同时拉起相机驱动 + Web 服务）：
+
+```bash
+ros2 launch camera_web_viewer camera_viewer.launch.py
+```
+
+启动后日志会打印监听地址，例如：
+
+```
+Web server: http://0.0.0.0:8000  (LAN accessible)
+ * Running on http://10.1.134.42:8000      ← 当前网卡 IP（会随网络变化）
+```
+
+`0.0.0.0` 表示监听所有网卡，局域网其他设备用**本机当前 IP** 访问即可：
+
+```
+http://<本机IP>:8000
+```
+
+本机 IP 用 `hostname -I` 或 `ip addr` 查询。
+
+> **相机话题**：launch 里启用了 `color_pcl:=True`（点云带 RGB 上色），
+> Web 服务订阅的是相机**原生话题**（带 `camera_publisher` 段，切勿 remap）：
+> ```
+> /ascamera_hp60c/camera_publisher/rgb0/image
+> /ascamera_hp60c/camera_publisher/depth0/image_raw
+> /ascamera_hp60c/camera_publisher/depth0/points
+> ```
+
+**验证要点**：
+
+- [ ] 浏览器打开 `http://<本机IP>:8000`，左 RGB 右 Depth 实时显示
+- [ ] 点击 Depth 画面，标签显示 `X / Y / 深度`，且数值随画面刷新
+- [ ] 深度无效区域（太近/太远/空洞）标签显示红色"无效"
+- [ ] 切到 3D 标签能看到点云，鼠标可旋转缩放
+- [ ] 侧边栏四路 FPS 正常跳动
+
+**常见问题**：
+
+| 现象 | 原因 | 解决方案 |
+|------|------|---------|
+| `Address already in use` / `Port 8000 is in use` | 上次的服务进程没退干净 | `ss -ltnp \| grep :8000` 查 PID，`kill -9 <pid>` |
+| `ModuleNotFoundError: flask` | flask 没装到 `/usr/bin/python3` | 用 `/usr/bin/python3 -m pip install flask flask-socketio simple-websocket` |
+| 网页打开但无画面 | 相机话题没数据 / 订阅错话题 | `ros2 topic hz /ascamera_hp60c/camera_publisher/rgb0/image`（等≥10s）确认有数据 |
+| 延迟好几秒 | QoS 队列堆积 | 已用 sensor_data QoS（best_effort + keep_last 1）修复；如自行改过订阅需保持 |
+| 深度值不刷新 | — | 已实现"粘性追踪点"，点击后每帧更新；右键可清除 |
+| 局域网其他设备打不开 | 防火墙挡了 8000 端口 | 放行 8000：`sudo ufw allow 8000`（如启用了 ufw） |
+
+> **停止服务**：`Ctrl+C`，或后台运行时 `pkill -f "launch camera_web_viewer"`。
+
+> **另一个 Web 工具**：`test/car1_web_server/` 是纯静态的 URDF 浏览器查看器
+> （`python3 server_cors.py [端口]` 启动，默认 8080，访问 `http://<IP>:端口/viewer/`），
+> 用于在浏览器里查看机器人 URDF 模型，与相机查看器互不相关。
+
 ### 2.3 键盘遥控
 
 ```bash
