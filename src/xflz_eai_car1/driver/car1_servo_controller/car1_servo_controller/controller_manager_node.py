@@ -106,6 +106,12 @@ class ControllerManagerNode(Node):
         self.get_state_client = self.create_client(
             GetBusServoState, namespace + '/car1_base_driver/bus_servo/get_state'
         )
+        # Wait so the timer doesn't start ticking before service discovery completes.
+        # Without this, service_is_ready() may stay False and _kick_off_one_read silently
+        # returns every tick → no PRAD sent → joint_states stuck at init (all zeros).
+        self.get_logger().info('Waiting for car1_base_driver/bus_servo/get_state...')
+        self.get_state_client.wait_for_service()
+        self.get_logger().info('get_state service ready, readback enabled.')
 
         # Cache for last known actual positions (fallback when readback fails)
         self.last_actual_positions = {}

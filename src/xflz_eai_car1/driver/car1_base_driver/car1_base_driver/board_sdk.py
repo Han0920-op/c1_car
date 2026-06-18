@@ -363,7 +363,6 @@ class Board:
                     # 阻塞等待响应（超时 1 秒）
                     data = self.bus_servo_queue.get(block=True, timeout=1.0)
                 except Exception:
-                    # 超时或队列异常
                     return None
 
                 # 检查数据长度
@@ -373,33 +372,23 @@ class Board:
                 try:
                     # 解析响应
                     result = struct.unpack(fmt, data[:expected_size])
-                    # 响应字节布局: req_id(1) + cmd_echo(1) + error_code(1) + payload...
-                    # result[0] = req_id（请求时的舵机 ID 回显）
-                    # result[1] = cmd_echo（请求时的子命令回显，如 0x05=读位置）
-                    # result[2] = error_code（0 表示成功）
-                    # result[3:] = 实际数据（位置、温度等）
-
                     response_id = result[0]
                     response_cmd = result[1]
                     error_code = result[2]
 
                     # 校验 cmd 和 servo_id 是否匹配
                     if response_cmd != cmd or response_id != servo_id:
-                        # ID 不匹配：可能是上次的延迟响应
-                        # 丢弃此响应，继续等待下一个
                         if attempt < max_attempts - 1:
-                            continue  # 还有重试机会，继续
+                            continue
                         else:
-                            return None  # 最后一次仍不匹配，返回失败
+                            return None
 
                     # 检查错误码
                     if error_code != 0:
-                        return None  # STM32 返回错误
+                        return None
 
-                    # 成功：返回数据
                     return result[3:]
                 except Exception:
-                    # 解析错误
                     continue
 
             # 超过最大重试次数

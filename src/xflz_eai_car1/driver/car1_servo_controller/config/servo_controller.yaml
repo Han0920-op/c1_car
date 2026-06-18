@@ -14,4 +14,4 @@
       gripper_controller:
         joints: [r_joint]
         action_name: gripper_controller/follow_joint_trajectory
-    publish_rate: 20.0  # Each tick reads ONE servo (round-robin); 6 servos refresh in ~0.3s
+    publish_rate: 3.0  # Each tick reads ONE servo (round-robin); 6 servos refresh in ~2s. Low rate keeps serial bandwidth for motor/IMU; arm is static during detection so high-rate readback is unneeded.
