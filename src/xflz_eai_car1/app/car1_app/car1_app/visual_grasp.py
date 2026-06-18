@@ -45,11 +45,21 @@ class VisualGraspNode(Node):
         # observe_pose pitch convention (matches arm_controller/ik_analytical):
         #   0=up, pi/2=horizontal, pi=down. Observation should look down at table.
         self.declare_parameter('observe_pose', [0.20, 0.0, 0.22, 3.14159])
-        self.declare_parameter('target_color_hsv_lower', [0, 100, 80])
+        # Red wraps around the HSV hue circle, so we need TWO ranges OR'd together:
+        # low-H end (0-10) and high-H end (160-180). Measured cube is mostly high-H
+        # (H 167-178, S down to 80), so the second range is what actually catches it.
+        self.declare_parameter('target_color_hsv_lower', [0, 80, 60])
         self.declare_parameter('target_color_hsv_upper', [10, 255, 255])
+        self.declare_parameter('target_color_hsv_lower2', [160, 80, 60])
+        self.declare_parameter('target_color_hsv_upper2', [180, 255, 255])
         self.declare_parameter('depth_sample_size', 5)
         self.declare_parameter('max_detection_attempts', 5)
         self.declare_parameter('verify_after_pick', False)
+        # dry_run: detect and print base_link coords, then STOP. Does NOT publish the
+        # detected target_pose (which would trigger arm_controller to move) and does NOT
+        # call pick. Use this to verify localization accuracy safely (arm only goes UP to
+        # the observe pose, never descends toward the object).
+        self.declare_parameter('dry_run', False)
 
         # Get parameters
         observe_pose = self.get_parameter('observe_pose').value
@@ -58,9 +68,14 @@ class VisualGraspNode(Node):
         hsv_upper = self.get_parameter('target_color_hsv_upper').value
         self.hsv_lower = np.array(hsv_lower, dtype=np.uint8)
         self.hsv_upper = np.array(hsv_upper, dtype=np.uint8)
+        hsv_lower2 = self.get_parameter('target_color_hsv_lower2').value
+        hsv_upper2 = self.get_parameter('target_color_hsv_upper2').value
+        self.hsv_lower2 = np.array(hsv_lower2, dtype=np.uint8)
+        self.hsv_upper2 = np.array(hsv_upper2, dtype=np.uint8)
         self.depth_sample_size = self.get_parameter('depth_sample_size').value
         self.max_attempts = self.get_parameter('max_detection_attempts').value
         self.verify_after_pick = self.get_parameter('verify_after_pick').value
+        self.dry_run = self.get_parameter('dry_run').value
 
         # CV Bridge
         self.bridge = CvBridge()
@@ -107,6 +122,12 @@ class VisualGraspNode(Node):
         self.target_pose_pub = self.create_publisher(
             PoseStamped, '/arm_controller/target_pose', 10
         )
+
+        # Debug image publishers: view in rqt to SEE what the camera sees and what
+        # HSV catches. /visual_grasp/debug_image = RGB with detected contour drawn;
+        # /visual_grasp/mask = raw HSV mask (white = pixels matching the color range).
+        self.debug_image_pub = self.create_publisher(Image, '/visual_grasp/debug_image', 1)
+        self.mask_pub = self.create_publisher(Image, '/visual_grasp/mask', 1)
 
         # Service client for pick
         self.pick_client = self.create_client(Trigger, '/arm_controller/pick')
@@ -201,10 +222,10 @@ class VisualGraspNode(Node):
         self._change_state(State.WAIT_STABLE)
 
     def _handle_wait_stable(self):
-        """Wait for arm and TF to stabilize."""
+        """Wait for arm to reach observation pose (or skip if already there)."""
         elapsed = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
-        if elapsed > 3.0:  # Wait 3 seconds
-            self.get_logger().info('Arm stabilized, starting detection...')
+        if elapsed > 3.0:  # Wait 3 seconds for arm movement
+            self.get_logger().info('Starting detection (using manual TF, not waiting for arm)...')
             self.detection_attempts = 0
             self._change_state(State.DETECT)
 
@@ -218,7 +239,14 @@ class VisualGraspNode(Node):
         if result is not None:
             self.detected_point_base = result
             self.get_logger().info(f'Object detected at base_link: [{result[0]:.3f}, {result[1]:.3f}, {result[2]:.3f}]')
-            self._change_state(State.COMPUTE_TARGET)
+            if self.dry_run:
+                self.get_logger().warn(
+                    '[DRY_RUN] Localization only. Measure the cube with a ruler and compare to '
+                    f'the base_link coords above [{result[0]:.3f}, {result[1]:.3f}, {result[2]:.3f}] '
+                    '(target <1.5cm). NOT publishing target_pose, NOT calling pick. Stopping.')
+                self._change_state(State.DONE)
+            else:
+                self._change_state(State.COMPUTE_TARGET)
         else:
             self.detection_attempts += 1
             if self.detection_attempts >= self.max_attempts:
@@ -226,6 +254,25 @@ class VisualGraspNode(Node):
                 self._change_state(State.FAILED)
             else:
                 self.get_logger().warn(f'Detection attempt {self.detection_attempts}/{self.max_attempts} failed, retrying...')
+
+    def _publish_mask(self, mask):
+        """Publish the HSV mask as a mono8 image for rqt inspection."""
+        try:
+            self.mask_pub.publish(self.bridge.cv2_to_imgmsg(mask, encoding='mono8'))
+        except Exception as e:
+            self.get_logger().error(f'mask publish failed: {e}')
+
+    def _publish_debug_image(self, rgb, contour, center=None):
+        """Publish RGB with the detected contour + center drawn, for rqt inspection."""
+        try:
+            img = rgb.copy()
+            if contour is not None:
+                cv2.drawContours(img, [contour], -1, (0, 255, 0), 2)
+            if center is not None:
+                cv2.circle(img, center, 6, (255, 0, 0), -1)
+            self.debug_image_pub.publish(self.bridge.cv2_to_imgmsg(img, encoding='bgr8'))
+        except Exception as e:
+            self.get_logger().error(f'debug image publish failed: {e}')
 
     def _detect_and_localize(self):
         """
@@ -238,42 +285,59 @@ class VisualGraspNode(Node):
             self.get_logger().warn('RGB frame too dark (likely first frame), skipping')
             return None
 
-        # HSV detection
+        # HSV detection — OR the two red ranges (red wraps around H=0/180)
         hsv = cv2.cvtColor(self.rgb_image, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
+        mask = cv2.bitwise_or(
+            cv2.inRange(hsv, self.hsv_lower, self.hsv_upper),
+            cv2.inRange(hsv, self.hsv_lower2, self.hsv_upper2),
+        )
 
         # Morphological operations
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
+        # Publish the raw mask so we can SEE in rqt what HSV catches (white pixels).
+        self._publish_mask(mask)
+
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
+            self.get_logger().warn(f'HSV found NO red contour (mask white px={int(mask.sum()/255)})')
+            self._publish_debug_image(self.rgb_image, None)
             return None
 
         # Use largest contour
         largest = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(largest)
         if area < 100:  # Min area threshold
+            self.get_logger().warn(f'Largest red contour too small: area={area:.0f} (<100)')
+            self._publish_debug_image(self.rgb_image, largest)
             return None
 
         # Get center pixel
         (u, v), radius = cv2.minEnclosingCircle(largest)
         u_int, v_int = int(u), int(v)
 
-        # Sample depth across the WHOLE detected contour (not just a 5x5 at center).
-        # The center pixel may fall in a depth hole; using the contour mask gives a
-        # robust median over all valid depth pixels belonging to the object.
+        # Annotated debug image: RGB with detected contour + center marked.
+        self._publish_debug_image(self.rgb_image, largest, (u_int, v_int))
+
+        # Sample depth at center region (more reliable than full contour which may
+        # include background edges). Use a small window around the center pixel.
         h, w = self.depth_image.shape[:2]
-        contour_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(contour_mask, [largest], -1, 255, thickness=cv2.FILLED)
-        object_depths = self.depth_image[(contour_mask > 0) & (self.depth_image > 0)]
+        sample_size = 10  # 10x10 window around center
+        v_min = max(0, v_int - sample_size//2)
+        v_max = min(h, v_int + sample_size//2)
+        u_min = max(0, u_int - sample_size//2)
+        u_max = min(w, u_int + sample_size//2)
+
+        center_region = self.depth_image[v_min:v_max, u_min:u_max]
+        object_depths = center_region[center_region > 0]
 
         if len(object_depths) == 0:
             self.get_logger().warn(
-                f'No valid depth in object region (center pixel=({u_int},{v_int}), '
-                f'area={area:.0f}). Object likely outside depth FOV (too low/close in image).')
+                f'No valid depth in center region (center pixel=({u_int},{v_int}), '
+                f'area={area:.0f}). Object likely outside depth FOV.')
             return None
 
         z_cam = float(np.median(object_depths))
@@ -286,26 +350,34 @@ class VisualGraspNode(Node):
         x_cam = (u - self.cx) * z_cam / self.fx
         y_cam = (v - self.cy) * z_cam / self.fy
 
-        # Transform to base_link via TF
-        try:
-            pt_stamped = PointStamped()
-            pt_stamped.header.frame_id = 'camera_depth_optical_frame'
-            pt_stamped.header.stamp = self.get_clock().now().to_msg()
-            pt_stamped.point.x = x_cam
-            pt_stamped.point.y = y_cam
-            pt_stamped.point.z = z_cam
+        # Debug: print every intermediate value so we can isolate which stage is wrong
+        # (HSV pixel / depth / back-projection / TF).
+        self.get_logger().info(
+            f'[DETECT] pixel=({u_int},{v_int}) area={area:.0f} valid_depth_px={len(object_depths)} '
+            f'z_cam={z_cam:.3f}m | cam_frame=({x_cam:.3f}, {y_cam:.3f}, {z_cam:.3f})')
 
-            transform = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_depth_optical_frame',
-                rclpy.time.Time(), timeout=Duration(seconds=1.0)
-            )
-            pt_base = do_transform_point(pt_stamped, transform)
+        # Transform to base_link manually (don't use TF which may use stale joint_states)
+        # At observation pose [0.2, 0, 0.22, pi]:
+        # - Camera at approximately [0.256, -0.003, 0.244] in base_link
+        # - Camera pointing down with ~5.31° forward tilt
+        # - Rotation matrix derived from URDF + observation pose FK
+        cam_x, cam_y, cam_z = 0.256, -0.003, 0.244
+        pitch_rad = 0.0927  # 5.31° in radians
+        cos_p, sin_p = 0.9957, 0.0925
 
-            return (pt_base.point.x, pt_base.point.y, pt_base.point.z)
+        # Rotation: optical frame → base_link (with 5.31° pitch)
+        # optical_x (image right) → base_y (left)
+        # optical_y (image down)  → -base_x (backward)
+        # optical_z (depth)       → -base_z (downward) with pitch correction
+        x_base = cam_x - y_cam
+        y_base = cam_y + cos_p * x_cam - sin_p * z_cam
+        z_base = cam_z - sin_p * x_cam - cos_p * z_cam
 
-        except Exception as e:
-            self.get_logger().error(f'TF transform failed: {e}')
-            return None
+        self.get_logger().info(
+            f'[MANUAL_TF] cam_pos=[{cam_x:.3f},{cam_y:.3f},{cam_z:.3f}], '
+            f'pitch={pitch_rad:.4f}rad → base_link=[{x_base:.3f},{y_base:.3f},{z_base:.3f}]')
+
+        return (x_base, y_base, z_base)
 
     def _handle_compute_target(self):
         """Compute target pose and publish."""

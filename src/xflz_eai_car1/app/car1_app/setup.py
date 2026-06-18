@@ -28,6 +28,8 @@ setup(
             'lidar_controller = car1_app.lidar_controller:main',
             'track_and_grab = car1_app.track_and_grab:main',
             'visual_grasp = car1_app.visual_grasp:main',
+            'test_hsv_detection = car1_app.test_hsv_detection:main',
+            'test_3d_localization = car1_app.test_3d_localization:main',
         ],
     },
 )

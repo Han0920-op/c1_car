@@ -29,12 +29,12 @@ def generate_launch_description():
             {"usb_bus_no": -1},
             {"usb_path": "null"},
             {"color_pcl": False},
-            {"pub_tfTree": True},
+            {"pub_tfTree": False},
             {"depth_width": 640},
             {"depth_height": 480},
             {"rgb_width": 640},
             {"rgb_height": 480},
-            {"fps": 15},
+            {"fps": 25},
         ],
         remappings=[]
     )

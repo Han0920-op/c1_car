@@ -37,11 +37,14 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'observe_pose': [0.20, 0.0, 0.22, 3.14159],  # x, y, z, pitch(rad). pitch=pi=gripper down
-            'target_color_hsv_lower': [0, 100, 80],     # Red lower bound
-            'target_color_hsv_upper': [10, 255, 255],   # Red upper bound
+            'target_color_hsv_lower': [0, 80, 60],       # Red low-H end
+            'target_color_hsv_upper': [10, 255, 255],
+            'target_color_hsv_lower2': [160, 80, 60],    # Red high-H end (cube measured at H167-178)
+            'target_color_hsv_upper2': [180, 255, 255],
             'depth_sample_size': 5,
-            'max_detection_attempts': 5,
-            'verify_after_pick': False
+            'max_detection_attempts': 10,  # 最多尝试10次检测
+            'verify_after_pick': False,
+            'dry_run': False  # 设置为False执行真实抓取
         }]
     )
 

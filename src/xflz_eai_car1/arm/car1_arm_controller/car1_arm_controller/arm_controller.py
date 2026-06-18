@@ -56,7 +56,7 @@ class ArmController(Node):
             ('gripper_duration', 1.0),
             ('gripper_open_angle', 0.8),
             ('gripper_close_angle', 0.0),
-            ('gripper_depth', 0.02),
+            ('gripper_depth', 0.0),  # 0 = tcp_link stops AT detected surface point; gripper straddles object, close to grasp (no descent)
             ('pre_grasp_height', 0.03),
             ('lift_height', 0.05),
             ('grasp_pitch', math.pi),  # 180° = end-effector pointing DOWN (ik_analytical convention)
@@ -341,7 +341,7 @@ class ArmController(Node):
         self._move_stepwise(joints, self.default_duration)
         self._check_stop()
 
-        # 3. Descend to grasp depth (gripper pointing down)
+        # 3. Descend to grasp point (= detected surface point when gripper_depth=0)
         joints = self._solve_or_raise(x, y, z - depth, pitch)
         self._move_joints(joints, 1.5)
         self._wait(1.8)
