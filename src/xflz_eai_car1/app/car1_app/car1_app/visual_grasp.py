@@ -10,6 +10,7 @@ Uses eye-in-hand camera (mounted on arm_link4) with look-then-move strategy:
 4. Execute pick via arm_controller
 """
 import enum
+import math
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
@@ -52,9 +53,14 @@ class VisualGraspNode(Node):
         self.declare_parameter('target_color_hsv_upper', [10, 255, 255])
         self.declare_parameter('target_color_hsv_lower2', [160, 80, 60])
         self.declare_parameter('target_color_hsv_upper2', [180, 255, 255])
-        self.declare_parameter('depth_sample_size', 5)
         self.declare_parameter('max_detection_attempts', 5)
-        self.declare_parameter('verify_after_pick', False)
+        # TF frames for localization. The detected pixel is back-projected into the
+        # depth optical frame (standard optical convention: x-right, y-down, z-forward),
+        # then transformed into base_link via the live TF tree (camera is eye-in-hand on
+        # arm_link4, so this transform changes with the arm pose -- it must be looked up,
+        # not hard-coded).
+        self.declare_parameter('camera_optical_frame', 'camera_depth_optical_frame')
+        self.declare_parameter('base_frame', 'base_link')
         # dry_run: detect and print base_link coords, then STOP. Does NOT publish the
         # detected target_pose (which would trigger arm_controller to move) and does NOT
         # call pick. Use this to verify localization accuracy safely (arm only goes UP to
@@ -72,9 +78,9 @@ class VisualGraspNode(Node):
         hsv_upper2 = self.get_parameter('target_color_hsv_upper2').value
         self.hsv_lower2 = np.array(hsv_lower2, dtype=np.uint8)
         self.hsv_upper2 = np.array(hsv_upper2, dtype=np.uint8)
-        self.depth_sample_size = self.get_parameter('depth_sample_size').value
         self.max_attempts = self.get_parameter('max_detection_attempts').value
-        self.verify_after_pick = self.get_parameter('verify_after_pick').value
+        self.camera_optical_frame = self.get_parameter('camera_optical_frame').value
+        self.base_frame = self.get_parameter('base_frame').value
         self.dry_run = self.get_parameter('dry_run').value
 
         # CV Bridge
@@ -217,7 +223,6 @@ class VisualGraspNode(Node):
 
         # Convert pitch to quaternion (rotation around Y axis)
         # pitch > 0 means looking down
-        import math
         qw = math.cos(self.observe_pitch / 2)
         qx = 0.0
         qy = math.sin(self.observe_pitch / 2)
@@ -327,36 +332,58 @@ class VisualGraspNode(Node):
             self._publish_debug_image(self.rgb_image, largest)
             return None
 
-        # Get center pixel
-        (u, v), radius = cv2.minEnclosingCircle(largest)
-        u_int, v_int = int(u), int(v)
+        # Center pixel = contour CENTROID (image moments), which is more stable than
+        # minEnclosingCircle center for irregular blobs and sits on the object body.
+        M = cv2.moments(largest)
+        if M['m00'] <= 0:
+            self.get_logger().warn('Contour has zero area moment, skipping')
+            return None
+        u = M['m10'] / M['m00']
+        v = M['m01'] / M['m00']
+        u_int, v_int = int(round(u)), int(round(v))
 
-        # Annotated debug image: RGB with detected contour + center marked.
+        # Annotated debug image: RGB with detected contour + centroid marked.
         self._publish_debug_image(self.rgb_image, largest, (u_int, v_int))
 
-        # Sample depth at center region (more reliable than full contour which may
-        # include background edges). Use a small window around the center pixel.
+        # --- Depth sampling ---
+        # Sample depth ONLY at pixels that are BOTH inside the detected contour AND have
+        # valid (non-zero) depth. Using the contour mask (not a fixed window) keeps
+        # background/table pixels out of the sample even when the centroid sits near an
+        # edge. We then reject outliers via median +/- MAD so a few stray readings
+        # (depth bleed at object borders) cannot pull the estimate off the object top.
         h, w = self.depth_image.shape[:2]
-        sample_size = 10  # 10x10 window around center
-        v_min = max(0, v_int - sample_size//2)
-        v_max = min(h, v_int + sample_size//2)
-        u_min = max(0, u_int - sample_size//2)
-        u_max = min(w, u_int + sample_size//2)
 
-        center_region = self.depth_image[v_min:v_max, u_min:u_max]
-        object_depths = center_region[center_region > 0]
+        # Build a mask of the contour interior, then intersect with valid depth.
+        contour_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(contour_mask, [largest], -1, 255, thickness=cv2.FILLED)
+        valid = (contour_mask > 0) & (self.depth_image > 0)
+        object_depths = self.depth_image[valid].astype(np.float64)
 
-        if len(object_depths) == 0:
+        # Require a minimum number of valid samples; too few means occlusion / FOV edge
+        # and the median would be noise (we saw 22 px give a bad z earlier).
+        MIN_DEPTH_SAMPLES = 30
+        if object_depths.size < MIN_DEPTH_SAMPLES:
             self.get_logger().warn(
-                f'No valid depth in center region (center pixel=({u_int},{v_int}), '
-                f'area={area:.0f}). Object likely outside depth FOV.')
+                f'Too few valid depth px inside contour: {object_depths.size} '
+                f'(<{MIN_DEPTH_SAMPLES}) at centroid=({u_int},{v_int}), area={area:.0f}. '
+                'Likely occlusion or object at depth-FOV edge.')
             return None
 
-        z_cam = float(np.median(object_depths))
+        # Robust outlier rejection: keep samples within 2.5*MAD of the median.
+        med = np.median(object_depths)
+        mad = np.median(np.abs(object_depths - med))
+        if mad > 1e-6:
+            inliers = object_depths[np.abs(object_depths - med) <= 2.5 * mad]
+        else:
+            inliers = object_depths
+        z_raw = float(np.median(inliers))
 
-        # Convert mm to meters if needed (depth published in mm as uint16)
-        if z_cam > 100:
-            z_cam = z_cam / 1000.0
+        # HP60C publishes depth as uint16 millimeters. Convert by dtype, not by a
+        # magnitude guess (the old `if z>100` heuristic breaks for objects <0.1 m).
+        if np.issubdtype(self.depth_image.dtype, np.integer):
+            z_cam = z_raw / 1000.0
+        else:
+            z_cam = z_raw  # float depth is already in meters
 
         # Back-project to camera frame
         x_cam = (u - self.cx) * z_cam / self.fx
@@ -365,29 +392,48 @@ class VisualGraspNode(Node):
         # Debug: print every intermediate value so we can isolate which stage is wrong
         # (HSV pixel / depth / back-projection / TF).
         self.get_logger().info(
-            f'[DETECT] pixel=({u_int},{v_int}) area={area:.0f} valid_depth_px={len(object_depths)} '
+            f'[DETECT] centroid=({u_int},{v_int}) area={area:.0f} '
+            f'depth_px={object_depths.size}->inliers={inliers.size} '
             f'z_cam={z_cam:.3f}m | cam_frame=({x_cam:.3f}, {y_cam:.3f}, {z_cam:.3f})')
 
-        # Transform to base_link manually (don't use TF which may use stale joint_states)
-        # At observation pose [0.2, 0, 0.22, pi]:
-        # - Camera at approximately [0.256, -0.003, 0.244] in base_link
-        # - Camera pointing down with ~5.31° forward tilt
-        # - Rotation matrix derived from URDF + observation pose FK
-        cam_x, cam_y, cam_z = 0.256, -0.003, 0.244
-        pitch_rad = 0.0927  # 5.31° in radians
-        cos_p, sin_p = 0.9957, 0.0925
+        # Transform the back-projected point from the depth optical frame into base_link
+        # using the LIVE TF tree. The camera is eye-in-hand (mounted on arm_link4), so this
+        # transform depends on the current arm joint angles and must be looked up, not
+        # hard-coded. /joint_states carries servo readback (real angles), so the TF tree
+        # reflects the arm's actual pose. If the transform is unavailable, return None so
+        # the caller retries -- never fall back to a stale/guessed pose.
+        try:
+            # lookup_transform(target_frame, source_frame) returns the transform FROM source
+            # TO target. To transform a point from camera_optical_frame to base_frame:
+            #   target_frame = base_frame (where we want the point)
+            #   source_frame = camera_optical_frame (where the point currently is)
+            tf = self.tf_buffer.lookup_transform(
+                self.base_frame,              # target
+                self.camera_optical_frame,    # source
+                rclpy.time.Time(),  # latest available
+                timeout=Duration(seconds=0.2),
+            )
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warn(
+                f'TF {self.camera_optical_frame} -> {self.base_frame} unavailable: {e}')
+            return None
 
-        # Rotation: optical frame → base_link (with 5.31° pitch)
-        # optical_x (image right) → -base_y (right, negative Y)
-        # optical_y (image down)  → -base_x (backward)
-        # optical_z (depth)       → -base_z (downward) with pitch correction
-        x_base = cam_x - y_cam
-        y_base = cam_y - cos_p * x_cam + sin_p * z_cam
-        z_base = cam_z - sin_p * x_cam - cos_p * z_cam
+        point_optical = PointStamped()
+        point_optical.header.frame_id = self.camera_optical_frame
+        point_optical.point.x = x_cam
+        point_optical.point.y = y_cam
+        point_optical.point.z = z_cam
+
+        point_base = do_transform_point(point_optical, tf)
+        x_base = point_base.point.x
+        y_base = point_base.point.y
+        z_base = point_base.point.z
 
         self.get_logger().info(
-            f'[MANUAL_TF] cam_pos=[{cam_x:.3f},{cam_y:.3f},{cam_z:.3f}], '
-            f'pitch={pitch_rad:.4f}rad → base_link=[{x_base:.3f},{y_base:.3f},{z_base:.3f}]')
+            f'[TF] {self.camera_optical_frame} -> {self.base_frame}: '
+            f'cam_frame=({x_cam:.3f},{y_cam:.3f},{z_cam:.3f}) → '
+            f'base_link=[{x_base:.3f},{y_base:.3f},{z_base:.3f}]')
 
         return (x_base, y_base, z_base)
 
@@ -411,7 +457,6 @@ class VisualGraspNode(Node):
 
         # Quaternion for pitch=180° (gripper pointing straight down)
         # Convention matches arm_controller: 0=up, 90=horizontal, 180=down
-        import math
         pitch = math.pi
         qw = math.cos(pitch / 2)
         qx = 0.0

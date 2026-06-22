@@ -240,7 +240,17 @@ class BaseDriverNode(Node):
             state.target_id = [sid]
             if cmd.get_position:
                 result = self.board.bus_servo_read_position(sid)
-                state.position = [result[0]] if result else [0]
+                # Subtract the offset that _set_bus_servo_cb adds on the write side
+                # (line ~191: target + offset). The servo reports the RAW pulse it is
+                # physically at, so to recover the logical position the controller
+                # commanded -- and keep /joint_states consistent with IK/URDF -- we must
+                # subtract the same offset here. Without this, joint_states (and thus the
+                # TF tree used by visual grasp) is biased by the offset (e.g. servo_2=20
+                # pulse ~= 0.047 rad on arm_joint3).
+                if result:
+                    state.position = [result[0] - self.servo_offsets.get(sid, 0)]
+                else:
+                    state.position = [0]
             if cmd.get_offset:
                 result = self.board.bus_servo_read_offset(sid)
                 state.offset = [result[0]] if result else [0]

@@ -46,6 +46,49 @@ colcon test-result --verbose
 
 **Never edit files under `install/` directly.** All changes go in `src/` and are validated through `colcon build`. The deliverable is source others compile themselves.
 
+## Code Change Protocol
+
+**CRITICAL: Before making any code changes, you MUST:**
+
+1. **Diagnose with evidence** — collect logs, error messages, actual output values. Never diagnose based solely on reading code.
+2. **State your plan clearly**:
+   - What file/lines will be changed
+   - Why this change is needed (root cause)
+   - What the expected result is (specific values/behavior)
+   - How to verify it worked (test commands + expected output)
+3. **Wait for user confirmation** before executing the change.
+4. **After the change** — run the verification steps and report actual results vs. expected.
+
+**Example of correct workflow**:
+```
+❌ WRONG: "I see the bug in line 42, let me fix it" [starts editing]
+✓ RIGHT: "Based on the log showing X=0.267→-0.012, I believe line 42 has 
+         reversed parameters. I'll swap A and B, expecting X≈0.26. 
+         Verify by running `ros2 launch ...` and checking the [TF] log line.
+         Proceed?"
+```
+
+This protocol applies to ALL changes: bug fixes, refactoring, features, config updates.
+
+## TF Transform Reference
+
+**`lookup_transform(target_frame, source_frame, time)`** returns transform FROM source TO target.
+
+To transform a point from frame A to frame B:
+```python
+# Correct usage
+tf_B_from_A = buffer.lookup_transform(
+    'frame_B',        # target (where you want the point)
+    'frame_A',        # source (where the point is now)
+    time
+)
+point_in_B = do_transform_point(point_in_A, tf_B_from_A)
+```
+
+**Common mistake**: swapping the parameters → you get the inverse transform, coordinates will be completely wrong.
+
+**Verification**: After any TF change, compare transformed coordinates against known ground truth or previous working values.
+
 ## Launch Commands
 
 ```bash

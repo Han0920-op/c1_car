@@ -41,9 +41,7 @@ def generate_launch_description():
             'target_color_hsv_upper': [10, 255, 255],
             'target_color_hsv_lower2': [160, 80, 60],    # Red high-H end (cube measured at H167-178)
             'target_color_hsv_upper2': [180, 255, 255],
-            'depth_sample_size': 5,
             'max_detection_attempts': 10,  # 最多尝试10次检测
-            'verify_after_pick': False,
             'dry_run': False  # 设置为False执行真实抓取
         }]
     )
