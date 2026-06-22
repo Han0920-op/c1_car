@@ -31,6 +31,7 @@ class State(enum.Enum):
     DETECT = 3
     COMPUTE_TARGET = 4
     PICK = 5
+    RETURN_TO_OBSERVE = 8
     DONE = 6
     FAILED = 7
 
@@ -122,6 +123,12 @@ class VisualGraspNode(Node):
         self.target_pose_pub = self.create_publisher(
             PoseStamped, '/arm_controller/target_pose', 10
         )
+        # set_pick_target: tells arm_controller the grasp target WITHOUT moving the
+        # arm. Using target_pose here would make the arm descend to the object before
+        # the pick service runs, which looks like a redundant "first grasp".
+        self.set_pick_target_pub = self.create_publisher(
+            PoseStamped, '/arm_controller/set_pick_target', 10
+        )
 
         # Debug image publishers: view in rqt to SEE what the camera sees and what
         # HSV catches. /visual_grasp/debug_image = RGB with detected contour drawn;
@@ -177,6 +184,8 @@ class VisualGraspNode(Node):
             self._handle_compute_target()
         elif self.state == State.PICK:
             self._handle_pick()
+        elif self.state == State.RETURN_TO_OBSERVE:
+            self._handle_return_to_observe()
         elif self.state == State.DONE:
             self._handle_done()
         elif self.state == State.FAILED:
@@ -386,18 +395,16 @@ class VisualGraspNode(Node):
         return (x_base, y_base, z_base)
 
     def _handle_compute_target(self):
-        """Compute target pose and publish (sets pick_target without moving arm)."""
+        """Set arm_controller's pick_target WITHOUT moving the arm."""
         if self.detected_point_base is None:
             self._change_state(State.FAILED)
             return
 
         x, y, z = self.detected_point_base
 
-        # Publish target pose to set arm_controller's pick_target.
-        # NOTE: This will trigger arm movement in pose_callback, but that's intentional
-        # for non-vision use cases. For vision grasp, we immediately call pick service
-        # which will use the updated pick_target. The intermediate movement to (x,y,z)
-        # before pick starts is harmless - it's moving toward the object anyway.
+        # Publish to set_pick_target (NOT target_pose): this only stores the target in
+        # arm_controller; it does NOT move the arm. The pick service will run the full
+        # grasp sequence (pre-grasp -> descend -> close -> retract) from this target.
         pose_msg = PoseStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = 'base_link'
@@ -418,9 +425,8 @@ class VisualGraspNode(Node):
         pose_msg.pose.orientation.y = qy
         pose_msg.pose.orientation.z = qz
 
-        self.target_pose_pub.publish(pose_msg)
-        self.get_logger().info(f'Published target pose for pick: [{x:.3f}, {y:.3f}, {z:.3f}]')
-        self.get_logger().info('Arm will move to target, then pick service will execute full grasp sequence')
+        self.set_pick_target_pub.publish(pose_msg)
+        self.get_logger().info(f'Set pick target (no move): [{x:.3f}, {y:.3f}, {z:.3f}]')
 
         self._change_state(State.PICK)
 
@@ -433,7 +439,7 @@ class VisualGraspNode(Node):
                     response = self._pick_future.result()
                     if response and response.success:
                         self.get_logger().info('Pick completed successfully')
-                        self._change_state(State.DONE)
+                        self._change_state(State.RETURN_TO_OBSERVE)
                     else:
                         msg = response.message if response else 'no response'
                         self.get_logger().error(f'Pick failed: {msg}')
@@ -451,6 +457,34 @@ class VisualGraspNode(Node):
 
         self.get_logger().info('Calling /arm_controller/pick...')
         self._pick_future = self.pick_client.call_async(Trigger.Request())
+
+    def _handle_return_to_observe(self):
+        """After a successful pick, lift the grasped object back to the observe pose."""
+        # Publish the observe pose ONCE (target_pose => real move), then wait for the
+        # motion to finish before declaring done. Use _returning flag so we publish only
+        # on the first tick of this state.
+        if not getattr(self, '_returning', False):
+            import math
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = self.get_clock().now().to_msg()
+            pose_msg.header.frame_id = 'base_link'
+            pose_msg.pose.position.x = self.observe_x
+            pose_msg.pose.position.y = self.observe_y
+            pose_msg.pose.position.z = self.observe_z
+            pose_msg.pose.orientation.w = math.cos(self.observe_pitch / 2)
+            pose_msg.pose.orientation.x = 0.0
+            pose_msg.pose.orientation.y = math.sin(self.observe_pitch / 2)
+            pose_msg.pose.orientation.z = 0.0
+            self.target_pose_pub.publish(pose_msg)
+            self.get_logger().info(
+                f'Returning to observe pose with object: [{self.observe_x}, {self.observe_y}, {self.observe_z}]')
+            self._returning = True
+            self.state_start_time = self.get_clock().now()
+            return
+
+        elapsed = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
+        if elapsed > 4.0:  # wait for the arm to reach the observe pose
+            self._change_state(State.DONE)
 
     def _handle_done(self):
         """Success state."""

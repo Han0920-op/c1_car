@@ -85,6 +85,11 @@ class ArmController(Node):
             JointState, '/joint_states', self.joint_callback, 10)
         self.pose_sub = self.create_subscription(
             PoseStamped, '/arm_controller/target_pose', self.pose_callback, 10)
+        # set_pick_target: stores pick/place target WITHOUT moving the arm. Used by
+        # visual_grasp so publishing the detected position doesn't trigger an extra
+        # descent before the pick service runs the real grasp sequence.
+        self.set_target_sub = self.create_subscription(
+            PoseStamped, '/arm_controller/set_pick_target', self.set_pick_target_callback, 10)
         self.joint_cmd_sub = self.create_subscription(
             JointState, '/arm_controller/joint_command', self.joint_cmd_callback, 10)
 
@@ -169,6 +174,17 @@ class ArmController(Node):
 
         self.stop_flag = False
         self._move_stepwise(joints, self.default_duration)
+
+    def set_pick_target_callback(self, msg):
+        """Store pick/place target WITHOUT moving the arm (used by visual_grasp)."""
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        z = msg.pose.position.z
+        pitch = self._quat_to_pitch(msg.pose.orientation)
+        self.pick_target = (x, y, z, pitch)
+        self.place_target = (x, y, z, pitch)
+        self.get_logger().info(
+            f'set pick_target (no move): ({x:.3f}, {y:.3f}, {z:.3f}), pitch={math.degrees(pitch):.1f} deg')
 
     def joint_cmd_callback(self, msg):
         if len(msg.position) != 5:
