@@ -352,8 +352,8 @@ class ArmController(Node):
         self._wait(self.gripper_duration + 0.3)
         self._check_stop()
 
-        # 5. Lift (keep gripper pointing down)
-        joints = self._solve_or_raise(x, y, z + lift_h, pitch)
+        # 5. Retract to pre-grasp position (same as step 2, avoids self-collision)
+        joints = self._solve_or_raise(x, y, z + pre_h, pitch)
         self._move_joints(joints, 1.5)
         self._wait(1.8)
 

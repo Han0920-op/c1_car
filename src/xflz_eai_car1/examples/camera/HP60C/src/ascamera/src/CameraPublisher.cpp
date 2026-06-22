@@ -1494,7 +1494,7 @@ int CameraPublisher::checkStreamContrll(unsigned int allType, unsigned int check
                     AS_SDK_StopStream(pCamera);
                 }
                 ret = AS_SDK_StartStream(pCamera, streamFlag | checkType);
-                // RCLCPP_INFO_STREAM(m_logger, "AS_SDK_StartStream ret " << ret << ", streamType 0x" << std::hex << checkType << std::dec <<  std::endl;
+                RCLCPP_INFO_STREAM(m_logger, "[stream-restart] AS_SDK_StartStream ret " << ret << ", streamType 0x" << std::hex << checkType << std::dec);
                 if (ret == 0) {
                     onCameraStart(pCamera);
                     streamFlag |= checkType;
@@ -1504,6 +1504,17 @@ int CameraPublisher::checkStreamContrll(unsigned int allType, unsigned int check
             }
         }
     } else {
+        // HP60C/HP60CN: once a stream has been started, never stop it on
+        // subscriber-count drop. StopStream tears down the depth engine, and a
+        // later StartStream returns 0 but yields all-zero depth frames (the
+        // depth-engine init — setInternalParameter / intrinsics load — only runs
+        // on the FIRST StartStream after camera Open, not on restart). Keeping the
+        // stream alive avoids that broken path entirely; power is managed by
+        // starting/stopping the camera node, not by on-demand streaming.
+        if ((m_cam_type_map[pCamera] == AS_SDK_CAM_MODEL_E::AS_SDK_CAM_MODEL_HP60C) ||
+            (m_cam_type_map[pCamera] == AS_SDK_CAM_MODEL_E::AS_SDK_CAM_MODEL_HP60CN)) {
+            return 0;
+        }
         if (allType == 0) {
             if (status == CAMERA_STREAM_STATUS) {
                 ret = AS_SDK_StopStream(pCamera);
