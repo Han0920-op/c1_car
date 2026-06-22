@@ -31,7 +31,6 @@ class State(enum.Enum):
     DETECT = 3
     COMPUTE_TARGET = 4
     PICK = 5
-    RETURN_TO_OBSERVE = 8
     DONE = 6
     FAILED = 7
 
@@ -184,8 +183,6 @@ class VisualGraspNode(Node):
             self._handle_compute_target()
         elif self.state == State.PICK:
             self._handle_pick()
-        elif self.state == State.RETURN_TO_OBSERVE:
-            self._handle_return_to_observe()
         elif self.state == State.DONE:
             self._handle_done()
         elif self.state == State.FAILED:
@@ -438,8 +435,8 @@ class VisualGraspNode(Node):
                 try:
                     response = self._pick_future.result()
                     if response and response.success:
-                        self.get_logger().info('Pick completed successfully')
-                        self._change_state(State.RETURN_TO_OBSERVE)
+                        self.get_logger().info('Pick completed successfully (arm returned to post-grasp pose)')
+                        self._change_state(State.DONE)
                     else:
                         msg = response.message if response else 'no response'
                         self.get_logger().error(f'Pick failed: {msg}')
@@ -457,34 +454,6 @@ class VisualGraspNode(Node):
 
         self.get_logger().info('Calling /arm_controller/pick...')
         self._pick_future = self.pick_client.call_async(Trigger.Request())
-
-    def _handle_return_to_observe(self):
-        """After a successful pick, lift the grasped object back to the observe pose."""
-        # Publish the observe pose ONCE (target_pose => real move), then wait for the
-        # motion to finish before declaring done. Use _returning flag so we publish only
-        # on the first tick of this state.
-        if not getattr(self, '_returning', False):
-            import math
-            pose_msg = PoseStamped()
-            pose_msg.header.stamp = self.get_clock().now().to_msg()
-            pose_msg.header.frame_id = 'base_link'
-            pose_msg.pose.position.x = self.observe_x
-            pose_msg.pose.position.y = self.observe_y
-            pose_msg.pose.position.z = self.observe_z
-            pose_msg.pose.orientation.w = math.cos(self.observe_pitch / 2)
-            pose_msg.pose.orientation.x = 0.0
-            pose_msg.pose.orientation.y = math.sin(self.observe_pitch / 2)
-            pose_msg.pose.orientation.z = 0.0
-            self.target_pose_pub.publish(pose_msg)
-            self.get_logger().info(
-                f'Returning to observe pose with object: [{self.observe_x}, {self.observe_y}, {self.observe_z}]')
-            self._returning = True
-            self.state_start_time = self.get_clock().now()
-            return
-
-        elapsed = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
-        if elapsed > 4.0:  # wait for the arm to reach the observe pose
-            self._change_state(State.DONE)
 
     def _handle_done(self):
         """Success state."""

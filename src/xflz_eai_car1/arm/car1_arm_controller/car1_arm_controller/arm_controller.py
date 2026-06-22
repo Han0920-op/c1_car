@@ -60,6 +60,9 @@ class ArmController(Node):
             ('pre_grasp_height', 0.03),
             ('lift_height', 0.05),
             ('grasp_pitch', math.pi),  # 180° = end-effector pointing DOWN (ik_analytical convention)
+            # After grasping, lift straight up then move to this pose (avoids dragging
+            # the object across the table on a big diagonal move). [x, y, z, pitch].
+            ('post_grasp_pose', [0.20, 0.0, 0.22, math.pi]),
         ])
 
         self.d1 = self.get_parameter('d1').value
@@ -74,6 +77,7 @@ class ArmController(Node):
         self.pre_grasp_height = self.get_parameter('pre_grasp_height').value
         self.lift_height = self.get_parameter('lift_height').value
         self.grasp_pitch = self.get_parameter('grasp_pitch').value
+        self.post_grasp_pose = self.get_parameter('post_grasp_pose').value
 
         # No longer need IKSolver instance - using solve_ik function from ik_analytical
         self.current_joints = [0.0] * 5
@@ -372,8 +376,21 @@ class ArmController(Node):
         joints = self._solve_or_raise(x, y, z + pre_h, pitch)
         self._move_joints(joints, 1.5)
         self._wait(1.8)
+        self._check_stop()
 
-        self.get_logger().info('pick complete')
+        # 6. Move directly to the post-grasp (observe) pose. Step 5 already lifted the
+        #    object pre_grasp_height above the table, so it clears the surface and there
+        #    is no need for an intermediate "straight-up" waypoint. That intermediate
+        #    point at (x, y, post_z) was unreachable at pitch=pi, so auto-pitch silently
+        #    tilted it (~165deg), then this segment snapped back to pitch=pi -- the wrist
+        #    flip dipped the end-effector down. Going straight to the reachable
+        #    post_grasp_pose keeps pitch=pi throughout, so no dip.
+        px, py, pz, ppitch = self.post_grasp_pose
+        joints = self._solve_or_raise(px, py, pz, ppitch)
+        self._move_stepwise(joints, self.default_duration)
+        self._wait(0.5)
+
+        self.get_logger().info('pick complete (returned to post-grasp pose)')
 
     def _execute_place(self, x, y, z, pitch=None):
         if pitch is None:
