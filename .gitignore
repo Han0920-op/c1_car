@@ -36,6 +36,11 @@ src/xflz_eai_car1/examples/camera/HP60C/src/*
 *.ipa
 *.apk
 
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
