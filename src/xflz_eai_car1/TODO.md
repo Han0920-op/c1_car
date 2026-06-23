@@ -1095,20 +1095,22 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
 
 #### P0-1: 里程计标定
 
-> ⚠️ **代码事实纠正（2026-06-23 核实源码）**：
-> - `linear_correction_factor` **有效** —— `odom_publisher_node.py:192-193` 实际用它乘 odom 的 x/y。
-> - `angular_correction_factor` **当前无效** —— `odom_publisher_node.py:194` 计算 yaw 时**没有乘**这个系数。
->   所以现在标定角度、把值填进 yaml 对里程计 yaw **毫无影响**，做了也白做。
->   要让它生效，需先改 odom_publisher（在 yaw 积分处乘 angular_factor），见本节末「角度系数未接线」。
-> - 标定脚本 `calibrate_linear/angular` 是**自动开环驱动**：勾 `start_test` 后小车自己走，
->   按 **odom 判断**走够 `test_distance` 就停；脚本**不写 yaml 文件**，最终系数要**手动填**。
-> - 因此**当前只做直线标定**即可；静止 3.8° yaw 偏置不归里程计标定管（属 IMU/EKF，见 P1-1）。
+> ✅ **代码现状（2026-06-23 已修复并核实）**：
+> - `linear_correction_factor` **有效** —— `odom_publisher_node.py:192-193` 用它乘 odom 的 x/y。
+> - `angular_correction_factor` **已接线生效** —— `odom_publisher_node.py:186` yaw 增量已乘该系数
+>   （`delta_yaw = self.angular_z * dt * self.angular_factor`）。现在标定角度并填 yaml 会真正影响 odom yaw。
+> - `calibrate_angular` **已改读 `/odom_raw`** 的纯轮式 yaw（不再读 EKF 融合后的 TF），
+>   标定的是纯轮式角度，与 angular 系数严格对应。
+> - 标定脚本 `calibrate_linear/angular` 是**自动开环驱动**：勾 `start_test` 后小车自己走/转，
+>   按 **odom 判断**到量就停；脚本**不写 yaml 文件**，最终系数要**手动填**。
+>   ⚠️ 因 odom 本身可能不准，脚本"到量"不等于真实到量——**角度必须用指南针量真实转角**。
+> - 静止 3.8° yaw 偏置不归里程计标定管（属 IMU/EKF，见 P1-1）。
 
 **lander_pi 实际值（对照）**: `linear_correction_factor: 0.94`, `angular_correction_factor: 1.00`
 
 **实施步骤（直线标定，自动脚本 + 尺子）**
 
-> 角度标定先跳过（系数未接线，见上方纠正）。只做直线。
+> 先做直线标定，再做角度标定（见下方「角度标定」）。
 
 ```bash
 # 终端 1: 启动底盘
@@ -1159,7 +1161,7 @@ nano ~/ros2_ws/src/xflz_eai_car1/driver/controller/config/calibrate_params.yaml
 /**:
   ros__parameters:
     linear_correction_factor: 1.064   # ← 填你量出来的系数
-    angular_correction_factor: 1.00   # 暂不动（代码未使用，见下方）
+    angular_correction_factor: 1.00   # ← 角度标定后填（见下方「角度标定」）
 ```
 保存后**重启 bringup** 即生效（yaml 在启动时被 `chassis_controller.launch.py:44` 读取，无需编译）。
 
@@ -1175,24 +1177,47 @@ ros2 topic echo /odom_raw --field pose.pose.position.x
 # odom 报告的 x 应与尺子实测接近（误差 <3%）
 ```
 
-**验收标准**
+**验收标准（直线）**
 - [ ] `ros2 param get /odom_publisher linear_correction_factor` 返回标定值
 - [ ] 走 1m，odom 报告与尺子实测误差 <3cm
 
-**「角度系数未接线」—— 如需让 angular 标定生效**
+---
 
-`odom_publisher_node.py:194` 当前是：
-```python
-self.odom.pose.pose.orientation = rpy2qua(0.0, 0.0, self.pose_yaw)
+**角度标定（手机指南针，2026-06-23 已接线生效）**
+
+> 关键：脚本靠 odom_raw 的 yaw 判断"转够没"，但 odom 本身可能不准——
+> **所以脚本停车 ≠ 真的转了 360°，必须用指南针量真实转角**。
+
+```bash
+# 终端1: bringup（确认 yaml 里 angular_correction_factor 当前值，比如 1.0）
+ros2 launch car1_bringup bringup.launch.py
+# 终端2: 角度标定节点（已改读 /odom_raw 纯轮式 yaw）
+ros2 run calibration calibrate_angular
+# 终端3: 参数界面
+ros2 run rqt_reconfigure rqt_reconfigure   # 左侧选 calibrate_angular
 ```
-`pose_yaw` 在 186 行积分时没乘 `angular_factor`。要启用角度标定，需改为对 yaw 增量应用系数（例如在 186 行 `delta_yaw = self.angular_z * dt * self.angular_factor`）。**改完才值得跑 `calibrate_angular`**。是否要改由后续决定。
 
-**时间估计**: 直线标定约 20 分钟
+流程：
+1. 手机指南针记录**起始朝向**（手机放车后部远离电机，避免磁干扰）。
+2. rqt：`test_angle=360`、`speed=0.5`，勾 `start_test` → 车自动转，停。
+3. **指南针量真实转角**（例：脚本以为转了 360°，实际只转了 343°）。
+4. 算系数：`angular_correction_factor = 360 / 343 ≈ 1.05`。
+5. 填进 `calibrate_params.yaml`，**重启 bringup**。
+6. 再转一次验证：指南针真实转角应接近 360°（脚本停车时机也更准）。
+
+> 跨 0° 换算：`偏差 = (结束 - 起始 + 180) % 360 - 180`。
+
+**验收标准（角度）**
+- [ ] `ros2 param get /odom_publisher angular_correction_factor` 返回标定值
+- [ ] 转一圈，指南针真实转角 ≈ odom_raw 报告转角（误差 <5°）
+
+**时间估计**: 直线约 20 分钟 + 角度约 15 分钟
 
 **涉及文件**:
-- `driver/controller/config/calibrate_params.yaml`（填系数）
-- `calibration/calibration/calibrate_linear.py`（标定工具，自动驱动）
-- `driver/controller/controller/odom_publisher_node.py`（消费系数；angular 待接线）
+- `driver/controller/config/calibrate_params.yaml`（填 linear + angular 系数）
+- `calibration/calibration/calibrate_linear.py`（直线标定，自动驱动）
+- `calibration/calibration/calibrate_angular.py`（角度标定，已改读 /odom_raw）
+- `driver/controller/controller/odom_publisher_node.py`（消费两个系数，均已接线）
 
 ---
 
