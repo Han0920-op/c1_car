@@ -56,8 +56,13 @@ class MecanumChassis:
         rl = linear_x + linear_y - angular_z * k  # rear-left (motor3)
         rr = linear_x - linear_y + angular_z * k  # rear-right (motor4)
 
-        # Convert to RPS, negate left side for correct rotation direction
-        v_s = [self.speed_to_rps(v) for v in [fl, fr, rl, rr]]
+        # Firmware raw per-wheel mode expects wheel-rim LINEAR velocity (m/s),
+        # NOT rps. The firmware feedback RT = ticks * (pi*D*PID_RATE/RESOLUTION)
+        # is already in m/s, and its PID drives RT == TG. So send fl/fr/rl/rr
+        # (which are m/s here) directly. Converting to rps caused a ~3.98x
+        # over-speed (1/(pi*D_firmware)). The msg field is named .rps for
+        # historical reasons but carries m/s.
+        v_s = [fl, fr, rl, rr]
 
         data = []
         for i in range(4):
