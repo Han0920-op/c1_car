@@ -1095,7 +1095,23 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
 
 #### P0-1: 里程计标定
 
-> ✅ **代码现状（2026-06-23 已修复并核实）**：
+> 🔴 **根本性发现（2026-06-23，对照下位机固件源码确认）**：
+> 之前标定一直"失效/小车超速/转 3.75 圈"的真正根因 **不是标定方法**，而是
+> **ROS 与下位机的速度单位错配**：
+> - `mecanum.py` 原经 `speed_to_rps` 发 **rps**，但 STM32 固件 raw 逐轮模式
+>   期望 **轮缘线速度 m/s**（固件 `Wheel.RT = ticks×(π·D·PID_RATE/RES)` 单位是 m/s）。
+> - 错配放大 `1/(π×0.08) ≈ 3.98` 倍 → 实测旋转指令 1 圈→实际 3.75 圈、直行超速。
+> - **已修复**：`mecanum.py` 直接发 m/s。实测旋转 3.75→1.2 圈、直行接近理论×1.21。
+> - **残留 ~1.21 倍** = 固件轮径 0.08 vs 真实 0.097 之差 →
+>   **这才是 `correction_factor` 真正该补偿的量级**（类比 lander_pi 的 0.94）。
+> - 固件不改（raw 模式下轮距/轴距不参与；改轮径需 Windows Keil 烧录）。
+>
+> ⚠️ **必须先确认 `mecanum.py` 已修复 + controller 已重编**，再做下面的标定，否则标的是错的。
+>
+> 验证工具：根目录 `chassis_serial_test.py`（直连下位机绕过 ROS）。
+> 注意：查表 CRC8（非 sum&0xFF）、开串口前 rts/dtr=False、先发 set_motor_type 初始化。
+
+> ✅ **代码现状（已修复并核实）**：
 > - `linear_correction_factor` **有效** —— `odom_publisher_node.py:192-193` 用它乘 odom 的 x/y。
 > - `angular_correction_factor` **已接线生效** —— `odom_publisher_node.py:186` yaw 增量已乘该系数
 >   （`delta_yaw = self.angular_z * dt * self.angular_factor`）。现在标定角度并填 yaml 会真正影响 odom yaw。
