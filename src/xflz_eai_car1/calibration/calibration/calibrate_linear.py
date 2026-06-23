@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 """Linear velocity calibration node.
 
-Drives the robot a known distance and compares odometry vs actual measurement.
-Use rqt_reconfigure to adjust odom_linear_scale_correction until they match.
+Drives the robot forward a known distance and compares odometry vs actual
+measurement (用尺子量实际距离). 系数 = test_distance / 实际距离。
+
+读 /odom_raw（纯轮式里程计），累加行进【里程】，单向前进，到目标就停。
+不再用欧氏距离 + 正负 error 闭环纠偏（那会因 sqrt 永远为正导致前后震荡）。
 """
 import time
 import rclpy
 import signal
 import threading
 from rclpy.node import Node
-from tf2_ros.buffer import Buffer
-from math import copysign, sqrt, pow
-from geometry_msgs.msg import Twist, Point
-from tf2_ros.transform_listener import TransformListener
-from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
 
 
 class CalibrateLinear(Node):
@@ -30,21 +30,17 @@ class CalibrateLinear(Node):
         self.declare_parameter('start_test', False)
         self.update_param()
 
-        self.odom_frame = 'odom'
-        self.base_frame = 'base_footprint'
         self.cmd_vel = self.create_publisher(Twist, "/controller/cmd_vel", 1)
+        self.create_subscription(Odometry, '/odom_raw', self.odom_callback, 10)
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        self.position = Point()
-        self.x_start = self.position.x
-        self.y_start = self.position.y
+        self.pos = None          # 最新 (x, y) from /odom_raw
+        self.last_pos = None     # 上一帧 (x, y)
+        self.traveled = 0.0      # 累加行进里程
 
         self.clock = self.get_clock()
         threading.Thread(target=self.main, daemon=True).start()
 
-        self.get_logger().info('\033[1;32m%s\033[0m' % 'Bring up rqt_reconfigure to control the test')
+        self.get_logger().info('\033[1;32m%s\033[0m' % 'Set start_test:=true to run')
 
     def update_param(self):
         self.start_test = self.get_parameter('start_test').value
@@ -53,45 +49,52 @@ class CalibrateLinear(Node):
         self.tolerance = self.get_parameter('tolerance').value
         self.odom_linear_scale_correction = self.get_parameter('odom_linear_scale_correction').value
 
+    def odom_callback(self, msg):
+        self.pos = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+
     def main(self):
+        running = False
         while True:
             self.update_param()
             move_cmd = Twist()
+
             if self.start_test:
-                self.position = self.get_position()
+                if self.pos is None:
+                    self.get_logger().warn('Waiting for /odom_raw...')
+                    time.sleep(0.1)
+                    continue
 
-                original_distance = sqrt(
-                    pow((self.position.transform.translation.x - self.x_start), 2) +
-                    pow((self.position.transform.translation.y - self.y_start), 2))
+                if not running:
+                    # 开始一次新测试：清零累加
+                    running = True
+                    self.traveled = 0.0
+                    self.last_pos = self.pos
 
-                calib_distance = original_distance * self.odom_linear_scale_correction
-                error = calib_distance - self.test_distance
+                # 累加这一帧的行进里程（幅度，与方向无关）
+                dx = self.pos[0] - self.last_pos[0]
+                dy = self.pos[1] - self.last_pos[1]
+                self.traveled += (dx * dx + dy * dy) ** 0.5
+                self.last_pos = self.pos
 
-                if not self.start_test or abs(error) < self.tolerance:
+                calib = self.traveled * self.odom_linear_scale_correction
+                remaining = self.test_distance - calib
+
+                if remaining > self.tolerance:
+                    move_cmd.linear.x = self.speed   # 单向前进
+                else:
+                    running = False
                     self.start_test = rclpy.parameter.Parameter(
                         'start_test', rclpy.Parameter.Type.BOOL, False)
                     self.set_parameters([self.start_test])
-                    self.get_logger().info('\033[1;32m%s\033[0m' % 'finish')
-                else:
-                    move_cmd.linear.x = copysign(self.speed, -1 * error)
+                    self.get_logger().info(
+                        '\033[1;32mfinish: odom 行进 %.3f m\033[0m' % self.traveled)
             else:
-                self.position = self.get_position()
-                if self.position is not None:
-                    self.x_start = self.position.transform.translation.x
-                    self.y_start = self.position.transform.translation.y
+                running = False
+                if self.pos is not None:
+                    self.last_pos = self.pos
 
             self.cmd_vel.publish(move_cmd)
             time.sleep(0.05)
-
-    def get_position(self):
-        try:
-            trans = self.tf_buffer.lookup_transform(
-                self.odom_frame, self.base_frame,
-                rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1))
-            return trans
-        except (LookupException, ConnectivityException, ExtrapolationException):
-            self.get_logger().info('\033[1;32m%s\033[0m' % 'TF Exception')
-            return None
 
     def shutdown(self, signum, frame):
         self.get_logger().info('\033[1;32m%s\033[0m' % 'Stopping the robot...')
