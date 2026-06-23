@@ -89,26 +89,34 @@ class CalibrateAngular(Node):
                     time.sleep(0.1)
                     continue
 
-                # Work entirely in radians; normalize_angle() is radian-based.
-                original_angle = self.odom_yaw                      # rad
-                test_angle_rad = copysign(radians(self.test_angle), self.reverse)
-
-                delta_angle = self.odom_angular_scale_correction * normalize_angle(
-                    original_angle - self.last_angle)
-                self.calib_angle += delta_angle                     # accumulated rad
-                error = test_angle_rad - self.calib_angle           # rad
+                # Accumulate the MAGNITUDE of rotation, independent of odom's yaw
+                # sign convention. We spin one constant direction (self.reverse)
+                # until the accumulated |rotation| from odom reaches test_angle.
+                # This avoids the positive-feedback divergence that happens when
+                # odom yaw sign is opposite to the commanded direction.
+                original_angle = self.odom_yaw                       # rad, wrapped [-pi,pi]
+                target = radians(abs(self.test_angle))               # rad, positive
+                step = abs(self.odom_angular_scale_correction *
+                           normalize_angle(original_angle - self.last_angle))
+                self.calib_angle += step                             # always grows
                 self.last_angle = original_angle
+                remaining = target - self.calib_angle                # shrinks to 0
 
-                if abs(error) > radians(self.tolerance) and self.start_test:
-                    move_cmd.angular.z = copysign(self.speed, error)
+                if remaining > radians(self.tolerance):
+                    move_cmd.angular.z = copysign(self.speed, self.reverse)
                 else:
                     self.calib_angle = 0.0
                     self.start_test = rclpy.parameter.Parameter(
                         'start_test', rclpy.Parameter.Type.BOOL, False)
                     self.set_parameters([self.start_test])
                     self.reverse = -self.reverse
-                    self.last_angle = 0
+                    self.last_angle = 0.0
                     self.get_logger().info('\033[1;32m%s\033[0m' % 'finish')
+            else:
+                # Keep last_angle synced while idle so the first delta after
+                # start_test isn't a huge jump.
+                if self.odom_yaw is not None:
+                    self.last_angle = self.odom_yaw
 
             self.cmd_vel.publish(move_cmd)
             time.sleep(0.05)
