@@ -17,7 +17,7 @@ import threading
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-from math import copysign, pi, atan2, asin
+from math import copysign, pi, atan2, asin, radians
 
 
 def qua2rpy(quat):
@@ -89,17 +89,17 @@ class CalibrateAngular(Node):
                     time.sleep(0.1)
                     continue
 
-                from math import degrees
-                original_angle = degrees(self.odom_yaw)
-                self.test_angle = copysign(self.test_angle, self.reverse)
+                # Work entirely in radians; normalize_angle() is radian-based.
+                original_angle = self.odom_yaw                      # rad
+                test_angle_rad = copysign(radians(self.test_angle), self.reverse)
 
                 delta_angle = self.odom_angular_scale_correction * normalize_angle(
                     original_angle - self.last_angle)
-                self.calib_angle += delta_angle
-                error = self.test_angle - self.calib_angle
+                self.calib_angle += delta_angle                     # accumulated rad
+                error = test_angle_rad - self.calib_angle           # rad
                 self.last_angle = original_angle
 
-                if abs(error) > self.tolerance and self.start_test:
+                if abs(error) > radians(self.tolerance) and self.start_test:
                     move_cmd.angular.z = copysign(self.speed, error)
                 else:
                     self.calib_angle = 0.0
