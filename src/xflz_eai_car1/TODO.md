@@ -1101,51 +1101,169 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
 
 **实施步骤**:
 
-1. **启动底盘**
+**第一步：线性标定（往返法 + 尺子测量）**
+
+```bash
+# === 终端 1: 启动底盘 ===
+ros2 launch car1_bringup bringup.launch.py
+
+# === 终端 2: 启动标定节点 ===
+ros2 run calibration calibrate_linear
+
+# === 终端 3: 启动参数调节界面 ===
+rqt
+# Plugins → Configuration → Dynamic Reconfigure → calibrate_linear
+```
+
+**标定流程（往返法）**:
+
+1. **标记起点**
+   - 用胶带/粉笔在地上标记小车中心初始位置（十字标记）
+
+2. **第一次往返测试（系数 1.0）**
    ```bash
-   ros2 launch car1_bringup bringup.launch.py
+   # rqt 参数设置:
+   # - test_distance: 1.0
+   # - odom_linear_scale_correction: 1.0
+   # - speed: 0.2
+   # - 勾选 start_test → 小车前进 1m 停止
+   
+   # 切换方向倒车:
+   # - test_distance: -1.0
+   # - 勾选 start_test → 小车倒退 1m 停止
    ```
 
-2. **线性标定**（直行 1m）
-   ```bash
-   # 新终端
-   ros2 run calibration calibrate_linear
-   
-   # 用 rqt_reconfigure 调整参数:
-   # - test_distance: 1.0 (目标距离)
-   # - speed: 0.2 (测试速度)
-   # - start_test: True (开始测试)
-   
-   # 观察实际行驶距离,调整 odom_linear_scale_correction
-   # 直到小车精确走 1m 停止
+3. **用尺子测量偏差**
+   - 小车停稳后，用尺子测量：车中心 到 起点十字标记 的距离
+   - 例如：偏差 = 8cm（在标记后方）
+
+4. **计算修正系数**
+   ```
+   单程误差 = 往返偏差 / 2 = 8 / 2 = 4cm
+   实际走了 = 100 - 4 = 96cm（以为是100cm）
+   修正系数 = 100 / 96 ≈ 1.042
    ```
 
-3. **角度标定**（原地转 360°）
+5. **第二次往返验证（系数 1.042）**
    ```bash
-   ros2 run calibration calibrate_angular
-   
-   # 用 rqt_reconfigure 调整参数:
-   # - test_angle: 360.0 (目标角度)
-   # - speed: 0.5 (旋转速度)
-   # - start_test: True (开始测试)
-   
-   # 观察实际旋转角度,调整 odom_angular_scale_correction
-   # 直到精确转 360° 停止
+   # 推车回起点十字标记
+   # rqt: odom_linear_scale_correction = 1.042
+   # 重复前进+倒退
+   # 用尺子测量偏差，应该 < 2cm
    ```
 
-4. **保存标定结果**
-   ```bash
-   # 编辑 driver/controller/config/calibrate_params.yaml
-   # 将最终的 linear_correction_factor 和 angular_correction_factor 写入
-   ```
+6. **记录最终系数**（例如：1.042）
 
-5. **重启验证**
-   ```bash
-   # Ctrl+C 停止 bringup,重新启动
-   ros2 launch car1_bringup bringup.launch.py
-   
-   # 运动测试:直行 1m + 原地转圈,观察墙是否重影
-   ```
+---
+
+**第二步：角度标定（手机指南针 + 3次测量取中位数）**
+
+```bash
+# === 终端 2: 切换到角度标定 ===
+# 按 Ctrl+C 停止 calibrate_linear
+ros2 run calibration calibrate_angular
+
+# === rqt 会自动刷新，切换到 calibrate_angular ===
+```
+
+**准备工作**:
+1. 打开手机指南针 APP（iOS 自带"测距仪"或 Android "Compass"）
+2. 校准指南针（按提示转动手机画"8"字）
+3. 用胶带/橡皮筋把手机固定在车顶中央（或拿在手上贴着车头）
+
+**标定流程（3次测量法）**:
+
+| 次数 | 操作 | 记录 |
+|------|------|------|
+| **第1次** | rqt: test_angle=360, 系数=1.0, start_test<br>记录: 起始角度(如45°) → 结束角度(如28°) | 偏差 = 28-45 = **-17°** |
+| **第2次** | 不动手机，再次 start_test<br>记录: 起始(28°) → 结束(如11°) | 偏差 = 11-28 = **-17°** |
+| **第3次** | 再次 start_test<br>记录: 起始(11°) → 结束(如-6° 或 354°) | 偏差 = -6-11 = **-17°** |
+
+**数据分析**:
+```
+3次偏差: -17°, -17°, -17° (一致性好)
+取中位数: -17°
+
+实际转角 = 360 + (-17) = 343°
+修正系数 = 360 / 343 ≈ 1.050
+```
+
+**角度换算技巧**（跨越0°时）:
+```python
+# 如果直接相减结果 > 180° 或 < -180°，需要修正:
+偏差 = (结束 - 起始 + 180) % 360 - 180
+
+例如: 起始10°, 结束350°
+偏差 = (350 - 10 + 180) % 360 - 180 = -20° (逆时针少转了20°)
+```
+
+**验证测试**:
+```bash
+# rqt: odom_angular_scale_correction = 1.050
+# 再测 1 次，偏差应该 < 2°
+```
+
+---
+
+**第三步：保存标定结果**
+
+```bash
+nano ~/ros2_ws/src/xflz_eai_car1/driver/controller/config/calibrate_params.yaml
+
+# 修改为实测值:
+/**:
+  ros__parameters:
+    linear_correction_factor: 1.042   # 你的线性系数
+    angular_correction_factor: 1.050  # 你的角度系数
+
+# 保存后重启
+# 终端1 Ctrl+C
+ros2 launch car1_bringup bringup.launch.py
+```
+
+---
+
+**第四步：验证效果**
+
+```bash
+# 1. 静止 yaw 偏置测试
+ros2 run tf2_ros tf2_echo odom base_footprint
+# 观察 yaw 值，应该从 3.8° 降到 < 0.5°
+
+# 2. 键盘遥控测试
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+# - 前进2-3米，观察轨迹是否笔直
+# - 原地转圈，观察是否回到起点朝向
+
+# 3. SLAM 运动测试（判断是否需要 laser_filters）
+ros2 launch car1_slam slam.launch.py
+# 用键盘遥控直行1-2m + 原地转360°
+# 盯着 RViz 里的墙:
+# - 墙重影/糊开 → odom 标定不够准，继续微调
+# - 墙清晰但机身附近有固定点 → 需要 P0-2: laser_filters
+```
+
+---
+
+**注意事项**:
+
+1. **往返法技巧**:
+   - 如果倒车功能不可用（test_distance=-1.0 不响应），改用单程重复测试
+   - 只测前进，手动推车回起点，多次测试看是否停在同一位置
+
+2. **尺子测量技巧**:
+   - 测量车中心到标记的距离（不是车头/车尾）
+   - 如果偏差很小（<1cm），说明已经很准
+
+3. **手机指南针技巧**:
+   - 手机要远离电机（放车后部）避免磁干扰
+   - 等小车完全停稳（5-10秒）再读数
+   - 如果3次偏差相差>5°，说明地面打滑或磁干扰，需降速或换地面
+
+4. **系数调整经验**:
+   - 第一次粗调：按10%步长（0.9, 1.0, 1.1）
+   - 接近目标后：按5%步长（1.05, 1.10）
+   - 最后精调：按2%步长（1.08, 1.10）
 
 **预期效果**:
 - 静止时 yaw 偏置显著减少(< 0.5°)
