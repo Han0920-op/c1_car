@@ -1093,189 +1093,127 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
 
 ### 🔴 P0 级优化（必须做,解决当前问题）
 
-#### P0-1: 里程计标定（解决 3.8° yaw 偏置）
+#### P0-1: 里程计标定
 
-**问题**: 当前 `calibrate_params.yaml` 全是默认值 1.0,相当于从未标定。这很可能就是静止时 yaw 有固定偏置、运动时墙重影的根本原因。
+> ⚠️ **代码事实纠正（2026-06-23 核实源码）**：
+> - `linear_correction_factor` **有效** —— `odom_publisher_node.py:192-193` 实际用它乘 odom 的 x/y。
+> - `angular_correction_factor` **当前无效** —— `odom_publisher_node.py:194` 计算 yaw 时**没有乘**这个系数。
+>   所以现在标定角度、把值填进 yaml 对里程计 yaw **毫无影响**，做了也白做。
+>   要让它生效，需先改 odom_publisher（在 yaw 积分处乘 angular_factor），见本节末「角度系数未接线」。
+> - 标定脚本 `calibrate_linear/angular` 是**自动开环驱动**：勾 `start_test` 后小车自己走，
+>   按 **odom 判断**走够 `test_distance` 就停；脚本**不写 yaml 文件**，最终系数要**手动填**。
+> - 因此**当前只做直线标定**即可；静止 3.8° yaw 偏置不归里程计标定管（属 IMU/EKF，见 P1-1）。
 
-**lander_pi 实际值**: `linear_correction_factor: 0.94`, `angular_correction_factor: 1.00`
+**lander_pi 实际值（对照）**: `linear_correction_factor: 0.94`, `angular_correction_factor: 1.00`
 
-**实施步骤**:
+**实施步骤（直线标定，自动脚本 + 尺子）**
 
-**第一步：线性标定（往返法 + 尺子测量）**
+> 角度标定先跳过（系数未接线，见上方纠正）。只做直线。
 
 ```bash
-# === 终端 1: 启动底盘 ===
+# 终端 1: 启动底盘
+cd /home/iflytek/ros2_ws && source install/setup.bash
 ros2 launch car1_bringup bringup.launch.py
 
-# === 终端 2: 启动标定节点 ===
+# 终端 2: 启动直线标定节点（自动驱动）
 ros2 run calibration calibrate_linear
 
-# === 终端 3: 启动参数调节界面 ===
-rqt
-# Plugins → Configuration → Dynamic Reconfigure → calibrate_linear
+# 终端 3: 参数调节界面
+ros2 run rqt_reconfigure rqt_reconfigure
+# 左侧选 calibrate_linear
 ```
 
-**标定流程（往返法）**:
+**标定流程（脚本自动走，你只管量实际距离）**:
 
-1. **标记起点**
-   - 用胶带/粉笔在地上标记小车中心初始位置（十字标记）
+1. **贴起点标记**：在车头正下方某固定点贴胶带/粉笔。
 
-2. **第一次往返测试（系数 1.0）**
-   ```bash
-   # rqt 参数设置:
-   # - test_distance: 1.0
-   # - odom_linear_scale_correction: 1.0
-   # - speed: 0.2
-   # - 勾选 start_test → 小车前进 1m 停止
-   
-   # 切换方向倒车:
-   # - test_distance: -1.0
-   # - 勾选 start_test → 小车倒退 1m 停止
+2. **第一次测试（系数 1.0）**
+   - rqt 确认：`test_distance=1.0`、`odom_linear_scale_correction=1.0`、`speed=0.2`
+   - 勾选 `start_test` → 小车自动前进，odom 判断走够 1m 就停（终端 2 打印 `finish`）
+
+3. **用尺子量实际距离**
+   - 量起点标记到车头当前位置 = 实际走的距离
+   - 例如实际只走了 **0.94m**（odom 以为是 1.0m）
+
+4. **算系数**
    ```
-
-3. **用尺子测量偏差**
-   - 小车停稳后，用尺子测量：车中心 到 起点十字标记 的距离
-   - 例如：偏差 = 8cm（在标记后方）
-
-4. **计算修正系数**
+   系数 = 目标距离 / 实际距离 = 1.0 / 0.94 ≈ 1.064
    ```
-   单程误差 = 往返偏差 / 2 = 8 / 2 = 4cm
-   实际走了 = 100 - 4 = 96cm（以为是100cm）
-   修正系数 = 100 / 96 ≈ 1.042
-   ```
+   含义：odom 报告偏小，乘 1.064 放大到真实值。
 
-5. **第二次往返验证（系数 1.042）**
-   ```bash
-   # 推车回起点十字标记
-   # rqt: odom_linear_scale_correction = 1.042
-   # 重复前进+倒退
-   # 用尺子测量偏差，应该 < 2cm
-   ```
+5. **验证**
+   - rqt 把 `odom_linear_scale_correction` 改成 `1.064`
+   - 小车放回起点，再勾 `start_test`
+   - 这次实际应接近 1.0m（误差 <3cm 合格）
 
-6. **记录最终系数**（例如：1.042）
+6. **记下最终系数**（例如 1.064）
 
----
+> 不需要往返、不需要倒车、不需要指南针。单程量距离即可。
 
-**第二步：角度标定（手机指南针 + 3次测量取中位数）**
-
-```bash
-# === 终端 2: 切换到角度标定 ===
-# 按 Ctrl+C 停止 calibrate_linear
-ros2 run calibration calibrate_angular
-
-# === rqt 会自动刷新，切换到 calibrate_angular ===
-```
-
-**准备工作**:
-1. 打开手机指南针 APP（iOS 自带"测距仪"或 Android "Compass"）
-2. 校准指南针（按提示转动手机画"8"字）
-3. 用胶带/橡皮筋把手机固定在车顶中央（或拿在手上贴着车头）
-
-**标定流程（3次测量法）**:
-
-| 次数 | 操作 | 记录 |
-|------|------|------|
-| **第1次** | rqt: test_angle=360, 系数=1.0, start_test<br>记录: 起始角度(如45°) → 结束角度(如28°) | 偏差 = 28-45 = **-17°** |
-| **第2次** | 不动手机，再次 start_test<br>记录: 起始(28°) → 结束(如11°) | 偏差 = 11-28 = **-17°** |
-| **第3次** | 再次 start_test<br>记录: 起始(11°) → 结束(如-6° 或 354°) | 偏差 = -6-11 = **-17°** |
-
-**数据分析**:
-```
-3次偏差: -17°, -17°, -17° (一致性好)
-取中位数: -17°
-
-实际转角 = 360 + (-17) = 343°
-修正系数 = 360 / 343 ≈ 1.050
-```
-
-**角度换算技巧**（跨越0°时）:
-```python
-# 如果直接相减结果 > 180° 或 < -180°，需要修正:
-偏差 = (结束 - 起始 + 180) % 360 - 180
-
-例如: 起始10°, 结束350°
-偏差 = (350 - 10 + 180) % 360 - 180 = -20° (逆时针少转了20°)
-```
-
-**验证测试**:
-```bash
-# rqt: odom_angular_scale_correction = 1.050
-# 再测 1 次，偏差应该 < 2°
-```
-
----
-
-**第三步：保存标定结果**
+**保存标定结果**
 
 ```bash
 nano ~/ros2_ws/src/xflz_eai_car1/driver/controller/config/calibrate_params.yaml
-
-# 修改为实测值:
+```
+```yaml
 /**:
   ros__parameters:
-    linear_correction_factor: 1.042   # 你的线性系数
-    angular_correction_factor: 1.050  # 你的角度系数
-
-# 保存后重启
-# 终端1 Ctrl+C
-ros2 launch car1_bringup bringup.launch.py
+    linear_correction_factor: 1.064   # ← 填你量出来的系数
+    angular_correction_factor: 1.00   # 暂不动（代码未使用，见下方）
 ```
+保存后**重启 bringup** 即生效（yaml 在启动时被 `chassis_controller.launch.py:44` 读取，无需编译）。
 
----
-
-**第四步：验证效果**
+**验证标定生效**
 
 ```bash
-# 1. 静止 yaw 偏置测试
-ros2 run tf2_ros tf2_echo odom base_footprint
-# 观察 yaw 值，应该从 3.8° 降到 < 0.5°
+# 1. 确认参数被读取
+ros2 param get /odom_publisher linear_correction_factor
+# 期望: Double value is: 1.064
 
-# 2. 键盘遥控测试
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-# - 前进2-3米，观察轨迹是否笔直
-# - 原地转圈，观察是否回到起点朝向
-
-# 3. SLAM 运动测试（判断是否需要 laser_filters）
-ros2 launch car1_slam slam.launch.py
-# 用键盘遥控直行1-2m + 原地转360°
-# 盯着 RViz 里的墙:
-# - 墙重影/糊开 → odom 标定不够准，继续微调
-# - 墙清晰但机身附近有固定点 → 需要 P0-2: laser_filters
+# 2. 实地验证：走一段，尺子量实际距离，对比 odom 报告
+ros2 topic echo /odom_raw --field pose.pose.position.x
+# odom 报告的 x 应与尺子实测接近（误差 <3%）
 ```
+
+**验收标准**
+- [ ] `ros2 param get /odom_publisher linear_correction_factor` 返回标定值
+- [ ] 走 1m，odom 报告与尺子实测误差 <3cm
+
+**「角度系数未接线」—— 如需让 angular 标定生效**
+
+`odom_publisher_node.py:194` 当前是：
+```python
+self.odom.pose.pose.orientation = rpy2qua(0.0, 0.0, self.pose_yaw)
+```
+`pose_yaw` 在 186 行积分时没乘 `angular_factor`。要启用角度标定，需改为对 yaw 增量应用系数（例如在 186 行 `delta_yaw = self.angular_z * dt * self.angular_factor`）。**改完才值得跑 `calibrate_angular`**。是否要改由后续决定。
+
+**时间估计**: 直线标定约 20 分钟
+
+**涉及文件**:
+- `driver/controller/config/calibrate_params.yaml`（填系数）
+- `calibration/calibration/calibrate_linear.py`（标定工具，自动驱动）
+- `driver/controller/controller/odom_publisher_node.py`（消费系数；angular 待接线）
 
 ---
 
-**注意事项**:
+### 校准文件归属约定（对照 lander_pi 验证，2026-06-23）
 
-1. **往返法技巧**:
-   - 如果倒车功能不可用（test_distance=-1.0 不响应），改用单程重复测试
-   - 只测前进，手动推车回起点，多次测试看是否停在同一位置
+> 核实了 car1 与 lander_pi 两套栈的校准文件实际分布与读写关系后确认：**两者布局几乎一致，当前 car1 无需搬迁任何文件**。原则是「按消费者就近」，不是「全部塞进 calibration 包」。
 
-2. **尺子测量技巧**:
-   - 测量车中心到标记的距离（不是车头/车尾）
-   - 如果偏差很小（<1cm），说明已经很准
+| 校准类型 | 文件 | 所在文件夹 | 生产者 | 消费者 | car1 vs lander_pi |
+|---|---|---|---|---|---|
+| 里程计 | `calibrate_params.yaml` | `driver/controller/config/` | 标定脚本不写，手动填 | controller launch | ✅ 完全一致 |
+| 舵机偏置 | `servo_offsets.yaml` | `calibration/config/` | `calibrate_servo` 写 | base_driver 跨包读 | car1 独有，工作正常 |
+| IMU | `imu_calib.yaml` | `calibration/config/` | 外部工具（六面/转台） | peripherals/imu_filter launch 跨包读 | car1 未来加，照搬此位置 |
+| 相机 | (rgbd) `calibration.yaml` | 视觉模块自己的 config | 视觉标定脚本 | 该模块自用 | 就近原则 |
 
-3. **手机指南针技巧**:
-   - 手机要远离电机（放车后部）避免磁干扰
-   - 等小车完全停稳（5-10秒）再读数
-   - 如果3次偏差相差>5°，说明地面打滑或磁干扰，需降速或换地面
+**约定**：
+1. **里程计** `calibrate_params.yaml` 留在 `controller/config/`（与 ekf/init_pose 同属底盘运行参数；lander_pi 也这么放）。
+2. **舵机偏置** `servo_offsets.yaml` 留在 `calibration/config/`（base_driver 已跨包读，勿动）。
+3. **未来 IMU 校准** `imu_calib.yaml` → 放 `calibration/config/`，跟随 servo_offsets 的跨包读模式（与 lander_pi 一致）。建议保留一份历史备份（lander_pi 用 `bk.yaml`）。
+4. **不为统一而搬迁可工作的文件** —— 移动 `calibrate_params.yaml` 要改 launch 跨包路径，收益小、风险实。
 
-4. **系数调整经验**:
-   - 第一次粗调：按10%步长（0.9, 1.0, 1.1）
-   - 接近目标后：按5%步长（1.05, 1.10）
-   - 最后精调：按2%步长（1.08, 1.10）
-
-**预期效果**:
-- 静止时 yaw 偏置显著减少(< 0.5°)
-- 运动时墙单层清晰,不重影
-- SLAM 建图质量提升
-
-**时间估计**: 30 分钟
-
-**涉及文件**:
-- `driver/controller/config/calibrate_params.yaml`
-- `calibration/calibration/calibrate_linear.py`
-- `calibration/calibration/calibrate_angular.py`
+---
 
 ---
 
