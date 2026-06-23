@@ -1378,7 +1378,7 @@ ros2 launch car1_peripherals teleop_key.launch.py
 > - 修复后残留误差仅约 6%，正是 `correction_factor` 该补偿的量级。
 >
 > **如果你的小车出现「速度异常快 / 转好几圈才停」，先检查上述两处是否已修复，不要急着调校准系数。**
-> 直连下位机验证工具见仓库根目录 `chassis_serial_test.py`（绕过 ROS，复刻 board_sdk 协议：查表 CRC8、开串口前 rts/dtr=False、先发 set_motor_type 初始化）。
+> 直连下位机验证工具见 `calibration/scripts/chassis_serial_test.py`（绕过 ROS，复刻 board_sdk 协议：查表 CRC8、开串口前 rts/dtr=False、先发 set_motor_type 初始化）。
 
 > ⚠️ **rqt_reconfigure 不是必需的**。若环境未装（`Package 'rqt_reconfigure' not found`），
 > 直接用 `ros2 param set` 命令行设置参数即可，效果完全一样。本节用命令行方式。

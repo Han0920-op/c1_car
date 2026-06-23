@@ -1127,7 +1127,7 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
 - `calibrate_linear.py`：改读 /odom_raw + 单向前进（修前后横跳震荡）
 - `calibrate_angular.py`：改读 /odom_raw + 累加幅度单向旋转（修单位 bug + 正反馈发散转不停）
 - `odom_publisher_node.py:186`：yaw 增量乘 angular_factor（接线角度系数）
-- 新增 `chassis_serial_test.py`：直连下位机测试工具（查表 CRC8 + rts/dtr=False + set_motor_type 初始化）
+- 新增 `calibration/scripts/chassis_serial_test.py`：直连下位机测试工具（查表 CRC8 + rts/dtr=False + set_motor_type 初始化）
 
 **操作流程**：见 `tutorial.md` 3.0.1（直线）/ 3.0.2（角度）/ 3.0.3（验证）。要点：
 1. 命令行 `ros2 param set` 设参数触发（rqt_reconfigure 未装也行）
