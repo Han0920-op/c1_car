@@ -183,7 +183,7 @@ class OdomPublisherNode(Node):
 
             delta_x = self.linear_x * dt * math.cos(self.pose_yaw)
             delta_y = self.linear_x * dt * math.sin(self.pose_yaw)
-            delta_yaw = self.angular_z * dt
+            delta_yaw = self.angular_z * dt * self.angular_factor
 
             self.x += delta_x
             self.y += delta_y
