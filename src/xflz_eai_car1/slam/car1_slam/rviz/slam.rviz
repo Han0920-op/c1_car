@@ -8,6 +8,8 @@ Panels:
         - /Status1
         - /LaserScan1/Topic1
         - /Map1
+        - /Map1/Topic1
+        - /Map1/Update Topic1
         - /RobotModel1
         - /RobotModel1/Description Topic1
         - /TF1
@@ -68,9 +70,9 @@ Visualization Manager:
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
-      Max Intensity: 255
+      Max Intensity: 241
       Min Color: 0; 0; 0
-      Min Intensity: 17
+      Min Intensity: 21
       Name: LaserScan
       Position Transformer: XYZ
       Selectable: true
@@ -95,7 +97,7 @@ Visualization Manager:
       Name: Map
       Topic:
         Depth: 5
-        Durability Policy: Volatile
+        Durability Policy: Transient Local
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
@@ -444,5 +446,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 3072
-  X: 0
-  Y: 34
+  X: 11
+  Y: 45

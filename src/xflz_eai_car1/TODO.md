@@ -2470,3 +2470,126 @@ ros2 launch car1_app navigation_transport.launch.py \
 - [ ] RViz 中模型姿态与实物一致
 - [ ] 实时更新（延迟 < 200ms）
 - [ ] 可用于辅助 Level 2-5 的调试
+
+<!-- APPEND-SLAM-DIAG-ANCHOR -->
+
+---
+
+## Phase 3.6: SLAM 双线/漂移根因诊断与修复计划（2026-06-24）
+
+> **本节是一份"下次进来照着做"的修复手册**。已通过多个独立实测把根因钉死，
+> 不需要重新诊断，直接按"修复步骤"执行 + "验证实验"确认即可。
+
+### 一、问题现象（实测，全部复现）
+
+建图后地图质量差，三个现象：
+1. **墙体双线/重影** —— 算法检测到 344 处平行墙（间隔 5~20cm），23% 墙体厚度 >15cm（正常应 5~10cm）。
+2. **闭环误差大** —— 车回到物理原点时，slam 认为车在 `(0.81, 0.52)m, yaw=-29.3°`（真值应为 `0,0,0°`）。位置差 ≈0.97m，**航向差 ≈29°**。
+3. **实时点云-地图失配 64%** —— 静止时只有 36% 激光点落在地图墙上（健康应 >80%），因为实时航向错 29°，投影方向偏。
+
+### 二、根因（已用证据锁定，一个根因串起全部现象）
+
+**总根因：IMU 旋转通道失效 + 麦轮开环里程计 → 航向无绝对参考，累积漂移 ~29°/圈。**
+
+证据链：
+- **IMU 坏**：发 `cmd_vel angular.z=0.6 rad/s`（实测真实转速），IMU 原始 `imu_raw.gz` 只报 ~0.02 rad/s，**缩小约 29 倍**。静止时 IMU 零漂正常（±0.0003），一转动就"装死"。
+- **bug 位置**：下位机固件 `xflz_eai_car1_base_controller_client/base/Core/Src/bmi088.c:130-131`：
+  ```c
+  BMI088_I2C_Write_Reg(hi2c, bmi088_gyro_addr, 0x0F, 0x01);  // 量程寄存器=0x01(±1000°/s)
+  gyro_scale = 1000.0f * 2.0f / 32768.0f;  // 多乘了2，等于按±2000°/s算（应为 1000/32768）
+  ```
+  scale 公式多乘 2 是一个 bug；但实测缩小 29 倍 ≠ 2 倍，说明**量程寄存器 0x0F 很可能根本没写进芯片**（I2C 时序/HAL_Delay 问题），陀螺仪停在某默认/异常状态，实际灵敏度与代码假设差 ~29 倍。
+- **当前 IMU 已被禁用**（正确处置）：`driver/controller/config/ekf.yaml` 的 `imu0_config` 全 false（commit 93104c5）。EKF 纯靠 odom。
+- **odom 是开环积分 cmd_vel 指令**，不读编码器（见 P0-1 记录）。航向漂移无任何外部校正 → 累积 29°。
+- **odom 航向计算不用雷达**，所以 29° 漂移与雷达无关。
+
+### 三、非根因（已排除，不要在这些上浪费时间）
+
+- **雷达视野 220°（后方 140° 缺失）**：是车身物理遮挡，驱动 `node_lidar.cpp:631-632` 主动裁到 ±110° 是**正确**的（后方全是打在车身的假点）。220° 对 slam_toolbox 足够，**不是双线原因**，也无法软件恢复。它只是次要放大因素（视野窄→扫描匹配纠正 odom 的能力弱）。
+- **雷达硬件**：静止测距跨帧抖动 <1.5mm，无自遮挡（异常近距点 0%），数据质量好。
+- **slam.yaml 参数**：已优化（minimum_travel_heading=0.02 等，见 Phase 3.5），不是瓶颈。
+- **建图操作/速度**：已用校准甜点速度（线 0.2m/s、角 0.3 rad/s），操作层到顶。
+
+<!-- APPEND-SLAM-DIAG-ANCHOR-2 -->
+
+### 四、修复方案（按优先级，先 A 后 B）
+
+#### 方案 A（治本，最大杠杆）：修 IMU 固件，恢复陀螺仪航向
+
+**为什么**：航向 29° 是主因，位置 0.97m 大部分是被航向放大的。修好 IMU → EKF 融合陀螺仪 vyaw → 航向有绝对参考 → 双线/漂移/失配三个现象一起大幅改善。
+
+**⚠️ 需要 Windows + Keil + ST-Link**（固件无命令行编译，见 `xflz_eai_car1_base_controller_client/CLAUDE.md`）。
+
+**修复步骤**：
+1. 改 `bmi088.c` `BMI088_Gyro_Init()`（约 126-135 行）：
+   - 修正 scale：`gyro_scale = 1000.0f / 32768.0f;`（去掉多乘的 2，对应 ±1000°/s 量程）
+   - **加量程寄存器回读校验**：写 `0x0F=0x01` 后立即读回，确认值确实是 0x01；若不是则重写/报错。这是排查"29 倍"的关键——确认量程真的设进芯片。
+   - 可选：把 `HAL_Delay(5)` 从读写函数里挪走（5ms 任务里的阻塞延时可能导致 I2C 配置时序问题）。
+2. Windows Keil 打开 `base/MDK-ARM/` 工程 → 编译 → ST-Link 烧录。
+3. 烧录后按"验证实验"确认。
+
+**修复后还要做的 ROS 端改动**（在板子上，可命令行编译）：
+4. 改 `driver/controller/config/ekf.yaml` 的 `imu0_config`，启用 yaw 角速度（第12位 vyaw）：
+   ```
+   imu0_config: [false,false,false, false,false,false, false,false,false, false,false,true, false,false,false]
+   ```
+   （参考 lander_pi 的 ekf.yaml：它用第6位 yaw + 第12位 vyaw）
+5. `colcon build --packages-select controller --symlink-install` → 重启 bringup。
+
+#### 方案 B（治本第二步，可选）：编码器闭环 odom
+
+修直线打滑残留。**也要烧固件**（让固件回传真实轮速）。详见 Phase 3.5 Step 3。**必须先做 A**——B 单独做无法解决航向（编码器测不准麦轮侧滑导致的航向偏差）。
+
+#### 方案 C（临时凑合）：用现有双线图导航
+
+不推荐。AMCL 在双线图上定位易飘。仅在急需往下走时临时用。
+
+### 五、验证实验（修复后照做，对比修复前的基线）
+
+**基线（修复前实测值，用于对比）**：
+- 转动测试：cmd 0.6 rad/s → IMU 报 0.02 rad/s（差 29 倍）
+- 回原点：slam 认为 yaw=-29.3°、位置 (0.81,0.52)
+- 点云匹配：贴墙 36%
+
+**实验 1：IMU 转动响应**（最直接，判断固件修复是否生效）
+```bash
+# 发 0.6 rad/s 转动，同时读 imu_raw.gz；修复后两者应接近（差 <20%），而非差 29 倍
+# 脚本逻辑：发 cmd_vel angular.z=0.6 → 读 /car1_base_driver/imu_raw 的 angular_velocity.z
+```
+✅ 通过标准：IMU gz ≈ 0.6 rad/s（不再是 0.02）
+
+**实验 2：回原点闭环误差**（判断整体改善）
+```bash
+# 启动 slam，手动开车走一圈再精确回到物理原点
+ros2 launch car1_slam slam.launch.py
+ros2 run tf2_ros tf2_echo map base_footprint   # 看 yaw 偏差
+```
+✅ 通过标准：回原点时 yaw 偏差 < 5°（修复前 29°），位置偏差 < 0.2m（修复前 0.97m）
+
+**实验 3：点云-地图匹配度**
+```bash
+# 静止时统计激光点落在地图墙上的比例（脚本见对话记录，投影 laser→map 比对占用格）
+```
+✅ 通过标准：贴墙率 > 80%（修复前 36%）
+
+**实验 4：建图双线**
+```bash
+# 重新建一圈，存图后程序检测平行墙数量 + 墙厚分布
+ros2 run nav2_map_server map_saver_cli -f /home/iflytek/ros2_ws/my_map --ros-args -p map_subscribe_transient_local:=true
+```
+✅ 通过标准：双线嫌疑 < 50 处（修复前 344），墙厚 >15cm 占比 < 5%（修复前 23%）
+
+### 六、关键文件清单
+
+| 文件 | 改什么 | 在哪编译 |
+|------|--------|---------|
+| `xflz_eai_car1_base_controller_client/base/Core/Src/bmi088.c:126-135` | scale 修正 + 量程回读校验 | **Windows Keil** |
+| `driver/controller/config/ekf.yaml` | imu0_config 启用 vyaw | 板子 colcon |
+| （参考）`src/lander_pi/driver/controller/config/ekf.yaml:163-168` | 对照 IMU 用法 | — |
+
+### 七、一句话总结
+
+**双线、29°漂移、点云失配是同一个病的三个症状，根因是 IMU 陀螺仪固件 scale/量程 bug（缩小~29倍）导致航向无绝对参考。修固件（方案A）是唯一治本路径，需 Windows 烧录。雷达 220° 视野和 slam 参数都不是原因，不要再动。**
+
+
+

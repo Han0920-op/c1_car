@@ -34,7 +34,7 @@ ODOM_TWIST_COVARIANCE = list(map(float,
      0, 0, 1e6, 0, 0, 0,
      0, 0, 0, 1e6, 0, 0,
      0, 0, 0, 0, 1e6, 0,
-     0, 0, 0, 0, 0, 1e3]))
+     0, 0, 0, 0, 0, 1e-2]))
 
 ODOM_TWIST_COVARIANCE_STOP = list(map(float,
     [1e-9, 0, 0, 0, 0, 0,

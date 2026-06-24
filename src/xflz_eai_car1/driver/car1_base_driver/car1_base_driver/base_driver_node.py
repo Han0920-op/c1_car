@@ -145,12 +145,13 @@ class BaseDriverNode(Node):
         msg = Imu()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.imu_frame
-        msg.linear_acceleration.x = ax * 9.80665
-        msg.linear_acceleration.y = ay * 9.80665
-        msg.linear_acceleration.z = az * 9.80665
-        msg.angular_velocity.x = math.radians(gx)
-        msg.angular_velocity.y = math.radians(gy)
-        msg.angular_velocity.z = math.radians(gz)
+        # Firmware already sends m/s² for accel and rad/s for gyro — use directly
+        msg.linear_acceleration.x = ax
+        msg.linear_acceleration.y = ay
+        msg.linear_acceleration.z = az
+        msg.angular_velocity.x = gx
+        msg.angular_velocity.y = gy
+        msg.angular_velocity.z = gz
         self.imu_pub.publish(msg)
 
     def _pub_battery(self):

@@ -30,12 +30,13 @@
       odom0_differential: false
       odom0_relative: false
 
-      # IMU input: use yaw and yaw rate
+      # IMU input: disabled — IMU rotation data is faulty (reports ~0 for both
+      # absolute yaw and yaw rate during rotation). EKF relies on odom for yaw.
       imu0: imu
       imu0_config: [false, false, false,
-                    false, false, true,
                     false, false, false,
-                    false, false, true,
+                    false, false, false,
+                    false, false, false,
                     false, false, false]
       imu0_nodelay: false
       imu0_differential: false

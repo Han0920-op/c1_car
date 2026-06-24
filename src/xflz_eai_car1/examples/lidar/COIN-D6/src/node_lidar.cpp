@@ -262,7 +262,7 @@ int read_forever()
 						node_lidar._lock.lock();
 						if((node_lidar.lidar_time.scan_time_current - node_lidar.lidar_time.scan_time_record) > 2000)
 						{
-							printf("full----- count=%d,time=%lld\n",scan_count,current_times());
+							// printf("full----- count=%d,time=%lld\n",scan_count,current_times());
 							node_lidar.lidar_time.scan_time_record = node_lidar.lidar_time.scan_time_current;
 						}
 						node_lidar.lidar_time.scan_start_time = node_lidar.lidar_time.tim_scan_start;
@@ -354,8 +354,8 @@ int send_lidar_data(LaserScan &outscan)
 	outscan.config.angle_increment = (2.0*M_PI/count);
 	outscan.config.min_angle = 0;
 	outscan.config.max_angle = outscan.config.angle_increment * (actual_points - 1);
-	outscan.config.min_range = 0.10;
-	outscan.config.max_range = 10.0;
+	outscan.config.min_range = 0.05;
+	outscan.config.max_range = 12.0;
 	outscan.config.scan_time =  static_cast<float>(scan_time * 1.0 / 1e9);
 	outscan.config.time_increment = outscan.config.scan_time / (double)(count - 1);
 	outscan.stamp = node_lidar.lidar_time.scan_start_time;
@@ -642,7 +642,11 @@ int node_start(int argc, char **argv)
 			scan_msg->ranges.resize(out_count, std::numeric_limits<float>::infinity());
 			scan_msg->intensities.resize(out_count, 0.0f);
 
-			scan_msg->header.stamp = node->get_clock()->now();
+			// Stamp at scan START, not publish time: back off one full sweep
+			// so slam_toolbox matches the scan against the correct odom pose.
+			scan_msg->header.stamp =
+				node->get_clock()->now()
+				- rclcpp::Duration::from_seconds(scan.config.scan_time);
 			scan_msg->header.frame_id = node_lidar.lidar_general_info.frame_id;
 
 			scan_msg->angle_min = ros_angle_min;
@@ -674,9 +678,9 @@ int node_start(int argc, char **argv)
 			}
 
 			laser_pub->publish(*scan_msg);
-			printf("published scan: %d points (from %zu raw), subs=%zu\n",
-				out_count, num_raw, laser_pub->get_subscription_count());
-			fflush(stdout);
+			// printf("published scan: %d points (from %zu raw), subs=%zu\n",
+			// 	out_count, num_raw, laser_pub->get_subscription_count());
+			// fflush(stdout);
       	}
 	}
 	node_lidar.serial_port->write_data(end_lidar,4);

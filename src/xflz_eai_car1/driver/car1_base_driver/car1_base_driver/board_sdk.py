@@ -237,7 +237,14 @@ class Board:
         buf.append(len(data))
         buf.extend(data)
         buf.append(_checksum_crc8(bytes(buf[2:])))
-        self.port.write(bytes(buf))
+
+        # DEBUG: 打印发送的包
+        import sys
+        packet_bytes = bytes(buf)
+        sys.stdout.write(f"[SERIAL TX] {packet_bytes.hex(' ')}\n")
+        sys.stdout.flush()
+
+        self.port.write(packet_bytes)
 
     def set_led(self, on_time, off_time, repeat=1, led_id=1):
         on_time_ms = int(on_time * 1000)

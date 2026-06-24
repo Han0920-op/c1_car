@@ -19,11 +19,11 @@ slam_toolbox:
     mode: mapping
 
     # Procesing rate (sec)
-    map_update_interval: 5.0
+    map_update_interval: 0.1
     resolution: 0.05
     max_laser_range: 12.0
-    minimum_time_interval: 0.5
-    transform_timeout: 1.0
+    minimum_time_interval: 0.1
+    transform_timeout: 0.2
     tf_buffer_duration: 30.0
     stack_size_to_use: 40000000
 
@@ -34,6 +34,13 @@ slam_toolbox:
     map_file_name: ''
     map_start_pose: [0.0, 0.0, 0.0]
     map_start_at_dock: true
+
+    # Scan acceptance thresholds (without these slam_toolbox falls back to
+    # 0.5m / 0.5rad defaults, so the map only updates after large moves)
+    minimum_travel_distance: 0.01
+    minimum_travel_heading: 0.02
+    scan_buffer_size: 100
+    scan_buffer_maximum_scan_distance: 12.0
 
     debug_logging: false
     enable_interactive_mode: true
@@ -49,6 +56,12 @@ slam_toolbox:
     loop_search_space_smear_deviation: 0.03
     loop_search_maximum_distance: 3.0
     do_loop_closing: true
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
 
     # Scan matcher params
     distance_variance_penalty: 0.5
