@@ -1064,6 +1064,308 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
 
 ---
 
+## Phase 3.5: SLAM 建图验证与优化（2026-06-24）
+
+> **目标**：验证里程计校准后的建图质量，按需渐进式优化 odom 精度  
+> **前置条件**：P0-1 里程计标定已完成（linear=0.961, angular=0.964）  
+> **实施策略**：先验证当前效果，只在发现问题时才做后续优化
+
+### 实施流程
+
+```
+Step 1: 基础建图验证（必做）
+    ↓
+  效果评估：墙清晰？闭环成功？
+    ↓
+  ├─ 足够好 → 完成，进入 Phase 4 导航
+  └─ 有问题 → Step 2
+    ↓
+Step 2: IMU 偏置估计（5分钟，快速改进）
+    ↓
+  重新建图验证
+    ↓
+  ├─ 足够好 → 完成
+  └─ 仍有问题 → Step 3
+    ↓
+Step 3: 编码器闭环 odom（半天，彻底解决）
+```
+
+---
+
+### Step 1: 基础建图验证 ⏳ 待做
+
+**目标**：确认当前 <1% odom 误差对 slam_toolbox 是否够用
+
+#### 操作步骤
+
+```bash
+# 1. 确认校准系数生效
+ros2 param get /odom_publisher linear_correction_factor   # 应为 0.961
+ros2 param get /odom_publisher angular_correction_factor  # 应为 0.964
+
+# 2. 启动 SLAM（包含 bringup + 雷达 + slam_toolbox + RViz）
+ros2 launch car1_slam slam.launch.py
+
+# 3. 键盘遥控建图（SSH 远程用 topic pub 替代）
+# 新终端
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+# 或用 topic pub（SSH 友好）：
+# 前进 3s: timeout 3 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.15}}" --rate 10
+# 左转 2s: timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{angular: {z: 0.3}}" --rate 10
+# 右转 2s: timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{angular: {z: -0.3}}" --rate 10
+# 左平移 2s: timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {y: 0.15}}" --rate 10
+
+# 4. 建图技巧
+#    - 速度慢（linear ≤ 0.15 m/s，angular ≤ 0.3 rad/s）
+#    - 缓慢移动，避免急转弯
+#    - 走闭环（回到起点），触发回环检测
+```
+
+#### 效果评估标准
+
+**✅ 足够好（可进入 Phase 4）**：
+- [ ] 墙清晰，无双层重影
+- [ ] 直行 5-10m 后墙仍清晰（局部匹配成功）
+- [ ] 回到起点时，起点墙与终点墙对齐（闭环成功）
+- [ ] 地图可用于导航（障碍物位置准确）
+
+**⚠️ 需要改进（进入 Step 2）**：
+- [ ] 墙轻微扭曲 / 闭环后有 <10cm 错位
+- [ ] 静止时机器人位姿缓慢漂移（yaw 角度）
+
+**❌ 需要彻底解决（跳到 Step 3）**：
+- [ ] 墙严重重影（双层/三层）
+- [ ] 闭环完全失败（起点终点错位 >20cm）
+- [ ] 长时间运动后地图变形
+
+#### 常见问题定位
+
+| 现象 | 可能原因 | 定位方法 |
+|------|---------|---------|
+| **墙双层重影** | odom 误差太大 / 激光自遮挡 | 原地转 360° 看机身附近是否有固定点云跟着转 |
+| **闭环失败** | 累计漂移超出搜索范围 | 查看日志 "loop closure failed" |
+| **角度缓慢漂移** | IMU 零偏 / EKF 权重不对 | 静止 30s 观察 /odometry/filtered 的 yaw |
+| **短距离就重影** | 标定系数未生效 / 打滑严重 | `ros2 param get /odom_publisher` 确认系数 |
+
+#### 涉及文件
+
+- `slam/car1_slam/launch/slam.launch.py` — SLAM 启动文件
+- `slam/car1_slam/config/slam.yaml` — slam_toolbox 配置
+- `driver/controller/config/calibrate_params.yaml` — 里程计校准系数
+
+---
+
+### Step 2: IMU 偏置估计（快速改进）⏳ 待做
+
+**触发条件**：Step 1 发现"角度缓慢漂移"或"闭环轻微错位"
+
+**原理**：启用 Madgwick 滤波器自动学习陀螺仪零偏，减少 EKF 融合后的角度累积误差
+
+#### 操作步骤
+
+1. **修改配置**
+
+   编辑 `driver/controller/launch/chassis_controller.launch.py`（约 50 行附近）：
+
+   ```python
+   imu_filter_node = Node(
+       package='imu_filter_madgwick',
+       executable='imu_filter_madgwick_node',
+       name='imu_filter',
+       parameters=[{
+           'use_mag': False,
+           'publish_tf': False,
+           'world_frame': 'enu',
+           'fixed_frame': 'base_link',
+           'do_bias_estimation': True,     # 新增
+           'bias_alpha': 0.01,              # 新增
+       }],
+       ...
+   )
+   ```
+
+2. **重新编译**
+   ```bash
+   colcon build --packages-select controller --symlink-install
+   source install/setup.bash
+   ```
+
+3. **重启验证**
+   ```bash
+   # 重启 bringup
+   ros2 launch car1_bringup bringup.launch.py
+   
+   # 静止 30s，观察 IMU 角速度是否接近 0
+   ros2 topic echo /imu --field angular_velocity
+   ```
+
+4. **重新建图**（重复 Step 1 流程，对比效果）
+
+#### 验收标准
+
+- [ ] 静止时 IMU 角速度 < 0.001 rad/s
+- [ ] 闭环错位减小到 <5cm
+- [ ] 长时间运动角度漂移减小
+
+#### 时间估计
+
+5 分钟改配置 + 10 分钟重新建图验证
+
+#### 涉及文件
+
+- `driver/controller/launch/chassis_controller.launch.py`
+
+---
+
+### Step 3: 编码器闭环 odom（彻底解决）⏳ 待做
+
+**触发条件**：Step 2 后仍有严重重影 / 闭环失败
+
+**原理**：固件已读编码器计算实际轮速 `Wheel.RT`，让 ROS 端用**实测轮速**积分 odom，消除打滑累积误差
+
+#### 前置确认
+
+固件已有编码器驱动（已确认）：
+```c
+// kinematics.c:61-72
+int16_t raw_a = encoder_a_get_counter();  // 读编码器
+Wheel_A.RT = (float)(-raw_a * MEC_WHEEL_SCALE);  // 实测轮速
+```
+
+但**未回传给 ROS**，需补充协议。
+
+#### 实施步骤
+
+##### 阶段 1：固件加回传协议（需 Windows 烧录）
+
+1. **修改固件协议**（`protocol.c`）
+
+   添加轮速回传功能：
+
+   ```c
+   // 新增：功能码 0x03 子功能 0x02 - 读取轮速
+   void send_wheel_speeds() {
+       uint8_t data[17];
+       data[0] = 0x02;  // 子功能：读速度
+       memcpy(&data[1], &Wheel_A.RT, 4);   // 4 个 float (m/s)
+       memcpy(&data[5], &Wheel_B.RT, 4);
+       memcpy(&data[9], &Wheel_C.RT, 4);
+       memcpy(&data[13], &Wheel_D.RT, 4);
+       protocol_send_packet(PACKET_FUNC_MOTOR, data, 17);
+   }
+   
+   // 在 PID 循环（200Hz）里定时发送
+   // 或添加查询响应（根据协议设计选择）
+   ```
+
+2. **Windows Keil 编译烧录**
+
+   ```
+   打开 xflz_eai_car1_base_controller_client 项目
+   → 编译
+   → ST-Link 烧录到 STM32
+   ```
+
+##### 阶段 2：ROS 端接收并积分（Python）
+
+1. **定义消息类型**（可选，或复用现有）
+
+   如需新消息：
+   ```bash
+   # car1_base_driver_msgs/msg/WheelSpeeds.msg
+   float32 wheel_a
+   float32 wheel_b
+   float32 wheel_c
+   float32 wheel_d
+   ```
+
+2. **board_sdk.py 解析轮速**
+
+   在 `board_sdk.py` 添加：
+
+   ```python
+   def _handle_motor_packet(self, data):
+       if data[0] == 0x02:  # 子功能：轮速反馈
+           wa, wb, wc, wd = struct.unpack('<ffff', bytes(data[1:17]))
+           # 发布到 ROS 话题 /motor_feedback
+           ...
+   ```
+
+3. **odom_publisher_node.py 改用实测轮速**
+
+   ```python
+   def __init__(self):
+       # 订阅固件回传的实际轮速
+       self.create_subscription(
+           WheelSpeeds, '/motor_feedback', self.wheel_speed_callback, 10)
+       
+       self.actual_vx = 0.0
+       self.actual_vy = 0.0
+       self.actual_wz = 0.0
+   
+   def wheel_speed_callback(self, msg):
+       """根据编码器实测轮速算 odom（闭环）"""
+       # 逆运动学：4 轮速 → base_link 速度
+       vx, vy, wz = self.mecanum.inverse_kinematics(
+           msg.wheel_a, msg.wheel_b, msg.wheel_c, msg.wheel_d)
+       
+       self.actual_vx = vx
+       self.actual_vy = vy
+       self.actual_wz = wz
+   
+   def _odom_loop(self):
+       # 积分实测速度（替代指令）
+       delta_x = self.actual_vx * dt * cos(yaw)  # 不再用 self.linear_x
+       delta_y = self.actual_vy * dt * sin(yaw)
+       delta_yaw = self.actual_wz * dt
+   ```
+
+4. **重新编译测试**
+   ```bash
+   colcon build --packages-select car1_base_driver_msgs car1_base_driver controller
+   source install/setup.bash
+   
+   # 重启 bringup
+   ros2 launch car1_bringup bringup.launch.py
+   
+   # 验证：人为阻挡轮子，odom 应不再累积误差
+   ```
+
+#### 验收标准
+
+- [ ] 人为阻挡轮子，odom 位置不变（打滑不累积）
+- [ ] 碰墙反弹，odom 自动修正
+- [ ] 长时间运动（>10min）无累积漂移
+- [ ] 建图质量：墙清晰、闭环完美对齐
+
+#### 时间估计
+
+- 固件修改 + 烧录：1-2 小时
+- ROS 端接收逻辑：1 小时
+- 测试验证：1 小时
+- **总计**：半天
+
+#### 涉及文件
+
+- `xflz_eai_car1_base_controller_client/base/Core/Src/protocol.c`（固件）
+- `car1_base_driver_msgs/msg/WheelSpeeds.msg`（新建，可选）
+- `driver/car1_base_driver/car1_base_driver/board_sdk.py`
+- `driver/controller/controller/odom_publisher_node.py`
+
+---
+
+### 优先级总结
+
+| Step | 名称 | 时间 | 触发条件 | 效果 |
+|---|---|---|---|---|
+| **Step 1** | 基础建图验证 | 30 分钟 | 必做 | 确认是否需要优化 |
+| **Step 2** | IMU 偏置估计 | 20 分钟 | Step 1 发现角度漂移 | 减少 50% 角度累积误差 |
+| **Step 3** | 编码器闭环 | 半天 | Step 2 后仍有严重问题 | 消除打滑累积，彻底解决 |
+
+**建议**：先做 Step 1，如果效果足够好（墙清晰、闭环成功），**直接进入 Phase 4 导航**，不必强求完美。只有在实际应用中遇到问题时，再回来做 Step 2/3。
+
+---
+
 ## 借鉴 lander_pi 的建图导航优化计划（2026-06-23）
 
 > 基于对 lander_pi 参考栈的深度分析,发现 car1 在校准机制、传感器配置、控制器架构等方面存在多项可优化点。
