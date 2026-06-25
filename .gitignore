@@ -41,6 +41,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+xflz_eai_car1_base_controller_client/
+
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.

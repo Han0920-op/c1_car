@@ -1064,6 +1064,533 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
 
 ---
 
+## 借鉴 lander_pi 的建图导航优化计划（2026-06-23）
+
+> 基于对 lander_pi 参考栈的深度分析,发现 car1 在校准机制、传感器配置、控制器架构等方面存在多项可优化点。
+> 本节详细记录需要实施的优化项,按优先级分为 P0(必须)、P1(强烈建议)、P2(可选)三级。
+
+### 优化背景
+
+**当前问题诊断**（2026-06-23 SLAM 调试）:
+- ✅ 机械臂抖动 → 已修复(删除冲突的 joint_state_publisher)
+- ✅ 轮子显示异常 → 已修复(补齐缺失的轮子关节)
+- ✅ robot_state_publisher 重复 → 已修复(统一单入口 slam.launch.py)
+- ✅ slam_toolbox 延迟不足 → 已修复(3s → 10s)
+- ✅ **底盘超速 3.98 倍 / 转 3.75 圈** → 已修复(rps↔m/s 单位错配 + 固件轮径 0.08→0.097)
+- ✅ **里程计标定** → 已完成(linear=0.961, angular=0.964；直线0.5%/角度1.1%)
+- ⏳ **静止 odom ~3.8° yaw 偏置** → 属 IMU/EKF，待做 P1-1
+- ⏳ **激光点云偏移/墙重影** → 底盘修好后大概率改善，待建图验证；如残留自遮挡走 P0-2
+
+**lander_pi 与 car1 核心差异对比**:
+
+| 维度 | lander_pi | car1 | 差距 |
+|------|-----------|------|------|
+| **IMU 校准** | ✅ SM 矩阵 + bias 向量校准 | ❌ 完全未校准 | **关键缺失** |
+| **里程计标定** | ✅ 实际标定值(linear=0.94) | ❌ 默认值 1.0(未标定) | **关键缺失** |
+| **laser_filters** | ✅ 5种雷达配置 | ❌ 无 | **缺失** |
+| **EKF 协方差动态** | ✅ 运动/静止两套 | ❌ 固定不变 | 可优化 |
+| **地图保存服务** | ✅ 独立节点 | ❌ 手动 CLI | 便利性 |
+
+---
+
+### 🔴 P0 级优化（必须做,解决当前问题）
+
+#### P0-1: 里程计标定 ✅ 已完成（2026-06-23）
+
+> ✅ **标定完成，实测系数**：`linear_correction_factor: 0.961`, `angular_correction_factor: 0.964`
+> （已写入 `driver/controller/config/calibrate_params.yaml`，重启 bringup 生效）
+> 最终精度：直线 0.5%、角度 1.1%（含瓷砖打滑随机误差）。**对 SLAM 建图足够。**
+> 完整操作流程见 `tutorial.md` 3.0 节（已更新为命令行 `ros2 param set` 方式 + 正确的系数算法）。
+
+> 🔴 **根本性发现（对照下位机固件源码确认）—— 标定失败的真正根因**：
+> 之前"标定失效/小车超速/转 3.75 圈"**不是标定方法问题**，是 **ROS 与下位机的速度单位错配**：
+> - `mecanum.py` 原经 `speed_to_rps` 发 **rps**，但 STM32 固件 raw 逐轮模式期望 **轮缘线速度 m/s**
+>   （固件 `Wheel.RT = ticks×(π·D·PID_RATE/RES)` 单位是 m/s）。错配放大 `1/(π×0.08) ≈ 3.98` 倍。
+> - **已修复（ROS）**：`mecanum.py` 直接发 m/s（去掉 speed_to_rps）。已重编 controller。
+> - **已修复（固件）**：`kinematics.h` 轮径 0.08→0.097、轮距/轴距→0.1946/0.2117（仓库
+>   `xflz_eai_car1_base_controller_client`，已在 Windows Keil 烧录）。烧录后残留误差降到 6%。
+> - 6% 残留由上面的 `correction_factor` 标定补掉。
+
+> **关键代码事实（已核实）**：
+> - `odom_publisher` 是**开环积分 cmd_vel 指令**，不读编码器。`/odom_raw` yaw = 指令积分。
+> - `linear_correction_factor` 乘在 odom x/y（:192-193）；`angular_correction_factor` 乘在 yaw 增量（:186，已接线）。
+> - 标定脚本 `calibrate_linear/angular` 已重写：读 `/odom_raw`、单向运动到量即停、不写 yaml（手动填）。
+> - ⚠️ 系数算法：`系数 = 真实 / odom报告`（不是目标/实际，方向别反）。
+> - ⚠️ 角度必须用**指南针量真实转角**（脚本"转够"基于 odom，不准）。
+> - 静止 3.8° yaw 偏置不归里程计标定管（属 IMU/EKF，见 P1-1）。
+
+**lander_pi 实际值（对照）**: `linear=0.94, angular=1.00`。car1 实测 `linear=0.961, angular=0.964`。
+
+**校准脚本/工具修复记录（本次）**：
+- `mecanum.py`：发 m/s 替代 rps（修单位错配 3.98×）
+- 固件 `kinematics.h`：轮径/轮距改真实值（修残留 1.21×）
+- `calibrate_linear.py`：改读 /odom_raw + 单向前进（修前后横跳震荡）
+- `calibrate_angular.py`：改读 /odom_raw + 累加幅度单向旋转（修单位 bug + 正反馈发散转不停）
+- `odom_publisher_node.py:186`：yaw 增量乘 angular_factor（接线角度系数）
+- 新增 `calibration/scripts/chassis_serial_test.py`：直连下位机测试工具（查表 CRC8 + rts/dtr=False + set_motor_type 初始化）
+
+**操作流程**：见 `tutorial.md` 3.0.1（直线）/ 3.0.2（角度）/ 3.0.3（验证）。要点：
+1. 命令行 `ros2 param set` 设参数触发（rqt_reconfigure 未装也行）
+2. 直线：尺子量实际距离 → `系数 = 实际/odom报告`
+3. 角度：指南针量真实转角 → `系数 = 真实转角/360`
+4. 填 `calibrate_params.yaml` → 重启 bringup → `ros2 param get` 确认
+
+**验收标准** ✅ 全部达成：
+- [x] `ros2 param get /odom_publisher linear_correction_factor` = 0.961
+- [x] `ros2 param get /odom_publisher angular_correction_factor` = 0.964
+- [x] 直线 1m 误差 0.5%（<3cm）
+- [x] 角度 360° 误差 1.1%（<5°）
+
+---
+
+### 校准文件归属约定（对照 lander_pi 验证，2026-06-23）
+
+> 核实了 car1 与 lander_pi 两套栈的校准文件实际分布与读写关系后确认：**两者布局几乎一致，当前 car1 无需搬迁任何文件**。原则是「按消费者就近」，不是「全部塞进 calibration 包」。
+
+| 校准类型 | 文件 | 所在文件夹 | 生产者 | 消费者 | car1 vs lander_pi |
+|---|---|---|---|---|---|
+| 里程计 | `calibrate_params.yaml` | `driver/controller/config/` | 标定脚本不写，手动填 | controller launch | ✅ 完全一致 |
+| 舵机偏置 | `servo_offsets.yaml` | `calibration/config/` | `calibrate_servo` 写 | base_driver 跨包读 | car1 独有，工作正常 |
+| IMU | `imu_calib.yaml` | `calibration/config/` | 外部工具（六面/转台） | peripherals/imu_filter launch 跨包读 | car1 未来加，照搬此位置 |
+| 相机 | (rgbd) `calibration.yaml` | 视觉模块自己的 config | 视觉标定脚本 | 该模块自用 | 就近原则 |
+
+**约定**：
+1. **里程计** `calibrate_params.yaml` 留在 `controller/config/`（与 ekf/init_pose 同属底盘运行参数；lander_pi 也这么放）。
+2. **舵机偏置** `servo_offsets.yaml` 留在 `calibration/config/`（base_driver 已跨包读，勿动）。
+3. **未来 IMU 校准** `imu_calib.yaml` → 放 `calibration/config/`，跟随 servo_offsets 的跨包读模式（与 lander_pi 一致）。建议保留一份历史备份（lander_pi 用 `bk.yaml`）。
+4. **不为统一而搬迁可工作的文件** —— 移动 `calibrate_params.yaml` 要改 launch 跨包路径，收益小、风险实。
+
+---
+
+---
+
+#### P0-2: laser_filters 集成（如需要,解决自遮挡）
+
+**前置判断**: 先完成 P0-1 标定,再做**运动测试**判断是否需要。
+
+**运动测试方法**:
+```bash
+# SLAM 运行中,用键盘遥控小车直行 1-2m 再原地转 360°
+ros2 launch car1_slam slam.launch.py
+# 新终端
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+
+# 盯着 RViz 里的墙:
+# - 墙重影/糊开 → 是 odom 漂移,P0-1 解决
+# - 墙清晰但机身附近有固定点跟着转 → 是自遮挡,需要 laser_filters
+```
+
+**如果确认需要 laser_filters**:
+
+1. **安装软件包**
+   ```bash
+   sudo apt install ros-humble-laser-filters
+   ```
+
+2. **实测标定过滤角度**（**不能直接搬 lander_pi 数值**）
+   
+   lander_pi 用的是 0~2π 约定,COIN-D6 用的是 -π~π 约定,直接搬数值会错。
+   
+   ```bash
+   # 启动雷达,对着空旷处
+   ros2 launch car1_peripherals lidar.launch.py
+   
+   # 新终端,实时查看雷达数据
+   ros2 topic echo /scan
+   
+   # 手动遮挡机身不同方向(后方/左后/右后),观察:
+   # - 哪些角度索引的 ranges 值异常近(<0.2m)
+   # - 记录这些索引,换算成弧度(-π~π)
+   
+   # 例如:索引 180-540(共 720 点) 有异常近距离读数
+   # 换算:180/720*2π - π ≈ 0.57 rad
+   #      540/720*2π - π ≈ 2.71 rad
+   ```
+
+3. **创建配置文件**
+   ```bash
+   # 已存在占位文件,需根据实测修改
+   nano peripherals/car1_peripherals/config/laser_filters.yaml
+   ```
+   
+   ```yaml
+   /**:
+     ros__parameters:
+       filter1:
+         name: angular_bounds_filter
+         type: laser_filters/LaserScanAngularBoundsFilterInPlace
+         params:
+           lower_angle: 0.57   # 实测得出的起始角度(弧度)
+           upper_angle: 2.71   # 实测得出的结束角度
+       
+       filter2:
+         name: range_filter
+         type: laser_filters/LaserScanRangeFilter
+         params:
+           use_message_range_limits: false
+           lower_threshold: 0.10  # 忽略 <10cm 的点(肯定是机身)
+           upper_threshold: 16.0
+           lower_replacement_value: .nan
+           upper_replacement_value: .inf
+   ```
+
+4. **集成到 lidar.launch.py**
+   
+   参照 lander_pi 的实现,在 `peripherals/car1_peripherals/launch/lidar.launch.py` 添加:
+   
+   ```python
+   laser_filter_node = Node(
+       package='laser_filters',
+       executable='scan_to_scan_filter_chain',
+       name='laser_filter',
+       parameters=[os.path.join(peripherals_pkg, 'config', 'laser_filters.yaml')],
+       remappings=[
+           ('scan', 'scan_raw'),           # 输入:原始雷达数据
+           ('scan_filtered', 'scan')       # 输出:过滤后数据
+       ]
+   )
+   ```
+
+5. **重启验证**
+   ```bash
+   # 重新编译(如果改了 launch)
+   colcon build --packages-select car1_peripherals
+   
+   # 重启 SLAM
+   ros2 launch car1_slam slam.launch.py
+   
+   # 观察 RViz,机身附近的固定假障碍应消失
+   ```
+
+**预期效果**:
+- 机身附近不再有跟着车转的固定点云
+- 地图中不再出现不存在的"假墙"
+- 建图更准确
+
+**时间估计**: 1-2 小时(含实测标定)
+
+**涉及文件**:
+- `peripherals/car1_peripherals/config/laser_filters.yaml`
+- `peripherals/car1_peripherals/launch/lidar.launch.py`
+
+---
+
+### 🟡 P1 级优化（强烈建议,提升稳定性）
+
+#### P1-1: IMU 偏置估计（简化方案）
+
+**问题**: 当前 IMU 未校准,零偏和刻度误差会被 EKF 积分,导致姿态漂移。
+
+**lander_pi 完整方案**: 用转台或 6 面静置法生成 SM 矩阵 + bias 向量,通过 `imu_calib` 节点先矫正再滤波。这需要专业工具,难度高。
+
+**car1 简化方案**: 启用 Madgwick 滤波器的**自动偏置估计**功能。
+
+**实施步骤**:
+
+1. **修改 IMU 滤波器配置**
+   
+   编辑 `driver/controller/launch/chassis_controller.launch.py`:
+   
+   ```python
+   imu_filter_node = Node(
+       package='imu_filter_madgwick',
+       executable='imu_filter_madgwick_node',
+       name='imu_filter',
+       parameters=[{
+           'use_mag': False,
+           'publish_tf': False,
+           'world_frame': 'enu',
+           'fixed_frame': 'base_link',
+           'do_bias_estimation': True,     # 新增:启用偏置估计
+           'bias_alpha': 0.01,              # 新增:偏置估计滤波系数
+       }],
+       remappings=[
+           ('imu/data_raw', 'car1_base_driver/imu_raw'),
+           ('imu/data', 'imu'),
+       ],
+       output='screen'
+   )
+   ```
+
+2. **重新编译**
+   ```bash
+   colcon build --packages-select controller
+   ```
+
+3. **重启验证**
+   ```bash
+   # 重启 bringup
+   ros2 launch car1_bringup bringup.launch.py
+   
+   # 查看 IMU 数据,静止时角速度应更接近 0
+   ros2 topic echo /imu --once
+   ```
+
+**预期效果**:
+- 滤波器自动学习并补偿陀螺零偏
+- 静止时姿态更稳定
+- 运动时累积误差减小
+
+**效果评估**:
+- 不如 SM 矩阵校准,但比完全不校准好很多
+- 适合对精度要求不极端的场景
+
+**时间估计**: 5 分钟
+
+**涉及文件**:
+- `driver/controller/launch/chassis_controller.launch.py`
+
+---
+
+#### P1-2: EKF 协方差动态调整
+
+**问题**: 当前 EKF 的协方差矩阵固定不变,无法根据运动状态调整对里程计/IMU 的信任度。
+
+**lander_pi 方案**: 针对运动/静止两种状态设置不同的协方差:
+- 运动时:里程计置信度正常
+- 静止时:里程计置信度极高(1e-9),强制 EKF 相信"车没动",抑制 IMU 漂移
+
+**实施步骤**:
+
+1. **修改 odom_publisher**
+   
+   编辑 `driver/controller/controller/odom_publisher_node.py`:
+   
+   在文件开头添加静止时的协方差常量:
+   
+   ```python
+   ODOM_POSE_COVARIANCE_STOP = [
+       1e-9, 0, 0, 0, 0, 0,
+       0, 1e-9, 0, 0, 0, 0,
+       0, 0, 1e6, 0, 0, 0,
+       0, 0, 0, 1e6, 0, 0,
+       0, 0, 0, 0, 1e6, 0,
+       0, 0, 0, 0, 0, 1e-9
+   ]
+   
+   ODOM_TWIST_COVARIANCE_STOP = [
+       1e-9, 0, 0, 0, 0, 0,
+       0, 1e-9, 0, 0, 0, 0,
+       0, 0, 1e6, 0, 0, 0,
+       0, 0, 0, 1e6, 0, 0,
+       0, 0, 0, 0, 1e6, 0,
+       0, 0, 0, 0, 0, 1e-9
+   ]
+   ```
+   
+   在 `_publish_odom()` 方法中,发布前添加判断:
+   
+   ```python
+   # 判断是否静止(线速度和角速度都接近 0)
+   if abs(self.linear_x) < 0.01 and abs(self.angular_z) < 0.01:
+       self.odom_msg.pose.covariance = ODOM_POSE_COVARIANCE_STOP
+       self.odom_msg.twist.covariance = ODOM_TWIST_COVARIANCE_STOP
+   else:
+       self.odom_msg.pose.covariance = ODOM_POSE_COVARIANCE
+       self.odom_msg.twist.covariance = ODOM_TWIST_COVARIANCE
+   ```
+
+2. **重新编译**
+   ```bash
+   colcon build --packages-select controller --symlink-install
+   ```
+
+3. **重启验证**
+   ```bash
+   ros2 launch car1_bringup bringup.launch.py
+   
+   # 查看静止时的 odom 协方差
+   ros2 topic echo /odom_raw --once | grep covariance
+   ```
+
+**预期效果**:
+- 静止时 yaw 漂移进一步减小
+- EKF 对静止状态的判断更准确
+
+**时间估计**: 10 分钟
+
+**涉及文件**:
+- `driver/controller/controller/odom_publisher_node.py`
+
+---
+
+### 🟢 P2 级优化（可选,锦上添花）
+
+#### P2-1: 地图保存服务节点
+
+**当前方式**: 手动运行 CLI 命令
+```bash
+cd ~/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps
+ros2 run nav2_map_server map_saver_cli -f "map_01" --ros-args -p map_subscribe_transient_local:=true
+```
+
+**lander_pi 方式**: 提供 ROS 服务接口,可通过 `ros2 service call` 或 RViz 插件保存。
+
+**实施步骤**:
+
+1. **创建地图保存节点**
+   
+   创建文件 `slam/car1_slam/car1_slam/map_save.py`:
+   
+   ```python
+   #!/usr/bin/env python3
+   import os
+   import rclpy
+   from rclpy.node import Node
+   from std_srvs.srv import Trigger
+   
+   class MapSaveNode(Node):
+       def __init__(self):
+           super().__init__('map_save_node')
+           self.create_service(Trigger, '~/save_map', self.save_map_callback)
+           self.get_logger().info('Map save service ready')
+       
+       def save_map_callback(self, request, response):
+           self.get_logger().info('Saving map...')
+           map_dir = os.path.expanduser('~/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps')
+           cmd = f'cd {map_dir} && ros2 run nav2_map_server map_saver_cli -f "map_01" --ros-args -p map_subscribe_transient_local:=true'
+           ret = os.system(cmd)
+           
+           response.success = (ret == 0)
+           response.message = 'Map saved successfully' if ret == 0 else 'Failed to save map'
+           return response
+   
+   def main():
+       rclpy.init()
+       node = MapSaveNode()
+       rclpy.spin(node)
+       rclpy.shutdown()
+   
+   if __name__ == '__main__':
+       main()
+   ```
+
+2. **修改 setup.py**
+   
+   在 `slam/car1_slam/setup.py` 的 `console_scripts` 中添加:
+   
+   ```python
+   'map_save = car1_slam.map_save:main',
+   ```
+
+3. **重新编译**
+   ```bash
+   colcon build --packages-select car1_slam
+   ```
+
+4. **使用方式**
+   ```bash
+   # SLAM 运行中,新终端
+   ros2 service call /map_save_node/save_map std_srvs/srv/Trigger
+   ```
+
+**预期效果**:
+- 保存地图更方便
+- 可集成到 GUI 或脚本中
+
+**时间估计**: 20 分钟
+
+**涉及文件**:
+- `slam/car1_slam/car1_slam/map_save.py` (新建)
+- `slam/car1_slam/setup.py`
+
+---
+
+#### P2-2: IMU SM 矩阵校准（完整方案,高精度需求）
+
+**适用场景**: 对姿态精度要求极高的应用(如长时间 SLAM、多传感器融合)。
+
+**前置条件**: 需要专业设备(三轴转台或精密水平台)。
+
+**参考 lander_pi 实现**:
+- 校准文件: `calibration/config/imu_calib.yaml`
+- 校准节点: `imu_calib` (apply_calib)
+- 滤波器: `imu_complementary_filter`
+
+**SM 矩阵含义**:
+```yaml
+SM:  # 3x3 Scale-Misalignment 矩阵
+  - 1.0028  -0.0108   0.0078    # 校正刻度误差和轴间串扰
+  - -0.0020  1.0047  -0.0339
+  - -0.0183 -0.0083   1.0035
+bias:  # 零偏向量
+  - 0.0505   0.2005  -0.0975
+```
+
+**校准方法**:
+1. 六面静置法:IMU 每个面朝上静置 10 分钟,记录数据
+2. 转台法:用三轴转台旋转 IMU,记录角速度
+3. 用标定算法(如 Allan 方差)计算 SM 矩阵和 bias
+
+**移植 lander_pi imu_calib**:
+1. 复制 `imu_calib` 包到 car1 工作区
+2. 修改话题 remap:`/ros_robot_controller/imu_raw` → `/car1_base_driver/imu_raw`
+3. 生成 `imu_calib.yaml`(需专业工具)
+4. 在 `chassis_controller.launch.py` 中插入 `imu_calib` 节点
+
+**时间估计**: 数小时到数天(取决于设备和经验)
+
+---
+
+### 优化实施顺序建议
+
+```
+第 1 天(核心问题):
+  1. P0-1: 里程计标定(30 分钟)
+  2. 运动测试,判断是否需要 laser_filters
+  3. 如需要,P0-2: laser_filters 集成(1-2 小时)
+
+第 2 天(稳定性提升):
+  4. P1-1: IMU 偏置估计(5 分钟)
+  5. P1-2: EKF 协方差动态(10 分钟)
+  6. 完整建图测试,验证效果
+
+第 3 天(可选,按需):
+  7. P2-1: 地图保存服务(20 分钟)
+  8. P2-2: IMU SM 校准(如有设备和需求)
+```
+
+---
+
+### 验收标准
+
+**P0 级验收**:
+- [ ] 里程计标定完成,`calibrate_params.yaml` 有实际值
+- [ ] 静止时 odom yaw 偏置 < 0.5°
+- [ ] 直行 1m 误差 < 3cm
+- [ ] 原地转 360° 误差 < 5°
+- [ ] 运动时墙不重影(或 laser_filters 后机身附近无假障碍)
+
+**P1 级验收**:
+- [ ] IMU 偏置估计启用,静止时角速度 < 0.001 rad/s
+- [ ] EKF 协方差动态调整生效,静止时协方差为 1e-9
+
+**P2 级验收**:
+- [ ] 地图保存服务可调用
+- [ ] (如做)IMU SM 校准文件存在且生效
+
+---
+
+### 相关代码参考
+
+**lander_pi 关键文件**:
+- 里程计标定: `src/lander_pi/calibration/calibration/calibrate_linear.py`, `calibrate_angular.py`
+- IMU 校准: `src/lander_pi/calibration/config/imu_calib.yaml`
+- IMU 滤波: `src/lander_pi/peripherals/launch/imu_filter.launch.py`
+- laser_filters: `src/lander_pi/peripherals/config/lidar_filters_config_ld19.yaml`
+- EKF 协方差: `src/lander_pi/driver/controller/controller/odom_publisher_node.py` (L16-46)
+- 地图保存: `src/lander_pi/slam/slam/map_save.py`
+
+**car1 待修改文件**:
+- `driver/controller/config/calibrate_params.yaml`
+- `driver/controller/launch/chassis_controller.launch.py`
+- `driver/controller/controller/odom_publisher_node.py`
+- `peripherals/car1_peripherals/config/laser_filters.yaml`
+- `peripherals/car1_peripherals/launch/lidar.launch.py`
+- `slam/car1_slam/car1_slam/map_save.py` (新建)
+
+---
+
 ## 实机机械臂抓取实施计划（从简单到复杂）
 
 > 参考 lander_pi 的实现路径，逐步实现实机机械臂抓取功能。

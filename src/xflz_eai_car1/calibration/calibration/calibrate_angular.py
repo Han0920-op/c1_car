@@ -4,17 +4,20 @@
 
 Rotates the robot a known angle (default 360°) and compares odometry vs actual.
 Use rqt_reconfigure to adjust odom_angular_scale_correction until they match.
+
+Reads yaw directly from /odom_raw (wheel-only odometry from odom_publisher),
+NOT from the odom->base_footprint TF (which is EKF-fused with IMU). This way the
+measured angle reflects pure wheel odometry, matching the angular_correction_factor
+that odom_publisher applies.
 """
 import time
 import rclpy
 import signal
 import threading
 from rclpy.node import Node
-from tf2_ros.buffer import Buffer
-from geometry_msgs.msg import Twist, Point
-from math import copysign, pi, atan2, asin, degrees
-from tf2_ros.transform_listener import TransformListener
-from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from math import copysign, pi, atan2, asin, radians
 
 
 def qua2rpy(quat):
@@ -53,17 +56,10 @@ class CalibrateAngular(Node):
         self.declare_parameter('start_test', False)
         self.update_param()
 
-        self.odom_frame = 'odom'
-        self.base_frame = 'base_footprint'
         self.cmd_vel = self.create_publisher(Twist, "/controller/cmd_vel", 1)
+        self.create_subscription(Odometry, '/odom_raw', self.odom_callback, 10)
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        self.position = Point()
-        self.x_start = self.position.x
-        self.y_start = self.position.y
-
+        self.odom_yaw = None  # latest yaw from /odom_raw (radians)
         self.last_angle = 0
         self.reverse = 1
         self.calib_angle = 0
@@ -80,43 +76,50 @@ class CalibrateAngular(Node):
         self.tolerance = self.get_parameter('tolerance').value
         self.odom_angular_scale_correction = self.get_parameter('odom_angular_scale_correction').value
 
+    def odom_callback(self, msg):
+        self.odom_yaw = qua2rpy(msg.pose.pose.orientation)[2]
+
     def main(self):
         while True:
             self.update_param()
             move_cmd = Twist()
             if self.start_test:
-                original_angle = degrees(self.get_odom_angle())
-                self.test_angle = copysign(self.test_angle, self.reverse)
+                if self.odom_yaw is None:
+                    self.get_logger().warn('Waiting for /odom_raw...')
+                    time.sleep(0.1)
+                    continue
 
-                delta_angle = self.odom_angular_scale_correction * normalize_angle(
-                    original_angle - self.last_angle)
-                self.calib_angle += delta_angle
-                error = self.test_angle - self.calib_angle
+                # Accumulate the MAGNITUDE of rotation, independent of odom's yaw
+                # sign convention. We spin one constant direction (self.reverse)
+                # until the accumulated |rotation| from odom reaches test_angle.
+                # This avoids the positive-feedback divergence that happens when
+                # odom yaw sign is opposite to the commanded direction.
+                original_angle = self.odom_yaw                       # rad, wrapped [-pi,pi]
+                target = radians(abs(self.test_angle))               # rad, positive
+                step = abs(self.odom_angular_scale_correction *
+                           normalize_angle(original_angle - self.last_angle))
+                self.calib_angle += step                             # always grows
                 self.last_angle = original_angle
+                remaining = target - self.calib_angle                # shrinks to 0
 
-                if abs(error) > self.tolerance and self.start_test:
-                    move_cmd.angular.z = copysign(self.speed, error)
+                if remaining > radians(self.tolerance):
+                    move_cmd.angular.z = copysign(self.speed, self.reverse)
                 else:
                     self.calib_angle = 0.0
                     self.start_test = rclpy.parameter.Parameter(
                         'start_test', rclpy.Parameter.Type.BOOL, False)
                     self.set_parameters([self.start_test])
                     self.reverse = -self.reverse
-                    self.last_angle = 0
+                    self.last_angle = 0.0
                     self.get_logger().info('\033[1;32m%s\033[0m' % 'finish')
+            else:
+                # Keep last_angle synced while idle so the first delta after
+                # start_test isn't a huge jump.
+                if self.odom_yaw is not None:
+                    self.last_angle = self.odom_yaw
 
             self.cmd_vel.publish(move_cmd)
             time.sleep(0.05)
-
-    def get_odom_angle(self):
-        try:
-            trans = self.tf_buffer.lookup_transform(
-                self.odom_frame, self.base_frame,
-                rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1))
-            return qua2rpy(trans.transform.rotation)[2]
-        except (LookupException, ConnectivityException, ExtrapolationException):
-            self.get_logger().info('\033[1;32m%s\033[0m' % 'TF Exception')
-            return 0.0
 
     def shutdown(self, signum, frame):
         self.get_logger().info('\033[1;32m%s\033[0m' % 'Stopping the robot...')

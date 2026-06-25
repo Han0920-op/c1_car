@@ -1370,108 +1370,147 @@ ros2 launch car1_peripherals teleop_key.launch.py
 
 > **为什么必须先校准**：不准确的里程计会导致 SLAM 地图变形、重影、回环检测失败。这是 SLAM 建图的前置条件，必须在建图前完成。
 
+> 🔴 **重要前置（2026-06-23 排查确认）**：校准前必须确保底层速度单位正确，否则标的是错的。
+> 历史上曾出现「小车超速 3.98 倍 / 指令转 1 圈实际转 3.75 圈」的问题，**根因不是校准，而是固件与 ROS 的速度单位错配**：
+> - **ROS 端** `mecanum.py` 原本经 `speed_to_rps` 发 **rps**，但 STM32 固件 raw 逐轮模式期望 **轮缘线速度 m/s**。
+> - **固件端** `kinematics.h` 的 `MEC_WHEEL_DIAMETER` 原为 0.08（真实 0.097），编码器反馈换算偏差。
+> - **已修复**：`mecanum.py` 直接发 m/s；固件 `kinematics.h` 轮径改 0.097、轮距/轴距改 0.1946/0.2117（需 Windows Keil 重新编译烧录）。
+> - 修复后残留误差仅约 6%，正是 `correction_factor` 该补偿的量级。
+>
+> **如果你的小车出现「速度异常快 / 转好几圈才停」，先检查上述两处是否已修复，不要急着调校准系数。**
+> 直连下位机验证工具见 `calibration/scripts/chassis_serial_test.py`（绕过 ROS，复刻 board_sdk 协议：查表 CRC8、开串口前 rts/dtr=False、先发 set_motor_type 初始化）。
+
+> ⚠️ **rqt_reconfigure 不是必需的**。若环境未装（`Package 'rqt_reconfigure' not found`），
+> 直接用 `ros2 param set` 命令行设置参数即可，效果完全一样。本节用命令行方式。
+
 #### 3.0.1 线速度校准
 
-**原理**：让机器人走一段已知距离（默认 1m），对比里程计报告值与实际测量值，得出修正系数。
+**原理**：让机器人前进一段，对比里程计报告值与尺子实测值，得出修正系数（乘在 odom 输出上，让 odom 报告匹配真实距离）。
+
+**校准脚本说明（2026-06-23 重写）**：
+- `calibrate_linear` 读 `/odom_raw`（纯轮式里程），累加行进里程，**单向前进**到目标就停。
+- 不再用「欧氏距离 + 正负 error 闭环」（那会因 sqrt 永远为正导致小车前后横跳）。
 
 **准备工作**：
-1. 在地面贴一条 1 米长的胶带作为参考线
-2. 将机器人前轮对齐起点
-3. 确保地面平整，轮子不打滑
+1. 在车头正下方某点贴胶带/粉笔做起点标记
+2. 确保地面平整，轮子不打滑（瓷砖偶有打滑，属正常随机误差）
 
 **操作步骤**：
 
 ```bash
-# 启动校准（会同时启动底盘控制器 + 校准节点 + rqt_reconfigure）
-ros2 launch calibration linear_calib.launch.py
+# 终端1：启动底盘
+ros2 launch car1_bringup bringup.launch.py
+
+# 终端2：启动直线校准节点
+ros2 run calibration calibrate_linear
+
+# 终端3：用命令行设参数并触发
+ros2 param set /calibrate_linear test_distance 1.0
+ros2 param set /calibrate_linear speed 0.2
+ros2 param set /calibrate_linear odom_linear_scale_correction 1.0
+ros2 param set /calibrate_linear start_test true
 ```
 
-**在 rqt_reconfigure 窗口中操作**：
+小车自动前进，odom 判断走够 1m 就停，终端2 打印 `finish: odom 行进 X.XXX m`。
 
-1. 找到 `calibrate_linear` 节点
-2. 设置参数：
-   - `test_distance`: 1.0（测试距离，单位 m）
-   - `speed`: 0.15（行驶速度，建议不超过 0.2）
-   - `tolerance`: 0.03（到达容差）
-   - `odom_linear_scale_correction`: 1.0（初始值）
-3. 勾选 `start_test` → 机器人开始前进
-4. 机器人停下后，用尺子量实际行驶距离
-
-**计算修正系数**：
+**用尺子量实际距离**，然后计算修正系数：
 
 ```
-odom_linear_scale_correction = 设定距离 / 实际行驶距离
+linear_correction_factor = 实际距离 / odom报告距离
 ```
 
-例如：设定 1.0m，实际走了 1.06m → 修正系数 = 1.0 / 1.06 ≈ 0.943
+> ⚠️ **方向别搞反**：系数 = 真实 / odom报告（不是目标/实际）。
+> 例：odom 报告 0.978m，尺子实测 0.94m → 系数 = 0.94 / 0.978 ≈ 0.961。
+> 含义：odom 多报了，要乘 0.961 把数字缩小到匹配真实。
 
 **反复验证**：
-1. 将计算出的修正系数填入 `odom_linear_scale_correction`
-2. 再次勾选 `start_test`
-3. 重复 2-3 次，直到实际距离与设定距离误差 < 2cm
+
+```bash
+# 填入算出的系数再测一次
+ros2 param set /calibrate_linear odom_linear_scale_correction 0.961
+ros2 param set /calibrate_linear start_test true
+# 这次尺子实测应接近 1.0m（误差 <3cm 合格）
+```
+
+> 实测案例：系数 0.961 验证后实际走 0.995m，误差 0.5%。
+
+**随时停车**（任意时刻）：
+```bash
+ros2 param set /calibrate_linear start_test false
+# 或兜底： pkill -f calibrate_linear
+```
 
 **保存结果**：
 
 ```bash
-# 编辑校准参数文件
-nano ~/ros2_ws/src/xflz_robot_car1/driver/controller/config/calibrate_params.yaml
+nano ~/ros2_ws/src/xflz_eai_car1/driver/controller/config/calibrate_params.yaml
 ```
 
 ```yaml
 /**:
   ros__parameters:
-    linear_correction_factor: 0.943   # ← 填入你的校准值
+    linear_correction_factor: 0.961   # ← 填入你的校准值
     angular_correction_factor: 1.00
 ```
 
-重新编译使配置生效：
-```bash
-colcon build --packages-select controller
-source install/setup.bash
-```
+> 保存后**重启 bringup** 即生效（yaml 启动时被读取，无需编译）。
 
 #### 3.0.2 角速度校准
 
-**原理**：让机器人原地旋转 360°，对比里程计报告的角度与实际旋转角度。
+**原理**：让机器人原地旋转，用手机指南针量真实转角，对比里程计报告。
+
+**校准脚本说明（2026-06-23 修复）**：
+- `calibrate_angular` 读 `/odom_raw` 纯轮式 yaw，**累加旋转幅度（绝对值）单向旋转**到目标就停。
+- 修复了两个历史 bug：① 度/弧度单位混用导致转不停；② odom yaw 符号与命令方向相反引发正反馈发散（实测转 3+ 圈）。
+- `angular_correction_factor` 已在 `odom_publisher_node.py:186` 接线生效（yaw 增量乘该系数）。
 
 **准备工作**：
-1. 在机器人正前方地面做一个标记（如贴胶带箭头）
-2. 确保机器人在平坦地面上，四轮均匀接地
+1. 手机打开指南针 APP，固定在车上（放车后部，远离电机避免磁干扰）
+2. 记录起始朝向
+3. 确保四轮均匀接地
 
 **操作步骤**：
 
 ```bash
-# 启动角速度校准
-ros2 launch calibration angular_calib.launch.py
+# 终端2：停掉直线校准，启动角度校准
+pkill -f calibrate_linear
+ros2 run calibration calibrate_angular
+
+# 终端3：设参数并触发
+ros2 param set /calibrate_angular test_angle 360.0
+ros2 param set /calibrate_angular speed 0.3
+ros2 param set /calibrate_angular odom_angular_scale_correction 1.0
+ros2 param set /calibrate_angular start_test true
 ```
 
-**在 rqt_reconfigure 窗口中操作**：
+小车自动旋转，odom 判断转够 360° 就停。
 
-1. 找到 `calibrate_angular` 节点
-2. 设置参数：
-   - `test_angle`: 360.0（测试角度，单位度）
-   - `speed`: 0.3（旋转速度 rad/s，建议不超过 0.5）
-   - `tolerance`: 1.5（角度容差，单位度）
-   - `odom_angular_scale_correction`: 1.0（初始值）
-3. 勾选 `start_test` → 机器人开始原地旋转
-4. 机器人停下后，观察标记方向
-
-**判断结果**：
-- 如果机器人**转过头了**（超过 360°）→ 修正系数 > 1.0
-- 如果机器人**没转够**（不到 360°）→ 修正系数 < 1.0
+> ⚠️ **关键**：脚本「转够」的判断基于 odom，odom 本身可能不准，所以**停车 ≠ 真转了 360°**。
+> **必须用指南针量真实转角**，不能信脚本。
 
 **计算修正系数**：
 
 ```
-odom_angular_scale_correction = 360 / 实际旋转角度
+angular_correction_factor = 真实转角 / 360
 ```
 
-例如：设定 360°，实际转了 355° → 修正系数 = 360 / 355 ≈ 1.014
+> 例：脚本停车时指南针显示实际转了 347°（少转 13°）→ 系数 = 347 / 360 ≈ 0.964。
+
+**跨 0° 换算**（指南针跨越 360/0 边界时）：
+```
+偏差 = (结束角度 - 起始角度 + 180) % 360 - 180
+```
 
 **反复验证**：
-1. 填入修正系数
-2. 再次 `start_test`（注意：每次测试会自动反向旋转）
-3. 重复直到停下时标记方向与起始一致
+
+```bash
+ros2 param set /calibrate_angular odom_angular_scale_correction 0.964
+ros2 param set /calibrate_angular start_test true
+# 指南针量真实转角，应接近 360°
+```
+
+> 实测案例：系数 0.964 验证后残留均值约 4°（1.1%）。残留在 2~10° 间随机跳动，
+> 是**起步惯性 + 瓷砖打滑 + 指南针精度** 的随机误差，不是系数问题，不必强求归零。
 
 **保存结果**：
 
@@ -1479,35 +1518,32 @@ odom_angular_scale_correction = 360 / 实际旋转角度
 # driver/controller/config/calibrate_params.yaml
 /**:
   ros__parameters:
-    linear_correction_factor: 0.943
-    angular_correction_factor: 1.014   # ← 填入你的校准值
+    linear_correction_factor: 0.961
+    angular_correction_factor: 0.964   # ← 填入你的校准值
 ```
 
 #### 3.0.3 校准验证
 
-完成校准后，做一次验证：
+完成校准后，**重启 bringup** 让系数生效，确认参数被读取：
 
 ```bash
-# 重新启动 bringup
 ros2 launch car1_bringup bringup.launch.py
 
-# 前进 1m 测试
-timeout 5 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.2}}" --rate 10
-# 用尺子量，误差应 < 3cm
-
-# 原地转 360° 测试
-timeout 6 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{angular: {z: 1.0}}" --rate 10
-# 观察是否回到起始朝向
+# 确认两个系数已加载
+ros2 param get /odom_publisher linear_correction_factor    # 应为 0.961
+ros2 param get /odom_publisher angular_correction_factor   # 应为 0.964
 ```
 
 **验证要点**：
-- [ ] 线速度：走 1m 实际误差 < 3cm
-- [ ] 角速度：转 360° 回到起始朝向（误差 < 5°）
+- [ ] `ros2 param get` 返回标定值（非默认 1.0）
+- [ ] 线速度：走 1m，尺子实测误差 < 3cm
+- [ ] 角速度：转 360°，指南针真实转角误差 < 5°
 
 **常见问题**：
-- **校准后仍有误差**：地面打滑或轮胎磨损不均，多次测量取平均值
-- **每次结果不同**：四轮接地不均匀，确保地面平整
-- **rqt_reconfigure 找不到节点**：检查 `ros2 node list`
+- **速度异常快 / 转好几圈才停**：底层单位错配，检查固件轮径(0.097)和 mecanum.py(发m/s)是否已修复，见本节顶部前置说明
+- **小车前后横跳不停**：旧版 calibrate_linear 闭环震荡 bug，已重写为单向前进；确认已重新编译 calibration 包并重启节点
+- **每次结果不同（误差 2~10° 跳动）**：瓷砖打滑 + 起步惯性 + 指南针精度的随机误差，正常，取多次均值
+- **`rqt_reconfigure` 找不到**：用 `ros2 param set` 命令行替代，见上方步骤
 
 ---
 
