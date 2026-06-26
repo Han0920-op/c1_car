@@ -12,14 +12,19 @@ def generate_launch_description():
     bringup_pkg = get_package_share_directory('car1_bringup')
     peripherals_pkg = get_package_share_directory('car1_peripherals')
     nav_pkg = get_package_share_directory('car1_navigation')
-    slam_pkg = get_package_share_directory('car1_slam')
 
-    map_name = LaunchConfiguration('map', default='map_01')
+    # Maps live in the SOURCE tree so a fresh SLAM map is used directly
+    # without rebuilding car1_slam. Points at src/.../slam/car1_slam/maps/.
+    maps_dir = os.path.join(
+        os.path.expanduser('~'),
+        'ros2_ws', 'src', 'xflz_eai_car1', 'slam', 'car1_slam', 'maps')
+
+    map_name = LaunchConfiguration('map', default='slam_map')
     map_arg = DeclareLaunchArgument(
-        'map', default_value='map_01',
-        description='Map name (without extension) in car1_slam/maps/')
+        'map', default_value='slam_map',
+        description='Map name (without extension) in src car1_slam/maps/')
 
-    map_file = [slam_pkg, '/maps/', map_name, '.yaml']
+    map_file = [maps_dir, '/', map_name, '.yaml']
 
     # 1. Bringup
     bringup_launch = IncludeLaunchDescription(

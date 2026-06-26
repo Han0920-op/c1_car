@@ -117,8 +117,8 @@ car1_base_driver ──────────▶ car1_servo_controller
 | Parameter | Value |
 |-----------|-------|
 | Wheelbase | 0.1946 m |
-| Track width | 0.2117 m |
-| Wheel diameter | 0.097 m |
+| Track width | 0.216 m |
+| Wheel diameter | 0.0935 m |
 | Serial port | `/dev/ttyUSB0` @ 1000000 baud |
 | Protocol | 0xAA 0x55 | Func | Len | Data | CRC8 |
 | Arm DOF | 5 (bus servo ID 0-4, arm_joint1-5) + gripper (ID 5, r_joint) |

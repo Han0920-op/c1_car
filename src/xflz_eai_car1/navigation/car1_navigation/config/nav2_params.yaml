@@ -132,95 +132,85 @@ controller_server:
       xy_goal_tolerance: 0.05
       yaw_goal_tolerance: 0.1
     FollowPath:
-      plugin: "teb_local_planner::TebLocalPlannerROS"
-      teb_autosize: 1.0
-      dt_ref: 0.3
-      dt_hysteresis: 0.1
-      max_samples: 500
-      global_plan_overwrite_orientation: true
-      allow_init_with_backwards_motion: false
-      max_global_plan_lookahead_dist: 3.0
-      global_plan_viapoint_sep: -1.0
-      global_plan_prune_distance: 1.0
-      exact_arc_length: false
-      feasibility_check_no_poses: 2
-      publish_feedback: false
-      min_resolution_collision_check_angular: 3.14159
-      control_look_ahead_poses: 1
-      max_vel_x: 0.26
-      max_vel_x_backwards: 0.2
-      max_vel_y: 0.26
-      max_vel_theta: 3.0
-      acc_lim_x: 2.5
-      acc_lim_y: 2.5
-      acc_lim_theta: 3.2
-      min_turning_radius: 0.0
-      footprint_model.type: "circular"
-      footprint_model.radius: 0.10
-      xy_goal_tolerance: 0.05
-      yaw_goal_tolerance: 0.1
-      free_goal_vel: false
-      dt_ref_: 0.3
-      dt_hysteresis_: 0.1
-      min_obstacle_dist: 0.06
-      inflation_dist: 0.16
-      include_costmap_obstacles: true
-      costmap_obstacles_behind_robot_dist: 1.5
-      obstacle_poses_affected: 15
-      dynamic_obstacle_inflation_dist: 0.16
-      include_dynamic_obstacles: true
-      costmap_converter_plugin: ""
-      costmap_converter_spin_thread: true
-      costmap_converter_rate: 5
-      no_inner_iterations: 5
-      no_outer_iterations: 4
-      optimization_activate: true
-      optimization_verbose: false
-      penalty_epsilon: 0.1
-      obstacle_cost_exponent: 4.0
-      weight_max_vel_x: 2.0
-      weight_max_vel_y: 2.0
-      weight_max_vel_theta: 1.0
-      weight_acc_lim_x: 1.0
-      weight_acc_lim_y: 1.0
-      weight_acc_lim_theta: 1.0
-      weight_kinematics_nh: 1.0
-      weight_kinematics_forward_drive: 1.0
-      weight_kinematics_turning_radius: 1.0
-      weight_optimaltime: 1.0
-      weight_shortest_path: 0.0
-      weight_obstacle: 100.0
-      weight_inflation: 0.2
-      weight_dynamic_obstacle: 10.0
-      weight_dynamic_obstacle_inflation: 0.2
-      weight_viapoint: 1.0
-      weight_adapt_factor: 2.0
-      enable_homotopy_class_planning: true
-      enable_multithreading: true
-      max_number_classes: 4
-      selection_cost_hysteresis: 1.0
-      selection_prefer_initial_plan: 0.9
-      selection_obst_cost_scale: 100.0
-      selection_alternative_time_cost: false
-      roadmap_graph_no_samples: 15
-      roadmap_graph_area_width: 5.0
-      roadmap_graph_area_length_scale: 1.0
-      h_signature_prescaler: 0.5
-      h_signature_threshold: 0.1
-      obstacle_heading_threshold: 0.45
-      switching_blocking_period: 0.0
-      viapoints_all_candidates: true
-      delete_detours_backwards: true
-      max_ratio_detours_duration_best_duration: 3.0
-      visualize_hc_graph: false
-      visualize_with_time_as_z_axis_scale: 0.0
-      shrink_horizon_backup: true
-      shrink_horizon_min_duration: 10.0
-      oscillation_recovery: true
-      oscillation_v_eps: 0.1
-      oscillation_omega_eps: 0.1
-      oscillation_recovery_min_duration: 10.0
-      oscillation_filter_duration: 10.0
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56
+      model_dt: 0.05
+      batch_size: 2000
+      vx_std: 0.2
+      vy_std: 0.2
+      wz_std: 0.4
+      vx_max: 0.26
+      vx_min: -0.26
+      vy_max: 0.26
+      wz_max: 3.0
+      ax_max: 2.5
+      ax_min: -2.5
+      ay_max: 2.5
+      az_max: 3.2
+      iteration_count: 1
+      prune_distance: 1.7
+      transform_tolerance: 0.1
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "Omni"
+      visualize: false
+      reset_period: 1.0
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        min_turning_r: 0.0
+      critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic", "PathAngleCritic", "PreferForwardCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        critical_cost: 300.0
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 1.0
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
 
 planner_server:
   ros__parameters:

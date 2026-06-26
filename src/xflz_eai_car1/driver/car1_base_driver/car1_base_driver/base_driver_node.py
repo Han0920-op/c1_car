@@ -145,13 +145,32 @@ class BaseDriverNode(Node):
         msg = Imu()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.imu_frame
-        # Firmware already sends m/s² for accel and rad/s for gyro — use directly
+        # Firmware sends m/s² for accel and rad/s for gyro (BMI088 scale corrected as of 2024)
         msg.linear_acceleration.x = ax
         msg.linear_acceleration.y = ay
         msg.linear_acceleration.z = az
         msg.angular_velocity.x = gx
         msg.angular_velocity.y = gy
         msg.angular_velocity.z = gz
+        # Covariances MUST be non-zero, otherwise robot_localization EKF cannot
+        # invert the measurement covariance and silently drops the IMU data.
+        # Diagonal = variance (std² ); off-diagonal = 0.
+        msg.angular_velocity_covariance = [
+            0.0025, 0.0,    0.0,
+            0.0,    0.0025, 0.0,
+            0.0,    0.0,    0.0025,
+        ]
+        msg.linear_acceleration_covariance = [
+            0.04, 0.0,  0.0,
+            0.0,  0.04, 0.0,
+            0.0,  0.0,  0.04,
+        ]
+        # No fused orientation from raw gyro/accel; mark orientation unavailable.
+        msg.orientation_covariance = [
+            -1.0, 0.0, 0.0,
+            0.0,  0.0, 0.0,
+            0.0,  0.0, 0.0,
+        ]
         self.imu_pub.publish(msg)
 
     def _pub_battery(self):
@@ -249,7 +268,8 @@ class BaseDriverNode(Node):
                 # TF tree used by visual grasp) is biased by the offset (e.g. servo_2=20
                 # pulse ~= 0.047 rad on arm_joint3).
                 if result:
-                    state.position = [result[0] - self.servo_offsets.get(sid, 0)]
+                    pos = result[0] - self.servo_offsets.get(sid, 0)
+                    state.position = [max(0, min(65535, pos))]
                 else:
                     state.position = [0]
             if cmd.get_offset:

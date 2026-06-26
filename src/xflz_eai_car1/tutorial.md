@@ -1370,6 +1370,13 @@ ros2 launch car1_peripherals teleop_key.launch.py
 
 > **为什么必须先校准**：不准确的里程计会导致 SLAM 地图变形、重影、回环检测失败。这是 SLAM 建图的前置条件，必须在建图前完成。
 
+> 🧭 **SLAM 前必做校准清单**（缺一不可，详见对应小节）：
+> 1. **线速度标定**（3.0.1）→ `linear_correction_factor`
+> 2. **角速度标定**（3.0.2）→ `angular_correction_factor`
+> 3. **IMU 校准与航向验证**（3.10）→ 麦轮原地转打滑严重，**航向完全靠 IMU**，IMU/EKF 不正确会直接导致地图航向漂移（曾漂 162°）。**务必在建图前先看 3.10 完成验证，不要看完 3.4 就直接建图。**
+>
+> 校准系数文件统一在：`~/ros2_ws/src/xflz_eai_car1/driver/controller/config/calibrate_params.yaml`
+
 > 🔴 **重要前置（2026-06-23 排查确认）**：校准前必须确保底层速度单位正确，否则标的是错的。
 > 历史上曾出现「小车超速 3.98 倍 / 指令转 1 圈实际转 3.75 圈」的问题，**根因不是校准，而是固件与 ROS 的速度单位错配**：
 > - **ROS 端** `mecanum.py` 原本经 `speed_to_rps` 发 **rps**，但 STM32 固件 raw 逐轮模式期望 **轮缘线速度 m/s**。
@@ -1433,6 +1440,105 @@ ros2 param set /calibrate_linear start_test true
 ```
 
 > 实测案例：系数 0.961 验证后实际走 0.995m，误差 0.5%。
+
+#### 3.0.1.1 速度依赖性（重要！）
+
+**实测发现**：标定速度影响校准结果，**必须用建图实际使用的速度标定**。
+
+实测案例（轮径 0.0935m，轮距 0.216m 实测值更新后）：
+
+| 标定速度 | odom 报告 | 实际距离 | 偏差 | 推荐系数 |
+|---------|---------|---------|------|---------|
+| 0.2 m/s | 0.993 m | 1.10 m | +10% | 1.108 |
+| 0.3 m/s | 0.993 m | 1.04 m | +4% | 1.04 |
+| 0.5 m/s | （未测） | （未测） | — | — |
+
+**原因分析**：
+- ROS odom 是**开环积分** cmd_vel（不读编码器），见 `odom_publisher_node.py:_odom_loop`
+- 不同速度下加速段/减速段占比不同，引入非线性误差：
+  - 低速时加速段占比大，加速期间命令已发但实际未到速 → odom 多报
+  - 高速时减速段惯性大，停车后还会滑行 → 实际多走
+- 二者方向相反，部分抵消，导致系数随速度变化
+
+**推荐做法**：
+1. **决定你建图常用速度**（推荐 0.3 m/s，平衡建图质量和效率）
+2. **用该速度标定**，得到对应系数
+3. **建图时保持同样速度**，标定才有意义
+
+> 速度依赖性是开环 odom 的固有局限。长期修复方案：固件上报编码器实测轮速，
+> ROS 端 odom 改用编码器反馈而非命令积分。当前 ~5% 残余误差对 SLAM 足够。
+
+#### 3.0.1.2 完整验证流程（带几何参数修改）
+
+如果你刚修改了麦轮几何参数（轮径/轮距/轴距），旧标定系数**全部失效**，必须重做。
+
+**完整步骤**：
+
+```bash
+# Step 1: 确认参数已更新
+# - ROS 端 mecanum.py / odom_publisher_node.py 改了几何参数
+# - 固件 kinematics.h MEC_ACLE_BASE / MEC_WHEEL_DIAMETER 改了且重烧
+# - calibrate_params.yaml 系数先临时设为 1.0（清空旧标定）
+
+# Step 2: 编译并重启 bringup
+cd ~/ros2_ws
+colcon build --packages-select controller car1_base_driver --symlink-install
+source install/setup.bash
+ros2 launch car1_bringup bringup.launch.py
+
+# Step 3: 确认系数加载
+# 另开终端
+ros2 param get /odom_publisher linear_correction_factor
+# 应显示 1.0（未标定状态）
+
+# Step 4: 启动标定节点
+ros2 run calibration calibrate_linear
+
+# Step 5: 设置参数（用你建图速度）
+ros2 param set /calibrate_linear test_distance 1.0
+ros2 param set /calibrate_linear speed 0.3   # ← 建图速度
+ros2 param set /calibrate_linear odom_linear_scale_correction 1.0
+ros2 topic pub /set_odom geometry_msgs/msg/Pose2D "{x: 0.0, y: 0.0, theta: 0.0}" --once
+
+# Step 6: 触发测试
+ros2 param set /calibrate_linear start_test true
+
+# Step 7: 量实际距离，计算系数
+# 公式：factor = 实际距离 / odom报告
+# 例：odom 报 0.993, 实际 1.04 → factor = 1.04 / 0.993 ≈ 1.047
+
+# Step 8: 保存到配置文件
+nano ~/ros2_ws/src/xflz_eai_car1/driver/controller/config/calibrate_params.yaml
+# 填入算出的系数
+
+# Step 9: 重启 bringup 使生效
+# Ctrl+C 停掉 bringup，重新启动
+ros2 launch car1_bringup bringup.launch.py
+
+# Step 10: 验证（关键！）
+# 重新启动标定节点（这次脚本内系数设 1.0，验证 odom 单独效果）
+ros2 run calibration calibrate_linear
+ros2 param set /calibrate_linear speed 0.3
+ros2 param set /calibrate_linear odom_linear_scale_correction 1.0
+ros2 topic pub /set_odom geometry_msgs/msg/Pose2D "{x: 0.0, y: 0.0, theta: 0.0}" --once
+ros2 param set /calibrate_linear start_test true
+
+# Step 10 预期结果：
+# - odom 报告 ≈ 0.97~0.99m（受 tolerance=0.03m 影响，提前停止）
+# - 实际距离 ≈ odom 报告（两者吻合 = 标定成功）
+# 例：odom 报 0.98m，实际量 0.98m → ✅ 完全吻合
+```
+
+**双系数说明（避免混淆）**：
+
+| 系数 | 位置 | 作用 | 标定时 | 验证时 |
+|------|------|------|--------|--------|
+| `linear_correction_factor` | calibrate_params.yaml<br/>(odom_publisher) | 放大 odom 输出，全局生效 | 暂设 1.0 | 填实测值 |
+| `odom_linear_scale_correction` | calibrate_linear 脚本运行时参数 | 脚本内部判断距离 | 暂设 1.0 | 暂设 1.0 |
+
+⚠️ **两个系数会叠加**：脚本系数 × odom_publisher 系数。验证时脚本系数必须设 1.0，否则会双重修正。
+
+**验证通过判据**：odom 报告值 ≈ 实际尺子量值（误差 <3cm 优秀，<5cm 合格）。
 
 **随时停车**（任意时刻）：
 ```bash
@@ -1670,7 +1776,7 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard
 > **注意**：SSH 远程连接时 teleop_twist_keyboard 可能无法捕获按键。替代方案：
 > ```bash
 > # 前进 3 秒
-> timeout 3 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.15, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" --rate 10
+> timeout 3 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.3, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" --rate 10
 >
 > # 左转 2 秒
 > timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.3}}" --rate 10
@@ -1679,12 +1785,12 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard
 > timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: -0.3}}" --rate 10
 >
 > # 左平移（麦轮）
-> timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.15, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" --rate 10
+> timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.3, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" --rate 10
 > ```
 
 **建图技巧**：
-- 速度不要太快（linear ≤ 0.15 m/s，angular ≤ 0.3 rad/s）
-- 缓慢移动，避免急转弯
+- 速度与标定速度保持一致（linear ≈ 0.3 m/s，angular ≤ 0.3 rad/s）。**标定速度=建图速度**，否则线速度系数失效（见 3.0.1.1）
+- 匀速移动，避免急加速和急转弯
 - 尽量覆盖整个环境
 - 走闭环（回到起点），slam_toolbox 会自动做回环检测优化地图
 - 避免长走廊等特征稀少的环境
@@ -1720,8 +1826,84 @@ ros2 run nav2_map_server map_saver_cli -f ~/ros2_ws/src/xflz_robot_car1/slam/car
 | Map 显示 "No map received" | slam_toolbox 未处理 scan | 确认 `transform_timeout` ≥ 1.0（在 `slam.yaml` 中） |
 | RobotModel 不显示 | 缺少 joint_states | 确认 `joint_state_publisher` 节点在运行 |
 | 轮子不停 | cmd_vel 超时未停止 | 系统已内置 0.5 秒超时自动停止 |
-| 地图重影 | 移动速度过快 | 减速，linear ≤ 0.15，angular ≤ 0.3 |
+| 地图重影 | 移动速度过快或与标定速度不符 | 匀速 ≈ 0.3 m/s（与标定一致），angular ≤ 0.3 |
 | 定位丢失 | 环境特征不足 | 增加环境特征物，避免空旷区域 |
+
+### 3.10 IMU 校准与航向验证（关键经验，2026-06）
+
+> 本节记录一次完整的航向问题排查。麦轮原地转打滑严重（实测 ~45%），**航向必须靠 IMU**，
+> 因此 IMU 链路 + EKF 融合是 SLAM 成败的核心。曾出现建图航向漂移 162°，根因是下面 5 个 bug 叠加。
+
+#### 3.10.1 航向问题的 5 个根因（全部已修复）
+
+| # | 问题 | 现象 | 修复 |
+|---|------|------|------|
+| 1 | IMU gyro scale 2× 过报告 | 转 1 圈 IMU 积分报 2 圈 | 固件 bmi088.c：soft-reset 后加 `HAL_Delay(30)` + 0x0F 回读校验 |
+| 2 | IMU 协方差全 0 | EKF 静默丢弃 IMU 数据 | base_driver_node.py：填非零协方差（角速度对角 0.0025） |
+| 3 | imu0_relative=true | vyaw 被减去初值 | ekf.yaml：改 `imu0_relative: false` |
+| 4 | **缺 base_link→imu_link TF** | EKF 无法变换 IMU 坐标（主因） | bringup.launch.py：加 robot_state_publisher |
+| 5 | 轮速 vyaw 与 IMU vyaw 冲突 | 打滑轮速污染航向 | ekf.yaml：odom0 关 vyaw，航向只用 IMU |
+
+#### 3.10.2 IMU scale 验证（转动法）
+
+```bash
+# 停掉 ROS，直接串口测（脚本独占串口，不能开 bringup）
+python3 src/xflz_eai_car1/test/imu_chassis_test.py
+```
+
+判读"缩小倍数"：
+- ~1.0 → IMU 正常（本项目实测转 300° / IMU 积分 303°，1.01×）
+- ~2.0 → scale 错误（量程寄存器问题）
+
+#### 3.10.3 EKF 融合 IMU 验证（分步排查）
+
+```bash
+ros2 launch car1_bringup bringup.launch.py
+
+# 1. IMU 链路三段验证
+ros2 topic hz /car1_base_driver/imu_raw   # STM32 源头，~10 Hz
+ros2 topic hz /imu                         # 滤波输出，~10 Hz
+ros2 node info /ekf_filter_node | grep -A5 Subscribers  # 含 /imu
+
+# 2. 协方差非零（关键！）
+ros2 topic echo /imu --once --field angular_velocity_covariance
+# 应为 [0.0025, 0, 0, 0, 0.0025, 0, 0, 0, 0.0025]，全 0 则 EKF 丢弃
+
+# 3. TF 链完整（关键！）
+ros2 run tf2_ros tf2_echo base_link imu_link
+# 应看到静态变换，"frame does not exist" 说明缺 robot_state_publisher
+
+# 4. 核心：转动时 EKF 角速度是否跟随
+#    终端A
+ros2 topic echo /odometry/filtered --field twist.twist.angular.z
+#    终端B
+ros2 topic pub /controller/cmd_vel geometry_msgs/msg/Twist "{angular: {z: 0.5}}" -r 20
+# 车转时终端A应显示 ~0.5（恒为 0 = EKF 没用 IMU）
+```
+
+#### 3.10.4 航向闭环验证（最终判据）
+
+```bash
+# 终端A：监控航向
+ros2 run tf2_ros tf2_echo odom base_footprint
+# 记录起始 yaw(degree)
+
+# 终端B：原地转整数圈（0.5 rad/s 转一圈约 12.5s）
+ros2 topic pub /controller/cmd_vel geometry_msgs/msg/Twist "{angular: {z: 0.5}}" -r 20
+# 目视转回原朝向后 Ctrl+C
+```
+
+**判据**：转 N 整圈后 yaw 回到起始值。本项目实测闭环误差 **0.25°/圈**（合格线 <5°）。
+
+#### 3.10.5 常见陷阱
+
+| 陷阱 | 说明 |
+|------|------|
+| imu_chassis_test.py 与 bringup 抢串口 | 两者都占 /dev/ttyUSB0，必须先停 bringup 再跑脚本 |
+| bringup 缺 robot_state_publisher | 修复后已加入 bringup；EKF 依赖 base_link→imu_link TF |
+| 协方差全 0 | robot_localization 无法求逆 → 静默丢弃，必须填非零 |
+| tf2_echo 时序误判 | 静止/转动日志要严格对齐时间，否则误判"yaw 不变" |
+| cmd_vel 持续发布转太多圈 | `-r 20` 不会自动停，用 `timeout 12.5` 控制圈数 |
 
 ---
 

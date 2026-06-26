@@ -44,7 +44,7 @@ xflz_robot_car1/
 |------|------|
 | 下位机 | STM32F407VET6 控制板 |
 | 通信方式 | 串口 1Mbps，协议帧：0xAA 0x55 \| Func \| Len \| Data \| CRC8 |
-| 底盘 | 4 轮麦克纳姆（轮距 0.1946m，轮宽 0.2117m，轮径 0.097m） |
+| 底盘 | 4 轮麦克纳姆（轮距 0.216m，轴距 0.1946m，轮径 0.0935m，实测值） |
 | 机械臂 | 5-DOF + 夹爪（总线舵机 ID 0~4 + 5） |
 | 传感器 | 激光雷达、深度相机（HP60C）、IMU |
 
@@ -213,10 +213,30 @@ ros2 launch car1_peripherals teleop_key.launch.py
 
 使用 slam_toolbox 进行 2D 激光 SLAM 建图，支持实时定位与地图保存。
 
+### ✅ 状态：航向问题已彻底解决（2026-06）
+
+历史问题：建图航向漂移（曾达 162°），墙体双线/地图旋转。
+**根因链（三个 bug 叠加，已全部修复）**：
+
+| # | 问题 | 修复 | 状态 |
+|---|------|------|------|
+| 1 | IMU gyro scale 2× 过报告 | 固件 bmi088.c 加 30ms 复位延时 + 0x0F 回读校验 | ✅ |
+| 2 | IMU 协方差全 0，EKF 丢弃数据 | base_driver 填非零协方差（角速度 0.0025） | ✅ |
+| 3 | imu0_relative=true 导致 vyaw 被减初值 | ekf.yaml 改 false | ✅ |
+| 4 | **缺 base_link→imu_link TF**（主因） | bringup 加 robot_state_publisher | ✅ |
+| 5 | EKF 轮速 vyaw 与 IMU vyaw 冲突 | ekf.yaml 关 odom0 的 vyaw，航向只用 IMU | ✅ |
+
+**校准成果**：
+- IMU scale：1.01× 精度（转 360° 误差 ~1%）
+- 线速度标定：linear_correction_factor=1.04，0% 残差
+- 角速度：真实≈360°，系数≈1.0
+- **航向闭环误差：0.25°/圈**（之前 162°）
+- EKF 角速度：转动时 ≈0.5（之前恒 0）
+
 ### 编译命令
 
 ```bash
-cd ~/xflz_robot_car1_ros2_ws
+cd ~/ros2_ws
 colcon build --packages-select car1_slam
 ```
 
@@ -224,21 +244,31 @@ colcon build --packages-select car1_slam
 
 ```bash
 # 启动 SLAM（包含 bringup + 雷达 + slam_toolbox）
+# 注意：bringup 现已含 robot_state_publisher（URDF TF），SLAM 不再单独启动
 ros2 launch car1_slam slam.launch.py
 
-# 启动 RViz 可视化
-ros2 launch car1_slam rviz_slam.launch.py
-
-# 保存地图
-ros2 run car1_slam map_save map_01
+# 保存地图（SLAM 运行时另开终端）
+ros2 run nav2_map_server map_saver_cli \
+  -f ~/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/slam_map \
+  --ros-args -p map_subscribe_transient_local:=true
 ```
 
 ### 验证要点
 
-- [ ] slam_toolbox 节点正常启动
-- [ ] 地图实时构建（RViz 中可见）
-- [ ] 使用键盘遥控建图，地图质量良好
-- [ ] 地图保存成功（生成 .pgm 和 .yaml 文件）
+- [x] slam_toolbox 节点正常启动
+- [x] EKF 融合 IMU 正常（转动时 /odometry/filtered 角速度≈指令值）
+- [x] 航向闭环误差 <5°（实测 0.25°/圈）
+- [x] 地图实时构建（RViz 中可见）
+- [x] 地图保存成功（生成 .pgm 和 .yaml 文件）
+- [ ] 墙体单线无重影（操作层面，需规整走位 + 走闭环）
+- [ ] 地图覆盖完整（减少未知区域，多角度扫描）
+
+### 建图操作建议（提升地图质量）
+
+1. **起步前静止 10 秒**：让 EKF/IMU filter 充分收敛再动
+2. **速度**：直线 0.2~0.3 m/s，转弯 ≤0.5 rad/s，拐角降速
+3. **走闭环**：回到起点触发回环优化，地图更整齐
+4. **覆盖全**：每区域多走、多角度，减少未知区域
 
 ---
 

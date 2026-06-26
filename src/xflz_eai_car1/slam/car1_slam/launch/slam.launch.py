@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""SLAM launch: bringup + lidar + robot_state_publisher + slam_toolbox.
+"""SLAM launch: bringup + lidar + slam_toolbox.
 
-Single entry point. Layered include of bringup (driver + chassis controller),
-then lidar, then a single robot_state_publisher for URDF static TF, and finally
+Single entry point. Layered include of bringup (driver + chassis controller +
+robot_state_publisher + joint_state_publisher), then lidar, and finally
 slam_toolbox delayed until odom/TF/scan have stabilized.
 
-Note: joint_state_publisher is intentionally NOT launched here. The real arm
-joint states are published by car1_servo_controller (controller_manager_node);
-adding a default-zero joint_state_publisher would fight it on /joint_states and
-make the arm jitter in RViz.
+Note: robot_state_publisher and joint_state_publisher now live in bringup
+(EKF needs base_link -> imu_link TF), so they are NOT started here to avoid
+duplicate publishers fighting over /robot_description and /tf_static.
 """
 import os
 from ament_index_python.packages import get_package_share_directory
@@ -24,20 +23,16 @@ def generate_launch_description():
     bringup_pkg = get_package_share_directory('car1_bringup')
     peripherals_pkg = get_package_share_directory('car1_peripherals')
     slam_pkg = get_package_share_directory('car1_slam')
-    description_pkg = get_package_share_directory('car1_description')
 
     slam_config = os.path.join(slam_pkg, 'config', 'slam.yaml')
-    urdf_file = os.path.join(description_pkg, 'urdf', 'car1.urdf')
     rviz_config = os.path.join(slam_pkg, 'rviz', 'slam.rviz')
-
-    with open(urdf_file, 'r') as f:
-        robot_desc = f.read()
 
     use_rviz = LaunchConfiguration('use_rviz', default='true')
     use_rviz_arg = DeclareLaunchArgument('use_rviz', default_value='true')
 
-    # 1. Bringup (driver layer: base_driver + chassis controller + servo controller).
-    #    servo_controller publishes the real /joint_states for the arm.
+    # 1. Bringup (driver + robot_state_publisher + joint_state_publisher + chassis controller).
+    #    robot_state_publisher (URDF static TF) and joint_state_publisher are provided
+    #    by bringup so EKF gets base_link -> imu_link TF.
     bringup_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(bringup_pkg, 'launch', 'bringup.launch.py'))
@@ -49,35 +44,7 @@ def generate_launch_description():
             os.path.join(peripherals_pkg, 'launch', 'lidar.launch.py'))
     )
 
-    # 3. Robot state publisher (the single source of URDF static TF).
-    #    bringup does NOT start one, so slam must provide it.
-    robot_state_publisher_node = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        parameters=[{'robot_description': robot_desc}],
-        output='screen'
-    )
-
-    # 4. Joint state publisher (fills in missing wheel joints).
-    #    servo_controller publishes arm_joint1-5 + r_joint (real servo positions).
-    #    But the 4 wheel_*_joint (continuous) are never published by anyone.
-    #    This node subscribes to /joint_states (gets arm joints from servo_controller),
-    #    republishes them unchanged, and adds default zero positions for wheels.
-    #    Result: robot_state_publisher receives complete joint_states for all URDF joints.
-    joint_state_publisher_node = Node(
-        package='joint_state_publisher',
-        executable='joint_state_publisher',
-        name='joint_state_publisher',
-        parameters=[
-            {'robot_description': robot_desc},
-            {'source_list': ['joint_states']},  # Subscribe to servo_controller's output
-            {'rate': 20},
-        ],
-        output='screen'
-    )
-
-    # 4. slam_toolbox, delayed 10s to let odom / TF / scan stabilize.
+    # 3. slam_toolbox, delayed 10s to let odom / TF / scan stabilize.
     slam_node = TimerAction(
         period=10.0,
         actions=[
@@ -91,7 +58,7 @@ def generate_launch_description():
         ]
     )
 
-    # 5. RViz2 (optional, toggle with use_rviz:=false)
+    # 4. RViz2 (optional, toggle with use_rviz:=false)
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -105,8 +72,6 @@ def generate_launch_description():
         use_rviz_arg,
         bringup_launch,
         lidar_launch,
-        robot_state_publisher_node,
-        joint_state_publisher_node,
         slam_node,
         rviz_node,
     ])

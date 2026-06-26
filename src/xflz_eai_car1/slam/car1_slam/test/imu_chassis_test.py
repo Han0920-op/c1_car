@@ -221,33 +221,41 @@ class IMUReader:
 # ============ 主程序 ============
 def main():
     # ---- 测试参数 ----
-    # 速度单位: RPS (转/秒, revolutions per second).
-    # 来源: ROS2 driver mecanum.py::speed_to_rps() 把 m/s 转 RPS 后发送给 STM32.
-    #   speed_to_rps(v) = v / (π × wheel_diameter)
-    # STM32 kinematics_set_raw_wheel(id, speed) 中 speed 直接赋值给 Wheel.TG.
+    # 速度单位: m/s (轮缘线速度)
+    # 来源: STM32 kinematics_set_raw_wheel(id, speed) 中 speed 直接赋值给 Wheel.TG,
+    #   而 Wheel.RT(实测轮速) = encoder_ticks × MEC_WHEEL_SCALE,
+    #   MEC_WHEEL_SCALE = π × D × PID_RATE / RES, 单位是 m/s.
+    #   PID 比较 TG 和 RT, 所以 STM32 期望的单位是 m/s, 不是 RPS.
     #
-    # SLAM 建图参考 (slam_toolbox):
-    #   - 推荐车体角速度 ω ≤ 1.0 rad/s, 避免激光点云运动畸变
-    #   - 计算: ω = 2 × v_wheel / track_width
-    #         v_wheel = RPS × π × wheel_diameter
-    #   - 轨距 track_width = 0.2117 m (MEC_ACLE_BASE)
-    #   - 轮径 wheel_diameter = 0.097 m (MEC_WHEEL_DIAMETER)
+    # 原地旋转角速度公式 (麦轮, 左右两轮反向):
+    #   ω = 2 × v_wheel / track_width
+    #   track_width = 0.216 m (MEC_ACLE_BASE, 实测值, 与固件一致)
     #
-    # WHEEL_SPEED=0.35 RPS → 轮线速 0.107 m/s → 车体角速度 ω ≈ 1.01 rad/s ≈ 0.16 圈/s
-    #                      → 7s 转 1.12 圈 (适合 SLAM, 不太快也不太慢)
-    # 之前误判: 200(RPS)≈1890 rad/s 飞快; 20(RPS)≈189 rad/s 仍快; 0.35(RPS)≈1 rad/s 合适
-    WHEEL_SPEED = 0.35       # 单轮转速 (RPS, 转/秒), 适合 SLAM 建图
-    DURATION = 7.0           # 旋转持续时间 (秒), 7s ≈ 转 1.12 圈
+    # WHEEL_SPEED=0.212 m/s → ω ≈ 1.96 rad/s
+    #                       → 5s 转 1.56 圈 (理论)
+    # 判别实验:
+    #   - 若 IMU 积分 ≈ 目视圈数 → 低速打滑是主因, IMU 正常
+    #   - 若 IMU 积分 ≈ 2× 目视  → IMU 过报告 2×, 与速度无关
+    WHEEL_SPEED = 0.212      # 单轮线速度 (m/s)
+    DURATION = 5.0           # 旋转持续时间 (秒), 5s ≈ 转 1.56 圈
     SETTLE_TIME = 1.0        # 旋转前后静止采样时间 (秒)
     OUTPUT_CSV = 'imu_test_log.csv'
+
+    # 理论角速度 (用于和 IMU gz 对比, 判断 IMU 缩小倍数)
+    TRACK_WIDTH = 0.216
+    THEORETICAL_OMEGA = 2.0 * WHEEL_SPEED / TRACK_WIDTH  # ≈ 1.96 rad/s
 
     print("=" * 50)
     print("  IMU 数据采集 + 麦轮旋转测试")
     print("=" * 50)
     print(f"串口:     {SERIAL_PORT} @ {BAUDRATE}")
-    print(f"轮速:     {WHEEL_SPEED}")
+    print(f"轮速:     {WHEEL_SPEED} m/s")
+    print(f"理论ω:    {THEORETICAL_OMEGA:.3f} rad/s (期望 IMU gz ≈ 该值)")
     print(f"旋转时间: {DURATION}s")
     print(f"静止采样: {SETTLE_TIME}s (前后各一次)")
+    print()
+    print("[提示] 若需看 STM32 启动日志 (BMI088 Init / Gyro Chip ID / Scale),")
+    print("       请按 STM32 复位键后立即运行本脚本。")
     print()
 
     # ---- 打开串口 ----
@@ -299,7 +307,10 @@ def main():
         while time.time() - t0 < DURATION:
             if reader.latest_imu:
                 imu = reader.latest_imu
-                print(f"\r  旋转: gyro_z={imu['gyro_z']:+.4f} rad/s  "
+                gz = imu['gyro_z']
+                ratio = THEORETICAL_OMEGA / gz if abs(gz) > 1e-4 else float('inf')
+                print(f"\r  旋转: gyro_z={gz:+.4f} rad/s  理论={THEORETICAL_OMEGA:+.3f}  "
+                      f"缩小≈{ratio:.1f}×  "
                       f"accel=({imu['accel_x']:+.2f},{imu['accel_y']:+.2f},{imu['accel_z']:+.2f})",
                       end='', flush=True)
             time.sleep(0.05)
@@ -350,10 +361,39 @@ def main():
 
     # ---- 简单统计 ----
     gyro_z = [r['gyro_z'] for r in reader.imu_log]
-    print(f"\n--- 角速度 Z (rad/s) 统计 ---")
+    print(f"\n--- 角速度 Z (rad/s) 全程统计 ---")
     print(f"  最大值: {max(gyro_z):+.4f}")
     print(f"  最小值: {min(gyro_z):+.4f}")
     print(f"  平均值: {sum(gyro_z)/len(gyro_z):+.4f}")
+
+    # 旋转阶段诊断: |gz| > 30% 理论值 视为旋转中
+    spin_threshold = 0.3 * THEORETICAL_OMEGA
+    spin_samples = [r['gyro_z'] for r in reader.imu_log if abs(r['gyro_z']) > spin_threshold]
+    print(f"\n--- 旋转阶段诊断 (阈值 |gz|>{spin_threshold:.3f}) ---")
+    print(f"  理论角速度:    {THEORETICAL_OMEGA:+.4f} rad/s")
+    if spin_samples:
+        spin_mean = sum(spin_samples) / len(spin_samples)
+        ratio = THEORETICAL_OMEGA / spin_mean if abs(spin_mean) > 1e-4 else float('inf')
+        print(f"  旋转阶段均值:  {spin_mean:+.4f} rad/s ({len(spin_samples)} 样本)")
+        print(f"  缩小倍数:      {ratio:.2f}×  (理论/实测)")
+        print()
+        print("  === 诊断结论 ===")
+        if ratio < 1.5:
+            print(f"  ✓ IMU 基本正常 (缩小 {ratio:.2f}×, 在噪声范围内)")
+            print("    残余误差可能来自: 轮速 PID 稳态误差 / 轮胎打滑 / track_width 标定")
+        elif 1.8 <= ratio <= 2.2:
+            print(f"  ✗ 2× 误差 (缩小 {ratio:.2f}×) → 量程寄存器 0x0F 未生效, 回退到 ±2000°/s 默认")
+            print("    修复: bmi088.c 软复位后加 30ms 唤醒延时, 再写 0x0F")
+        elif ratio > 5:
+            print(f"  ✗ {ratio:.1f}× 误差 → 陀螺 Z 通道未正常采样 (非 scale 问题)")
+            print("    可能原因: I2C 读取失败被忽略 / 软复位后未唤醒 / 数据撕裂")
+            print("    修复: 加读取错误重试 + 软复位延时 + burst 读取 6 字节")
+        else:
+            print(f"  ? {ratio:.2f}× 误差, 介于 2× 和大倍数之间, 需结合启动日志判断")
+    else:
+        print(f"  ✗ 未检测到旋转样本 (无 |gz|>{spin_threshold:.3f} 的数据)")
+        print("    可能: 车没转 / IMU 完全死掉 / 电机命令未生效")
+        print("    建议: 检查 accel 是否有向心加速度变化, 确认车是否真转")
 
     accel_z = [r['accel_z'] for r in reader.imu_log]
     print(f"\n--- 加速度 Z (m/s²) 统计 ---")

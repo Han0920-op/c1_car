@@ -15,8 +15,9 @@ class MecanumChassis:
         motor2 |     | motor4
     """
 
-    def __init__(self, wheelbase=0.1946, track_width=0.2117, wheel_diameter=0.097):
-        """
+    def __init__(self, wheelbase=0.1946, track_width=0.216, wheel_diameter=0.0935):
+        """Initialize mecanum chassis kinematics.
+
         Args:
             wheelbase: Distance between front and rear axles (m).
             track_width: Distance between left and right wheels (m).

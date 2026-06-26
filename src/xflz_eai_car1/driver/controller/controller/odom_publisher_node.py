@@ -80,8 +80,8 @@ class OdomPublisherNode(Node):
         self.declare_parameter('linear_correction_factor', 1.00)
         self.declare_parameter('angular_correction_factor', 1.00)
         self.declare_parameter('wheelbase', 0.1946)
-        self.declare_parameter('track_width', 0.2117)
-        self.declare_parameter('wheel_diameter', 0.097)
+        self.declare_parameter('track_width', 0.216)
+        self.declare_parameter('wheel_diameter', 0.0935)
 
         self.base_frame_id = self.get_parameter('base_frame_id').value
         self.odom_frame_id = self.get_parameter('odom_frame_id').value

@@ -11,6 +11,8 @@
   <depend>car1_base_driver</depend>
   <depend>controller</depend>
   <depend>car1_description</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>joint_state_publisher</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
