@@ -163,7 +163,7 @@ car1_base_driver ──────────▶ car1_servo_controller
 - **app/** — `car1_app`: `line_following`, `object_tracking`, `hand_gesture`, `lidar_controller`, `track_and_grab`, `visual_grasp`.
 - **calibration/** — `calibrate_linear`, `calibrate_angular`, `calibrate_servo`.
 - **peripherals/** — `car1_peripherals` launch files for COIN-D6 lidar and HP60C depth camera.
-- **navigation/** — `car1_navigation` (Nav2: AMCL, ThetaStar global, TEB local in omni mode).
+- **navigation/** — `car1_navigation` (Nav2: AMCL DifferentialMotionModel, ThetaStar global, MPPI local with DiffDrive motion model (Y disabled), custom BT without backup recovery).
 - **slam/** — `car1_slam` (slam_toolbox config + saved `maps/`).
 - **simulations/** — `car1_description` (URDF), `car1_gazebo` (worlds + grasp demos), `car1_moveit_config`.
 - **bringup/** — `car1_bringup` (system launch).
@@ -172,8 +172,9 @@ car1_base_driver ──────────▶ car1_servo_controller
 
 ### Velocity Command Routing
 
-- `/cmd_vel` — external commands (Nav2, teleop)
-- `/controller/cmd_vel` — internal commands (app nodes)
+- `/cmd_vel` — external commands (teleop, app). `odom_publisher` applies a ±0.2 m/s safety clamp on this channel.
+- `/controller/cmd_vel` — internal high-speed commands from Nav2 (no clamp).
+- Nav2 path: `controller_server` → `/cmd_vel_nav` → `velocity_smoother` → `/controller/cmd_vel` → `odom_publisher`. The two `cmd_vel` remaps in `car1_navigation/launch/include/navigation_base.launch.py` must stay in place; otherwise Nav2 output falls back to `/cmd_vel` and gets clamped to ±0.2 m/s.
 
 ### Arm Control Interfaces
 

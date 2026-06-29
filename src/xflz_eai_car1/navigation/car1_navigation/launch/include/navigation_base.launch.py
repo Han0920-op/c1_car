@@ -27,6 +27,7 @@ def generate_launch_description():
         executable='controller_server',
         name='controller_server',
         parameters=[configured_params],
+        remappings=[('cmd_vel', 'cmd_vel_nav')],
         output='screen'
     )
 
@@ -59,7 +60,7 @@ def generate_launch_description():
         executable='velocity_smoother',
         name='velocity_smoother',
         parameters=[configured_params],
-        remappings=[('cmd_vel_smoothed', 'controller/cmd_vel')],
+        remappings=[('cmd_vel', 'cmd_vel_nav'), ('cmd_vel_smoothed', 'controller/cmd_vel')],
         output='screen'
     )
 

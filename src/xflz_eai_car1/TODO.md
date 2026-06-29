@@ -1,11 +1,11 @@
-# xflz_robot_car1 项目功能清单与目录结构
+# xflz_eai_car1 项目功能清单与目录结构
 
 ---
 
 ## 项目目录结构
 
 ```
-xflz_robot_car1/
+xflz_eai_car1/
 ├── TODO.md                              # 本文件：功能清单与验证指南
 ├── tutorial.md                          # 教程文档
 ├── driver/                              # 硬件驱动层（Phase 1）
@@ -13,7 +13,7 @@ xflz_robot_car1/
 │   ├── car1_base_driver_msgs/           # 板级驱动消息/服务定义
 │   ├── car1_servo_controller/           # 总线舵机控制器（关节状态 + 轨迹动作）
 │   ├── car1_servo_controller_msgs/      # 舵机控制器消息定义
-│   ├── car1_chassis_controller/         # 底盘控制（麦轮运动学 + 里程计 + EKF）
+│   ├── controller/                      # 底盘控制（麦轮运动学 + 里程计 + EKF）
 │   └── car1_sdk/                        # 工具库（PID、通用函数）
 ├── peripherals/                         # 传感器集成（Phase 2）
 │   └── car1_peripherals/                # 雷达、深度相机、遥控
@@ -44,7 +44,7 @@ xflz_robot_car1/
 |------|------|
 | 下位机 | STM32F407VET6 控制板 |
 | 通信方式 | 串口 1Mbps，协议帧：0xAA 0x55 \| Func \| Len \| Data \| CRC8 |
-| 底盘 | 4 轮麦克纳姆（轮距 0.216m，轴距 0.1946m，轮径 0.0935m，实测值） |
+| 底盘 | 4 轮麦克纳姆（轮距 0.2117m，轴距 0.1946m，轮径 0.097m，固件已校准） |
 | 机械臂 | 5-DOF + 夹爪（总线舵机 ID 0~4 + 5） |
 | 传感器 | 激光雷达、深度相机（HP60C）、IMU |
 
@@ -58,7 +58,7 @@ car1_base_driver ──────────▶ car1_servo_controller
          │                              │
          └──────────┬───────────────────┘
                     ▼
-         car1_chassis_controller
+              controller (chassis)
                     │
                     ▼
               car1_bringup
@@ -67,14 +67,14 @@ car1_base_driver ──────────▶ car1_servo_controller
 ### 编译命令
 
 ```bash
-cd ~/xflz_robot_car1_ros2_ws
+cd ~/ros2_ws
 colcon build --packages-select \
   car1_base_driver_msgs \
   car1_servo_controller_msgs \
   car1_sdk \
   car1_base_driver \
   car1_servo_controller \
-  car1_chassis_controller \
+  controller \
   car1_arm_controller
 ```
 
@@ -91,7 +91,7 @@ ros2 launch car1_arm_controller arm_controller.launch.py
 ros2 launch car1_base_driver base_driver.launch.py
 
 # 单独启动底盘控制器
-ros2 launch car1_chassis_controller chassis_controller.launch.py
+ros2 launch controller chassis_controller.launch.py
 ```
 
 ### 验证要点
@@ -118,7 +118,7 @@ ros2 launch car1_chassis_controller chassis_controller.launch.py
 ### 编译命令
 
 ```bash
-cd ~/xflz_robot_car1_ros2_ws
+cd ~/ros2_ws
 colcon build --packages-select car1_arm_controller
 ```
 
@@ -177,7 +177,7 @@ car1_peripherals
 ### 编译命令
 
 ```bash
-cd ~/xflz_robot_car1_ros2_ws
+cd ~/ros2_ws
 colcon build --packages-select car1_peripherals
 ```
 
@@ -276,19 +276,53 @@ ros2 run nav2_map_server map_saver_cli \
 
 ### 功能说明
 
-基于 Nav2 的自主导航系统，支持 AMCL 定位、ThetaStar 全局规划、TEB 局部规划（全向运动）。
+基于 Nav2 的自主导航系统。**与 lander_pi 参考栈对比讨论后的当前选型**：
+
+- **AMCL**：DifferentialMotionModel（按差速车配置，麦轮横向不参与定位粒子建模）
+- **全局规划**：ThetaStar（line-of-sight 优化，8-connectivity）
+- **局部控制**：RotationShimController 外壳 → MPPI（DiffDrive 运动模型，vy=0）
+  - shim 用于路径起点角度差 >0.5 rad 时先原地转齐，避免画弧线起步
+  - MPPI vx_max=0.4 m/s、wz_max=3.0 rad/s
+  - critic 去掉 PreferForward（麦轮可后退无代价）
+- **Recovery**：与 lander_pi mecanum 对齐——`[spin, drive_on_heading, assisted_teleop, wait]`（无 backup）
+- **BT**：
+  - 单点 `navigate_to_pose_without_backup.xml`：双层 RecoveryNode（ComputePath/FollowPath 各带 ClearCostmap 内层重试）
+  - 多点 `navigate_through_poses_without_backup.xml`：连续多点路径（用于"不停顿穿越"）
+- **多点导航/巡逻/按点任务**：走应用层 Python 循环 `BasicNavigator.goToPose()`，**不**用 `follow_waypoints`，不加 `waypoint_follower` / `smoother_server`
+- **cmd_vel 路由**：
+  - Nav2 → `/cmd_vel_nav` → velocity_smoother → `/controller/cmd_vel`（无 clamp）→ odom_publisher
+  - 外部 teleop/app → `/cmd_vel`（odom_publisher 内 ±0.2 m/s clamp）
+  - 两通道**必须**通过 launch remap 分离，否则 Nav2 输出会被 clamp 截速 + 与 smoother 竞态
+- **Costmap**：`inflation_radius=0.18` + `cost_scaling_factor=4.0`，针对最窄 0.5 m 通道 + 车宽 0.27 m 调参（通道居中 cost=0），**不要按"外接圆经验"抬高**
+- **Lidar 范围（D8）**：AMCL 用 0.10–8.0 m；驱动 `m1ct_d2` 限 0.05–12 m（与厂家有效范围对齐）
+- **地图加载（D12）**：`get_package_share_directory('car1_slam') + /maps/`，配 `--symlink-install` 后新建图无需 rebuild 即时生效
+
+### 关键配置文件
+
+| 文件 | 作用 |
+|---|---|
+| `car1_navigation/config/nav2_params.yaml` | 全栈 Nav2 参数 |
+| `car1_navigation/config/behavior_trees/navigate_to_pose_without_backup.xml` | 单点导航 BT |
+| `car1_navigation/config/behavior_trees/navigate_through_poses_without_backup.xml` | 多点穿越 BT |
+| `car1_navigation/launch/include/navigation_base.launch.py` | cmd_vel remap 入口 |
+| `car1_navigation/launch/navigation.launch.py` | 主 launch（含 map 路径解析） |
+| `car1_peripherals/launch/lidar.launch.py` | COIN-D6 lidar 驱动范围 |
+| `driver/controller/config/ekf.yaml` | EKF 输入通道（仅 odom_raw vx/vy + IMU vyaw） |
+| `driver/controller/controller/odom_publisher_node.py` | cmd_vel 双通道路由（`cmd_vel` clamp / `controller/cmd_vel` 无 clamp）|
 
 ### 编译命令
 
 ```bash
-cd ~/xflz_robot_car1_ros2_ws
-colcon build --packages-select car1_navigation
+cd ~/ros2_ws
+colcon build --symlink-install --packages-select car1_navigation car1_slam car1_peripherals
 ```
 
 ### 启动命令
 
 ```bash
-# 启动导航（需指定地图文件）
+# 启动导航（默认地图 slam_map，对应 src/.../slam/car1_slam/maps/slam_map.yaml）
+ros2 launch car1_navigation navigation.launch.py
+# 或指定其他地图
 ros2 launch car1_navigation navigation.launch.py map:=map_01
 
 # 启动 RViz 导航可视化
@@ -297,13 +331,73 @@ ros2 launch car1_navigation rviz_navigation.launch.py
 
 ### 验证要点
 
-- [ ] 地图加载成功
+- [ ] 地图加载成功（路径来自 `install/car1_slam/share/car1_slam/maps/` 软链到源码 maps）
 - [ ] AMCL 定位正常（机器人位姿与地图对齐）
-- [ ] 在 RViz 中设置导航目标，机器人能自主规划路径
-- [ ] 机器人能避障并到达目标点
-- [ ] 麦轮全向运动正常（可横向平移）
+- [ ] RViz 单点 goal 能规划路径且到达
+- [ ] **D3 RotationShim 预对齐**：路径起点方向差 >28° 时机器人先原地转再前进（不应画弧绕进）
+- [ ] **D3 速度上限**：直线段最高速达 ~0.4 m/s（D11 修 cmd_vel 路由前会被 clamp 到 0.2）
+- [ ] **D11 cmd_vel 隔离**：teleop 发 `/cmd_vel` 时车体受 ±0.2 m/s 限速；Nav2 自动控制时不受限
+- [ ] **D8 AMCL 收敛**：在 8 m 房间内 5 s 内收敛粒子云
+- [ ] 多点导航：Python 串行 `goToPose` 循环工作（不是 `followWaypoints`）
+
+### 已写入 auto-memory 的关键决策（防止以后绕回）
+
+- `mecanum_lateral_disabled_in_nav.md` — Nav2 全栈按差速车配置；底盘 vy 通路完好，app/teleop 可直发 `/controller/cmd_vel.linear.y`
+- `nav_multipoint_via_app_loop.md` — 多点统一走应用层 Python 循环
+- `nav_costmap_tuned_for_narrow_corridor.md` — 0.18/4.0 是为 0.5 m 通道刻意调的
+- `cmd_vel_routing_car1.md` — Nav2/teleop 双通道路由 + clamp 隔离规则
+
+### 工程卫生收尾（F1-F6，已完成）
+
+| # | 改动 | 文件 |
+|---|---|---|
+| F1 | 补 `navigation.rviz`（基于 lander_pi 拷改：`/scan_raw→/scan`、`lidar_frame→laser_link`） | `car1_navigation/rviz/navigation.rviz` |
+| F2 | `xy_goal_tolerance 0.05→0.10`、`required_movement_radius 0.5→0.1`（解除接近 goal 时 progress 误判失败的冲突） | `nav2_params.yaml:128,133` |
+| F3 | `amcl.transform_tolerance 1.0→0.3`（EKF TF 卡死时不会用 1s 旧 TF 推错粒子云） | `nav2_params.yaml:37` |
+| F4 | 加 `test/test_copyright.py`、`test_flake8.py`、`test_pep257.py` + `package.xml` 加 `test_depend` | `car1_navigation/test/`、`package.xml`、`setup.py` |
+| F5 | 删 `map_saver` 下无效的 `map_subscribe_transient_local: true`（该参数只对 static_layer 有效） | `nav2_params.yaml:354-359` |
+| F6 | CLAUDE.md（根 + 子）补 `cmd_vel` 双通道注释，说明 Nav2 path 和 ±0.2 clamp 关系 | `CLAUDE.md:173-178`、`src/xflz_eai_car1/CLAUDE.md:103-107` |
+
+### 未决事项
+
+#### D9 — Lidar 滤波链（等实测）
+
+**待验证**：lidar 装在车前端中线（laser_joint 偏移 x=0.146 m），向车尾扫描时可能扫到自身车体（外壳/支架/相机/手臂底座）。
+
+**实测步骤**：
+1. `ros2 launch car1_navigation navigation.launch.py`
+2. RViz 加 `LocalCostmap` 显示
+3. 机器人静止于空旷处，观察 footprint 周围一圈是否有持续标记的红色 cell
+
+**判定 + 处置**：
+- footprint 外圈干净 → 无需处理（保持现状）
+- footprint 周围有持续残影 → 启用 `lidar.launch.py` 的 `ignore_array` 参数屏蔽对应车后扇区（不引入 `laser_filters` 节点以避免多一层 IPC 延迟）
+
+#### D2 — 静止 yaw 漂移（等诊断）
+
+**现象**：car1 静止运行一段时间后 yaw 漂移可见。
+
+**初步定位**：EKF 仅靠 IMU 提供 vyaw（odom vyaw 实际是 cmd_vel 命令回声，已正确禁用），BMI088 静止零偏 ±0.04 rad/s 是物理事实。
+
+**诊断步骤**：
+1. `ros2 run tf2_ros tf2_echo odom base_footprint` — 静止 5 分钟看 yaw 变化率
+2. `ros2 run tf2_ros tf2_echo map base_footprint` — 同上
+
+**判定 + 处置**：
+- 仅 `odom→base_footprint` 漂、`map→base_footprint` 稳 → AMCL 在兜底，**不用处理**，仅是 odom 帧外观
+- 两者都漂 → AMCL 也失锁，回头查 AMCL 参数或粒子收敛
+- 介意 odom 帧静止漂移 → 在 odom_publisher 或单独节点加在线零偏估计（静止 ≥2 s 平均 gyro_z 作 offset 扣减）
+
+#### D3 — MPPI CPU 占用（等实测）
+
+**待验证**：batch_size=2000 × time_steps=56 在 RK3576 上是否能稳到 controller_frequency=20 Hz。
+
+**实测**：跑导航 + `htop` 看 `controller_server` CPU；`ros2 topic hz /local_costmap/costmap_updates`。
+
+**回退**：若 controller_server 持续 >90% 单核 → 把 batch_size 砍到 1000，再不行 1500/40 组合。
 
 ---
+
 
 ## 智能应用（Phase 5）
 
@@ -320,7 +414,7 @@ ros2 launch car1_navigation rviz_navigation.launch.py
 ### 编译命令
 
 ```bash
-cd ~/xflz_robot_car1_ros2_ws
+cd ~/ros2_ws
 colcon build --packages-select car1_app
 ```
 
@@ -353,392 +447,6 @@ ros2 launch car1_app track_and_grab.launch.py
 
 ---
 
-## 仿真功能验证（已实现）
-
----
-
-## 概述
-
-| 项目 | 说明 |
-|------|------|
-| 验证目标 | 确保新 URDF 模型可正常运行所有功能 |
-| 适用产品 | xflz_robot_car1 (car1_description) |
-| 依赖环境 | ROS2 Jazzy + 本项目代码 |
-| 验证方式 | 从底层到顶层，逐层验证 |
-
----
-
-## 验证流程总览
-
-```
-新URDF模型
-    ↓
-① URDF验证 (Rviz)
-    ↓
-② 运动学配置与测试
-    ↓
-③ 控制器配置与测试
-    ↓
-④ SLAM建图
-    ↓
-⑤ 导航验证
-    ↓
-⑥ 视觉功能
-    ↓
-⑦ 应用功能
-    ↓
-⑧ Bringup启动 (一键启动)
-    ↓
-⑨ Gazebo 仿真抓取验证（阶段1~5）
-```
-
----
-
-## 第一步：URDF 模型验证
-
-### 目标
-
-确保机器人 3D 模型在 Rviz 中正确显示，关节连杆关系正确。
-
-### 路径
-
-- URDF文件：`src/xflz_robot_car1/simulations/urdf/`
-
-### 涉及文件
-
-| 文件 | 作用 |
-|------|------|
-| `car1.urdf` | 主入口，机器人完整模型 |
-| `car1.csv` | 机器人模型参数数据 |
-
-### 操作命令
-
-```bash
-# 启动 Rviz 可视化
-ros2 launch car1_description display.launch.py
-
-### 验证要点
-
-- [ ] 机器人模型完整显示
-- [ ] 各关节连接关系正确
-- [ ] 关节可自由拖动
-- [ ] TF 坐标系正确发布
-
-### 常见问题
-
-- 如遇 `MACHINE_TYPE` 未设置错误：设置环境变量
-- 如遇路径错误：确保在项目根目录运行
-
----
-
-## 第二步：运动学配置与测试
-
-### 目标
-
-验证机械臂正逆运动学求解正确，确保末端可到达目标位置。
-
-### 路径
-
-- 运动学代码：`src/xflz_robot_car1/arm/kinematics/`
-
-### 涉及文件
-
-| 文件 | 作用 |
-|------|------|
-| `kinematics/fk_demo.py` | 正运动学正解Demo |
-| `kinematics/ik_demo.py` | 逆运动学解析解Demo |
-| `car1.urdf` | 机械臂模型（来自 simulations 包） |
-
-### 操作命令
-
-```bash
-# 编译
-colcon build --packages-select car1_kinematics
-
-# 运行正运动学正解Demo
-ros2 launch car1_kinematics kinematics.launch.py
-
-# 或使用 ros2 run
-ros2 run car1_kinematics fk_demo
-
-# 运行逆运动学解析解Demo
-ros2 run car1_kinematics ik_demo
-```
-
-### 机械臂关节信息
-
-基于 car1.urdf 的机械臂结构：
-
-| 关节名称 | 类型 | 父连杆 | 子连杆 | 限位 (rad) |
-|----------|------|--------|--------|-------------|
-| arm_base_joint | fixed | base_link | arm_base_link | - |
-| arm_joint1 | revolute | arm_base_link | arm_link1 | [-3.14, 3.14] |
-| arm_joint2 | revolute | arm_link1 | arm_link2 | [-3.14, 3.14] |
-| arm_joint3 | revolute | arm_link2 | arm_link3 | [-3.14, 3.14] |
-| arm_joint4 | revolute | arm_link3 | arm_link4 | [-3.14, 3.14] |
-| arm_joint5 | revolute | arm_link4 | arm_link5 | [-3.14, 3.14] |
-| arm_joint6 | fixed | arm_link5 | arm_link6 | - |
-
-**机械臂自由度：5 (DOF)**
-
-### 验证要点
-
-- [ ] 正运动学：给定关节角度，末端位置计算正确
-- [ ] 逆运动学：给定目标位置，能求出有效关节角度（解析解）
-- [ ] 关节范围不超出机械结构限制
-- [ ] 连杆长度与实际模型一致
-
-### 机械臂参数
-
-基于 car1.urdf 提取的连杆参数：
-
-| 参数 | 说明 | 值 (m) |
-|------|------|--------|
-| d1 | 底座高度 | 0.0435 |
-| a2 | 大臂长度 | 0.12614 |
-| a3 | 小臂长度 | 0.12614 |
-| a4 | 腕部长度 | 0.074395 |
-| 自由度 | DOF | 5 |
-
-### 注意事项
-
-- 270度舵机建议限位：±120度（约±2.09弧度）
-- 设置90%~95%的最大角度作为安全限位
-
----
-
-## 第三步：控制器配置
-
-### 目标
-
-确保机器人底盘运动控制正常工作。
-
-### 路径
-
-- 控制器代码：`src/xflz_robot_car1/driver/car1_chassis_controller/`
-
-### 涉及文件
-
-| 文件 | 作用 |
-|------|------|
-| `config/ekf.yaml` | 扩展卡尔曼滤波配置 |
-| `config/init_pose.yaml` | 机器人初始位置 |
-| `launch/chassis_controller.launch.py` | 底盘控制器启动 |
-
-### 操作命令
-
-```bash
-# 启动底盘控制器（包含在 bringup 中）
-ros2 launch car1_bringup bringup.launch.py
-
-# 或单独启动
-ros2 launch car1_chassis_controller chassis_controller.launch.py
-```
-
-### 验证要点
-
-- [ ] 机器人可响应运动指令 (`ros2 topic pub /controller/cmd_vel ...`)
-- [ ] 里程计数据正常发布 (`ros2 topic echo /odom_raw`)
-- [ ] EKF 融合输出正常 (`ros2 topic echo /odometry/filtered`)
-- [ ] 坐标系变换正确 (`ros2 run tf2_tools view_frames`)
-
----
-
-## 第四步：传感器集成（Phase 2）
-
-### 目标
-
-验证激光雷达和深度相机数据正常发布。
-
-### 路径
-
-- 传感器包：`src/xflz_robot_car1/peripherals/car1_peripherals/`
-
-### 操作命令
-
-```bash
-# 启动所有传感器
-ros2 launch car1_peripherals peripherals.launch.py
-
-# 键盘遥控
-ros2 launch car1_peripherals teleop_key.launch.py
-```
-
-### 验证要点
-
-- [ ] 雷达数据正常 (`ros2 topic echo /scan`)
-- [ ] 深度相机图像正常 (`ros2 topic echo /depth_cam/rgb/image_raw`)
-- [ ] 键盘遥控响应正常
-
----
-
-## 第五步：SLAM 建图（Phase 3）
-
-### 目标
-
-验证机器人能够构建环境地图。
-
-### 路径
-
-- SLAM包：`src/slam/`
-
-### 操作命令
-
-```bash
-# 2D 建图
-ros2 launch slam slam.launch.py
-ros2 launch slam rviz_slam.launch.py
-
-# 3D 建图（需要深度相机）
-ros2 launch slam rtabmap_slam.launch.py
-ros2 launch slam rviz_rtabmap.launch.py
-```
-
-### 验证要点
-
-- [ ] 地图构建正常
-- [ ] 实时定位准确
-- [ ] 可保存地图文件
-
-### 保存地图
-
-```bash
-cd ~/ros2_ws/src/slam/maps
-ros2 run nav2_map_server map_saver_cli -f "map_01" --ros-args -p map_subscribe_transient_local:=true
-```
-
----
-
-## 第六步：导航验证（Phase 4）
-
-### 目标
-
-验证机器人能够使用已有地图进行自主导航。
-
-### 路径
-
-- 导航包：`src/xflz_robot_car1/navigation/car1_navigation/`
-
-### 操作命令
-
-```bash
-# 2D 导航
-ros2 launch car1_navigation navigation.launch.py map:=map_01
-ros2 launch car1_navigation rviz_navigation.launch.py
-```
-
-### 验证要点
-
-- [ ] 地图加载成功
-- [ ] 定位正常（机器人模型与地图对齐）
-- [ ] 路径规划正常
-- [ ] 导航目标可正常下达
-- [ ] 麦轮全向运动正常
-
----
-
-## 第七步：智能应用验证（Phase 5）
-
-### 目标
-
-验证基于摄像头的视觉功能正常工作。
-
-### 路径
-
-- 视觉代码：`src/example/example/`
-
-### 功能列表与命令
-
-| 功能 | 命令 |
-|------|------|
-| 颜色检测 | `ros2 launch example color_detect.launch.py` |
-| 颜色追踪 | `ros2 launch example color_track_node.launch.py` |
-| 手部追踪 | `ros2 launch example hand_track_node.launch.py` |
-| 目标分类 | `ros2 launch example object_classification.launch.py` |
-| 目标抓取 | `ros2 launch example track_and_grab.launch.py` |
-
-### 验证要点
-
-- [ ] 摄像头数据正常
-- [ ] 颜色/目标检测准确
-- [ ] 机械臂响应视觉反馈
-
-### 无硬件时
-
-可使用：
-- USB 摄像头
-- 视频文件输入
-- ROS bag 回放数据
-
----
-
-## 第七步：应用功能验证
-
-### 目标
-
-验证完整的上层应用功能。
-
-### 路径
-
-- 应用代码：`src/app/`
-
-### 功能列表与命令
-
-| 功能 | 命令 |
-|------|------|
-| 巡线 | `ros2 launch app line_following_node.launch.py` |
-| 目标跟踪 | `ros2 launch app object_tracking_node.launch.py` |
-| 手势控制 | `ros2 launch app hand_gesture_node.launch.py` |
-| 雷达避障 | `ros2 launch app lidar_node.launch.py` |
-
-### 验证要点
-
-- [ ] 各功能模块正常运行
-- [ ] 传感器数据融合正确
-- [ ] 机器人行为符合预期
-
----
-
-## 第八步：Bringup 启动
-
-### 目标
-
-一键启动机器人的所有核心功能（控制器、传感器、应用），实现完整功能验证。
-
-### 路径
-
-- Bringup 包：`src/xflz_robot_car1/bringup/`
-
-### 涉及文件
-
-| 文件 | 作用 |
-|------|------|
-| `bringup/bringup.launch.py` | 主启动文件，一键启动所有功能 |
-| `bringup/package.xml` | 包定义 |
-
-### 操作命令
-
-```bash
-# 一键启动
-ros2 launch car1_bringup bringup.launch.py
-```
-
-### 启动内容
-
-| 模块 | 说明 |
-|------|------|
-| 控制器 | 底盘运动控制 |
-| 传感器 | 相机、雷达等 |
-| 应用 | 巡线、跟踪等功能 |
-| Web服务 | rosbridge、视频服务 |
-
-### 验证要点
-
-- [ ] 所有模块正常启动
-- [ ] 机器人可响应控制指令
-- [ ] 传感器数据正常
-
----
 
 ## 环境变量汇总
 
@@ -795,293 +503,19 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py
 
 ---
 
-## Gazebo 仿真抓取验证（从易到难）
-
-基于 Gazebo 物理仿真环境，逐步实现机械臂抓取功能。所有代码位于 `simulations/car1_gazebo/` 目录下。
-
-### 验证流程总览
-
-```
-Gazebo 基础仿真（已完成）
-    ↓
-阶段1：固定位置抓取（纯运动学）
-    ↓
-阶段2：视觉感知 + 坐标变换
-    ↓
-阶段3：运动规划（避障 + 路径优化）
-    ↓
-阶段4：闭环控制（视觉伺服）
-    ↓
-阶段5：多物体分类抓取（完整场景）
-```
-
----
-
-### 阶段 1：固定位置抓取（纯运动学）
-
-#### 目标
-
-在已知物体位置的情况下，完成完整的抓取-放置流程。
-
-#### 路径
-
-- 仿真代码：`src/xflz_robot_car1/simulations/car1_gazebo/`
-- 运动学参考：`src/xflz_robot_car1/arm/kinematics/`
-
-#### 涉及技术
-
-| 技术 | 说明 |
-|------|------|
-| 正运动学（FK） | 给定关节角度 → 计算末端位置 |
-| 逆运动学（IK） | 给定目标位置 → 计算关节角度 |
-| 轨迹插值 | 平滑地从当前位置移动到目标位置 |
-| JointTrajectoryController | 通过 ros2_control 发送关节轨迹 |
-
-#### 实现步骤
-
-1. 在 Gazebo 中放置一个固定位置的物体（立方体）
-2. 编写 IK 求解器（基于已有的解析解方案）
-3. 编写抓取序列脚本：
-   - 移动到物体上方（pre-grasp）
-   - 下降到抓取高度
-   - 闭合夹爪
-   - 提升物体
-   - 移动到目标放置位置
-   - 松开夹爪
-   - 回到初始位置
-
-#### 涉及文件
-
-| 文件 | 作用 |
-|------|------|
-| `worlds/grasp_demo.sdf` | 包含桌面和目标物体的仿真世界 |
-| `scripts/grasp_demo.py` | 抓取序列控制节点 |
-| `launch/grasp_demo.launch.py` | 启动仿真 + 抓取节点 |
-
-#### 验证要点
-
-- [ ] Gazebo 中物体正确生成
-- [ ] IK 求解结果正确（末端到达目标位置）
-- [ ] 夹爪能稳定夹住物体
-- [ ] 物体能被提起并移动到目标位置
-- [ ] 放置后物体稳定
-
----
-
-### 阶段 2：视觉感知 + 坐标变换
-
-#### 目标
-
-通过深度相机识别红色立方体位置，动态计算抓取目标并执行抓取。
-
-#### 路径
-
-- 仿真代码：`src/xflz_robot_car1/simulations/car1_gazebo/`
-
-#### 涉及技术
-
-| 技术 | 说明 |
-|------|------|
-| RGB-D 相机 | Gazebo 中模拟安思疆 HP60C 深度相机 |
-| 物体检测 | HSV 颜色分割 + 轮廓检测 |
-| TF 坐标变换 | camera_depth_link → base_link |
-| 深度定位 | 像素坐标 + 深度图 → 3D 坐标 |
-
-#### 涉及文件
-
-| 文件 | 作用 |
-|------|------|
-| `urdf/car1.gazebo.xacro` | 深度相机 Gazebo 传感器插件 |
-| `launch/grasp_demo_vision.launch.py` | 视觉抓取启动文件 |
-| `scripts/object_detector.py` | HSV 颜色检测 + 3D 定位节点 |
-| `scripts/grasp_demo_vision.py` | 视觉引导抓取控制节点 |
-
-#### 编译与运行
-
-```bash
-# 编译
-colcon build --packages-select car1_gazebo car1_description
-
-# 运行（默认立方体在 x=0.25, y=0.0）
-ros2 launch car1_gazebo grasp_demo_vision.launch.py
-
-# 指定立方体位置
-ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.22 cube_y:=0.03
-```
-
-#### 分层验证
-
-**第1层：相机话题**
-
-```bash
-# 检查话题是否发布
-ros2 topic list | grep camera
-# 期望: /camera/image, /camera/depth, /camera/points, /camera/camera_info
-
-# 检查帧率
-ros2 topic hz /camera/image
-# 期望: ~10-20 Hz
-```
-
-**第2层：图像可视化**
-
-```bash
-# 启动 rviz2，添加：
-# - Image display → /camera/image（能看到红方块）
-# - Image display → /detection_image（能看到绿色检测框）
-# - PointCloud2 display → /camera/points
-```
-
-**第3层：物体检测**
-
-```bash
-# 检查检测结果
-ros2 topic echo /detected_object_pose
-# 期望: 输出 PoseStamped，position 接近物体实际位置
-
-# 可视化标记（rviz2 中添加 Marker display → /detected_object_marker）
-```
-
-**第4层：动态抓取**
-
-```bash
-# 默认位置自动抓取
-ros2 launch car1_gazebo grasp_demo_vision.launch.py
-
-# 不同位置测试（3个位置，要求 3/3 成功）
-ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.25 cube_y:=0.0
-ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.22 cube_y:=0.03
-ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
-```
-
-#### 故障定位
-
-| 现象 | 检查命令 | 修复方向 |
-|------|----------|----------|
-| 无相机话题 | `ros2 topic list` | 检查 Gazebo 传感器插件是否加载、ros_gz_bridge 是否运行 |
-| 图像全黑 | rviz2 Image display | 检查 sensor update_rate 和 clip near/far |
-| 物体检测不到 | `ros2 run rqt_image_view rqt_image_view` 查看 /camera/image | 调整 object_detector.py 中 HSV 阈值 |
-| 检测坐标跳动 | `ros2 topic hz /camera/depth` | 增大 depth_region_size 或加中值滤波 |
-| 坐标明显偏移 | `ros2 run tf2_ros tf2_echo base_link camera_depth_link` | 检查 TF 链和相机内参 |
-| 机械臂到达但没抓到 | `ros2 topic echo /detected_object_pose` | 检查深度 z 值是否合理，IK 参数 |
-| 机械臂方向错误 | 对比 /detected_object_pose 与 Gazebo 实际位置 | 检查 base_footprint z 偏移和 IK 参数 |
-| 抓取超时 | 查看日志 "超时，未检测到物体" | 确认立方体在相机视野和机械臂可达范围内 |
-
-#### 验证要点
-
-- [ ] 相机图像正常发布 (>10Hz)
-- [ ] 物体检测准确（位置误差 < 1cm）
-- [ ] 坐标变换正确（camera_depth_link → base_link）
-- [ ] 能抓取默认位置的红色立方体
-- [ ] 能抓取不同位置 (cube_x, cube_y 参数) 的立方体
-
----
-
-### 阶段 3：运动规划（避障 + 路径优化）
-
-#### 目标
-
-在有障碍物的环境中安全规划抓取路径。
-
-#### 路径
-
-- MoveIt2 配置：`src/xflz_robot_car1/simulations/car1_moveit_config/`
-- 仿真代码：`src/xflz_robot_car1/simulations/car1_gazebo/`
-
-#### 涉及技术
-
-| 技术 | 说明 |
-|------|------|
-| MoveIt2 | 运动规划框架 |
-| RRT/RRT* | 随机采样路径规划算法 |
-| PlanningScene | 碰撞检测与场景管理 |
-| MoveGroupInterface | MoveIt2 编程接口 |
-
-#### 实现步骤
-
-1. 配置 MoveIt2 与 Gazebo 联合仿真
-2. 在 Gazebo 中添加障碍物（桌子、墙壁）
-3. 将障碍物同步到 MoveIt2 的 PlanningScene
-4. 使用 MoveGroupInterface 规划无碰撞路径
-5. 执行规划的轨迹
-
-#### 验证要点
-
-- [ ] MoveIt2 与 Gazebo 控制器正确对接
-- [ ] 障碍物正确加载到 PlanningScene
-- [ ] 规划路径无碰撞
-- [ ] 机械臂按规划路径运动
-
----
-
-### 阶段 4：闭环控制（视觉伺服）
-
-#### 目标
-
-实时调整抓取姿态，提高抓取成功率和鲁棒性。
-
-#### 路径
-
-- 仿真代码：`src/xflz_robot_car1/simulations/car1_gazebo/`
-
-#### 涉及技术
-
-| 技术 | 说明 |
-|------|------|
-| IBVS/PBVS | 基于图像/位置的视觉伺服 |
-| 实时反馈控制 | 闭环调整末端位姿 |
-| 抓取检测 | 夹爪位置反馈判断是否抓取成功 |
-
-#### 实现步骤
-
-1. 在接近物体时切换到视觉伺服模式
-2. 实时计算图像误差（物体中心 vs 图像中心）
-3. 调整末端位置直到误差 < 阈值
-4. 闭合夹爪并检测是否抓取成功（夹爪位置反馈）
-5. 如果失败，重新尝试
-
-#### 验证要点
-
-- [ ] 视觉伺服收敛（误差持续减小）
-- [ ] 对位置偏差有鲁棒性
-- [ ] 抓取成功率 > 90%
-- [ ] 失败后能自动重试
-
----
-
-### 阶段 5：多物体分类抓取（完整场景）
-
-#### 目标
-
-识别多个物体，按类别分类放置到不同区域。
-
-#### 路径
-
-- 仿真代码：`src/xflz_robot_car1/simulations/car1_gazebo/`
-
-#### 涉及技术
-
-| 技术 | 说明 |
-|------|------|
-| 实例分割 | Mask R-CNN / YOLO |
-| 任务规划 | 状态机或行为树 |
-| 多目标排序 | 最近优先、颜色优先等策略 |
-| 场景状态管理 | 跟踪已抓取/未抓取物体 |
-
-#### 实现步骤
-
-1. 检测场景中所有物体（类别 + 位置）
-2. 根据任务需求排序（如"红色放左边，蓝色放右边"）
-3. 循环执行抓取-放置
-4. 更新场景状态（已抓取的物体从列表移除）
-5. 处理异常（物体掉落、抓取失败等）
-
-#### 验证要点
-
-- [ ] 多物体检测准确
-- [ ] 分类逻辑正确
-- [ ] 能完成"将 5 个不同颜色方块分类放入对应区域"
-- [ ] 异常处理有效
+## Gazebo 仿真抓取验证（参考路线，未实施）
+
+> 仿真路线已被实机 Level 1-5 取代（见下方"实机机械臂抓取实施计划"）。这里仅保留 5 阶段总览供后续做仿真时参考。
+
+| 阶段 | 内容 | 关键技术 |
+|---|---|---|
+| 1 | 固定位置抓取 | FK/IK + JointTrajectoryController |
+| 2 | 视觉感知 + 坐标变换 | RGB-D HSV 检测 + TF（camera→base_link） |
+| 3 | 运动规划 + 避障 | MoveIt2 + RRT* + PlanningScene |
+| 4 | 视觉伺服闭环 | IBVS/PBVS + 抓取检测 |
+| 5 | 多物体分类抓取 | 实例分割 + 状态机 |
+
+代码位置：`simulations/car1_gazebo/`，启动文件 `grasp_demo.launch.py` / `grasp_demo_vision.launch.py`。详细分层验证步骤见 git 历史（`f48f26b^` 之前的 TODO.md）。
 
 ---
 
@@ -1094,832 +528,26 @@ ros2 launch car1_gazebo grasp_demo_vision.launch.py cube_x:=0.20 cube_y:=-0.03
 
 ---
 
-## Phase 3.5: SLAM 建图验证与优化（2026-06-24）
-
-> **目标**：验证里程计校准后的建图质量，按需渐进式优化 odom 精度  
-> **前置条件**：P0-1 里程计标定已完成（linear=0.961, angular=0.964）  
-> **实施策略**：先验证当前效果，只在发现问题时才做后续优化
-
-### 实施流程
-
-```
-Step 1: 基础建图验证（必做）
-    ↓
-  效果评估：墙清晰？闭环成功？
-    ↓
-  ├─ 足够好 → 完成，进入 Phase 4 导航
-  └─ 有问题 → Step 2
-    ↓
-Step 2: IMU 偏置估计（5分钟，快速改进）
-    ↓
-  重新建图验证
-    ↓
-  ├─ 足够好 → 完成
-  └─ 仍有问题 → Step 3
-    ↓
-Step 3: 编码器闭环 odom（半天，彻底解决）
-```
-
----
-
-### Step 1: 基础建图验证 ⏳ 待做
-
-**目标**：确认当前 <1% odom 误差对 slam_toolbox 是否够用
-
-#### 操作步骤
-
-```bash
-# 1. 确认校准系数生效
-ros2 param get /odom_publisher linear_correction_factor   # 应为 0.961
-ros2 param get /odom_publisher angular_correction_factor  # 应为 0.964
-
-# 2. 启动 SLAM（包含 bringup + 雷达 + slam_toolbox + RViz）
-ros2 launch car1_slam slam.launch.py
-
-# 3. 键盘遥控建图（SSH 远程用 topic pub 替代）
-# 新终端
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-# 或用 topic pub（SSH 友好）：
-# 前进 3s: timeout 3 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.15}}" --rate 10
-# 左转 2s: timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{angular: {z: 0.3}}" --rate 10
-# 右转 2s: timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{angular: {z: -0.3}}" --rate 10
-# 左平移 2s: timeout 2 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {y: 0.15}}" --rate 10
-
-# 4. 建图技巧
-#    - 速度慢（linear ≤ 0.15 m/s，angular ≤ 0.3 rad/s）
-#    - 缓慢移动，避免急转弯
-#    - 走闭环（回到起点），触发回环检测
-```
-
-#### 效果评估标准
-
-**✅ 足够好（可进入 Phase 4）**：
-- [ ] 墙清晰，无双层重影
-- [ ] 直行 5-10m 后墙仍清晰（局部匹配成功）
-- [ ] 回到起点时，起点墙与终点墙对齐（闭环成功）
-- [ ] 地图可用于导航（障碍物位置准确）
-
-**⚠️ 需要改进（进入 Step 2）**：
-- [ ] 墙轻微扭曲 / 闭环后有 <10cm 错位
-- [ ] 静止时机器人位姿缓慢漂移（yaw 角度）
-
-**❌ 需要彻底解决（跳到 Step 3）**：
-- [ ] 墙严重重影（双层/三层）
-- [ ] 闭环完全失败（起点终点错位 >20cm）
-- [ ] 长时间运动后地图变形
-
-#### 常见问题定位
-
-| 现象 | 可能原因 | 定位方法 |
-|------|---------|---------|
-| **墙双层重影** | odom 误差太大 / 激光自遮挡 | 原地转 360° 看机身附近是否有固定点云跟着转 |
-| **闭环失败** | 累计漂移超出搜索范围 | 查看日志 "loop closure failed" |
-| **角度缓慢漂移** | IMU 零偏 / EKF 权重不对 | 静止 30s 观察 /odometry/filtered 的 yaw |
-| **短距离就重影** | 标定系数未生效 / 打滑严重 | `ros2 param get /odom_publisher` 确认系数 |
-
-#### 涉及文件
-
-- `slam/car1_slam/launch/slam.launch.py` — SLAM 启动文件
-- `slam/car1_slam/config/slam.yaml` — slam_toolbox 配置
-- `driver/controller/config/calibrate_params.yaml` — 里程计校准系数
-
----
-
-### Step 2: IMU 偏置估计（快速改进）⏳ 待做
-
-**触发条件**：Step 1 发现"角度缓慢漂移"或"闭环轻微错位"
-
-**原理**：启用 Madgwick 滤波器自动学习陀螺仪零偏，减少 EKF 融合后的角度累积误差
-
-#### 操作步骤
-
-1. **修改配置**
-
-   编辑 `driver/controller/launch/chassis_controller.launch.py`（约 50 行附近）：
-
-   ```python
-   imu_filter_node = Node(
-       package='imu_filter_madgwick',
-       executable='imu_filter_madgwick_node',
-       name='imu_filter',
-       parameters=[{
-           'use_mag': False,
-           'publish_tf': False,
-           'world_frame': 'enu',
-           'fixed_frame': 'base_link',
-           'do_bias_estimation': True,     # 新增
-           'bias_alpha': 0.01,              # 新增
-       }],
-       ...
-   )
-   ```
-
-2. **重新编译**
-   ```bash
-   colcon build --packages-select controller --symlink-install
-   source install/setup.bash
-   ```
-
-3. **重启验证**
-   ```bash
-   # 重启 bringup
-   ros2 launch car1_bringup bringup.launch.py
-   
-   # 静止 30s，观察 IMU 角速度是否接近 0
-   ros2 topic echo /imu --field angular_velocity
-   ```
-
-4. **重新建图**（重复 Step 1 流程，对比效果）
-
-#### 验收标准
-
-- [ ] 静止时 IMU 角速度 < 0.001 rad/s
-- [ ] 闭环错位减小到 <5cm
-- [ ] 长时间运动角度漂移减小
-
-#### 时间估计
-
-5 分钟改配置 + 10 分钟重新建图验证
-
-#### 涉及文件
-
-- `driver/controller/launch/chassis_controller.launch.py`
-
----
-
-### Step 3: 编码器闭环 odom（彻底解决）⏳ 待做
-
-**触发条件**：Step 2 后仍有严重重影 / 闭环失败
-
-**原理**：固件已读编码器计算实际轮速 `Wheel.RT`，让 ROS 端用**实测轮速**积分 odom，消除打滑累积误差
-
-#### 前置确认
-
-固件已有编码器驱动（已确认）：
-```c
-// kinematics.c:61-72
-int16_t raw_a = encoder_a_get_counter();  // 读编码器
-Wheel_A.RT = (float)(-raw_a * MEC_WHEEL_SCALE);  // 实测轮速
-```
-
-但**未回传给 ROS**，需补充协议。
-
-#### 实施步骤
-
-##### 阶段 1：固件加回传协议（需 Windows 烧录）
-
-1. **修改固件协议**（`protocol.c`）
-
-   添加轮速回传功能：
-
-   ```c
-   // 新增：功能码 0x03 子功能 0x02 - 读取轮速
-   void send_wheel_speeds() {
-       uint8_t data[17];
-       data[0] = 0x02;  // 子功能：读速度
-       memcpy(&data[1], &Wheel_A.RT, 4);   // 4 个 float (m/s)
-       memcpy(&data[5], &Wheel_B.RT, 4);
-       memcpy(&data[9], &Wheel_C.RT, 4);
-       memcpy(&data[13], &Wheel_D.RT, 4);
-       protocol_send_packet(PACKET_FUNC_MOTOR, data, 17);
-   }
-   
-   // 在 PID 循环（200Hz）里定时发送
-   // 或添加查询响应（根据协议设计选择）
-   ```
-
-2. **Windows Keil 编译烧录**
-
-   ```
-   打开 xflz_eai_car1_base_controller_client 项目
-   → 编译
-   → ST-Link 烧录到 STM32
-   ```
-
-##### 阶段 2：ROS 端接收并积分（Python）
-
-1. **定义消息类型**（可选，或复用现有）
-
-   如需新消息：
-   ```bash
-   # car1_base_driver_msgs/msg/WheelSpeeds.msg
-   float32 wheel_a
-   float32 wheel_b
-   float32 wheel_c
-   float32 wheel_d
-   ```
-
-2. **board_sdk.py 解析轮速**
-
-   在 `board_sdk.py` 添加：
-
-   ```python
-   def _handle_motor_packet(self, data):
-       if data[0] == 0x02:  # 子功能：轮速反馈
-           wa, wb, wc, wd = struct.unpack('<ffff', bytes(data[1:17]))
-           # 发布到 ROS 话题 /motor_feedback
-           ...
-   ```
-
-3. **odom_publisher_node.py 改用实测轮速**
-
-   ```python
-   def __init__(self):
-       # 订阅固件回传的实际轮速
-       self.create_subscription(
-           WheelSpeeds, '/motor_feedback', self.wheel_speed_callback, 10)
-       
-       self.actual_vx = 0.0
-       self.actual_vy = 0.0
-       self.actual_wz = 0.0
-   
-   def wheel_speed_callback(self, msg):
-       """根据编码器实测轮速算 odom（闭环）"""
-       # 逆运动学：4 轮速 → base_link 速度
-       vx, vy, wz = self.mecanum.inverse_kinematics(
-           msg.wheel_a, msg.wheel_b, msg.wheel_c, msg.wheel_d)
-       
-       self.actual_vx = vx
-       self.actual_vy = vy
-       self.actual_wz = wz
-   
-   def _odom_loop(self):
-       # 积分实测速度（替代指令）
-       delta_x = self.actual_vx * dt * cos(yaw)  # 不再用 self.linear_x
-       delta_y = self.actual_vy * dt * sin(yaw)
-       delta_yaw = self.actual_wz * dt
-   ```
-
-4. **重新编译测试**
-   ```bash
-   colcon build --packages-select car1_base_driver_msgs car1_base_driver controller
-   source install/setup.bash
-   
-   # 重启 bringup
-   ros2 launch car1_bringup bringup.launch.py
-   
-   # 验证：人为阻挡轮子，odom 应不再累积误差
-   ```
-
-#### 验收标准
-
-- [ ] 人为阻挡轮子，odom 位置不变（打滑不累积）
-- [ ] 碰墙反弹，odom 自动修正
-- [ ] 长时间运动（>10min）无累积漂移
-- [ ] 建图质量：墙清晰、闭环完美对齐
-
-#### 时间估计
-
-- 固件修改 + 烧录：1-2 小时
-- ROS 端接收逻辑：1 小时
-- 测试验证：1 小时
-- **总计**：半天
-
-#### 涉及文件
-
-- `xflz_eai_car1_base_controller_client/base/Core/Src/protocol.c`（固件）
-- `car1_base_driver_msgs/msg/WheelSpeeds.msg`（新建，可选）
-- `driver/car1_base_driver/car1_base_driver/board_sdk.py`
-- `driver/controller/controller/odom_publisher_node.py`
-
----
-
-### 优先级总结
-
-| Step | 名称 | 时间 | 触发条件 | 效果 |
-|---|---|---|---|---|
-| **Step 1** | 基础建图验证 | 30 分钟 | 必做 | 确认是否需要优化 |
-| **Step 2** | IMU 偏置估计 | 20 分钟 | Step 1 发现角度漂移 | 减少 50% 角度累积误差 |
-| **Step 3** | 编码器闭环 | 半天 | Step 2 后仍有严重问题 | 消除打滑累积，彻底解决 |
-
-**建议**：先做 Step 1，如果效果足够好（墙清晰、闭环成功），**直接进入 Phase 4 导航**，不必强求完美。只有在实际应用中遇到问题时，再回来做 Step 2/3。
-
----
-
-## 借鉴 lander_pi 的建图导航优化计划（2026-06-23）
-
-> 基于对 lander_pi 参考栈的深度分析,发现 car1 在校准机制、传感器配置、控制器架构等方面存在多项可优化点。
-> 本节详细记录需要实施的优化项,按优先级分为 P0(必须)、P1(强烈建议)、P2(可选)三级。
-
-### 优化背景
-
-**当前问题诊断**（2026-06-23 SLAM 调试）:
-- ✅ 机械臂抖动 → 已修复(删除冲突的 joint_state_publisher)
-- ✅ 轮子显示异常 → 已修复(补齐缺失的轮子关节)
-- ✅ robot_state_publisher 重复 → 已修复(统一单入口 slam.launch.py)
-- ✅ slam_toolbox 延迟不足 → 已修复(3s → 10s)
-- ✅ **底盘超速 3.98 倍 / 转 3.75 圈** → 已修复(rps↔m/s 单位错配 + 固件轮径 0.08→0.097)
-- ✅ **里程计标定** → 已完成(linear=0.961, angular=0.964；直线0.5%/角度1.1%)
-- ⏳ **静止 odom ~3.8° yaw 偏置** → 属 IMU/EKF，待做 P1-1
-- ⏳ **激光点云偏移/墙重影** → 底盘修好后大概率改善，待建图验证；如残留自遮挡走 P0-2
-
-**lander_pi 与 car1 核心差异对比**:
-
-| 维度 | lander_pi | car1 | 差距 |
-|------|-----------|------|------|
-| **IMU 校准** | ✅ SM 矩阵 + bias 向量校准 | ❌ 完全未校准 | **关键缺失** |
-| **里程计标定** | ✅ 实际标定值(linear=0.94) | ❌ 默认值 1.0(未标定) | **关键缺失** |
-| **laser_filters** | ✅ 5种雷达配置 | ❌ 无 | **缺失** |
-| **EKF 协方差动态** | ✅ 运动/静止两套 | ❌ 固定不变 | 可优化 |
-| **地图保存服务** | ✅ 独立节点 | ❌ 手动 CLI | 便利性 |
-
----
-
-### 🔴 P0 级优化（必须做,解决当前问题）
-
-#### P0-1: 里程计标定 ✅ 已完成（2026-06-23）
-
-> ✅ **标定完成，实测系数**：`linear_correction_factor: 0.961`, `angular_correction_factor: 0.964`
-> （已写入 `driver/controller/config/calibrate_params.yaml`，重启 bringup 生效）
-> 最终精度：直线 0.5%、角度 1.1%（含瓷砖打滑随机误差）。**对 SLAM 建图足够。**
-> 完整操作流程见 `tutorial.md` 3.0 节（已更新为命令行 `ros2 param set` 方式 + 正确的系数算法）。
-
-> 🔴 **根本性发现（对照下位机固件源码确认）—— 标定失败的真正根因**：
-> 之前"标定失效/小车超速/转 3.75 圈"**不是标定方法问题**，是 **ROS 与下位机的速度单位错配**：
-> - `mecanum.py` 原经 `speed_to_rps` 发 **rps**，但 STM32 固件 raw 逐轮模式期望 **轮缘线速度 m/s**
->   （固件 `Wheel.RT = ticks×(π·D·PID_RATE/RES)` 单位是 m/s）。错配放大 `1/(π×0.08) ≈ 3.98` 倍。
-> - **已修复（ROS）**：`mecanum.py` 直接发 m/s（去掉 speed_to_rps）。已重编 controller。
-> - **已修复（固件）**：`kinematics.h` 轮径 0.08→0.097、轮距/轴距→0.1946/0.2117（仓库
->   `xflz_eai_car1_base_controller_client`，已在 Windows Keil 烧录）。烧录后残留误差降到 6%。
-> - 6% 残留由上面的 `correction_factor` 标定补掉。
-
-> **关键代码事实（已核实）**：
-> - `odom_publisher` 是**开环积分 cmd_vel 指令**，不读编码器。`/odom_raw` yaw = 指令积分。
-> - `linear_correction_factor` 乘在 odom x/y（:192-193）；`angular_correction_factor` 乘在 yaw 增量（:186，已接线）。
-> - 标定脚本 `calibrate_linear/angular` 已重写：读 `/odom_raw`、单向运动到量即停、不写 yaml（手动填）。
-> - ⚠️ 系数算法：`系数 = 真实 / odom报告`（不是目标/实际，方向别反）。
-> - ⚠️ 角度必须用**指南针量真实转角**（脚本"转够"基于 odom，不准）。
-> - 静止 3.8° yaw 偏置不归里程计标定管（属 IMU/EKF，见 P1-1）。
-
-**lander_pi 实际值（对照）**: `linear=0.94, angular=1.00`。car1 实测 `linear=0.961, angular=0.964`。
-
-**校准脚本/工具修复记录（本次）**：
-- `mecanum.py`：发 m/s 替代 rps（修单位错配 3.98×）
-- 固件 `kinematics.h`：轮径/轮距改真实值（修残留 1.21×）
-- `calibrate_linear.py`：改读 /odom_raw + 单向前进（修前后横跳震荡）
-- `calibrate_angular.py`：改读 /odom_raw + 累加幅度单向旋转（修单位 bug + 正反馈发散转不停）
-- `odom_publisher_node.py:186`：yaw 增量乘 angular_factor（接线角度系数）
-- 新增 `calibration/scripts/chassis_serial_test.py`：直连下位机测试工具（查表 CRC8 + rts/dtr=False + set_motor_type 初始化）
-
-**操作流程**：见 `tutorial.md` 3.0.1（直线）/ 3.0.2（角度）/ 3.0.3（验证）。要点：
-1. 命令行 `ros2 param set` 设参数触发（rqt_reconfigure 未装也行）
-2. 直线：尺子量实际距离 → `系数 = 实际/odom报告`
-3. 角度：指南针量真实转角 → `系数 = 真实转角/360`
-4. 填 `calibrate_params.yaml` → 重启 bringup → `ros2 param get` 确认
-
-**验收标准** ✅ 全部达成：
-- [x] `ros2 param get /odom_publisher linear_correction_factor` = 0.961
-- [x] `ros2 param get /odom_publisher angular_correction_factor` = 0.964
-- [x] 直线 1m 误差 0.5%（<3cm）
-- [x] 角度 360° 误差 1.1%（<5°）
-
----
-
-### 校准文件归属约定（对照 lander_pi 验证，2026-06-23）
-
-> 核实了 car1 与 lander_pi 两套栈的校准文件实际分布与读写关系后确认：**两者布局几乎一致，当前 car1 无需搬迁任何文件**。原则是「按消费者就近」，不是「全部塞进 calibration 包」。
-
-| 校准类型 | 文件 | 所在文件夹 | 生产者 | 消费者 | car1 vs lander_pi |
-|---|---|---|---|---|---|
-| 里程计 | `calibrate_params.yaml` | `driver/controller/config/` | 标定脚本不写，手动填 | controller launch | ✅ 完全一致 |
-| 舵机偏置 | `servo_offsets.yaml` | `calibration/config/` | `calibrate_servo` 写 | base_driver 跨包读 | car1 独有，工作正常 |
-| IMU | `imu_calib.yaml` | `calibration/config/` | 外部工具（六面/转台） | peripherals/imu_filter launch 跨包读 | car1 未来加，照搬此位置 |
-| 相机 | (rgbd) `calibration.yaml` | 视觉模块自己的 config | 视觉标定脚本 | 该模块自用 | 就近原则 |
-
-**约定**：
-1. **里程计** `calibrate_params.yaml` 留在 `controller/config/`（与 ekf/init_pose 同属底盘运行参数；lander_pi 也这么放）。
-2. **舵机偏置** `servo_offsets.yaml` 留在 `calibration/config/`（base_driver 已跨包读，勿动）。
-3. **未来 IMU 校准** `imu_calib.yaml` → 放 `calibration/config/`，跟随 servo_offsets 的跨包读模式（与 lander_pi 一致）。建议保留一份历史备份（lander_pi 用 `bk.yaml`）。
-4. **不为统一而搬迁可工作的文件** —— 移动 `calibrate_params.yaml` 要改 launch 跨包路径，收益小、风险实。
-
----
-
----
-
-#### P0-2: laser_filters 集成（如需要,解决自遮挡）
-
-**前置判断**: 先完成 P0-1 标定,再做**运动测试**判断是否需要。
-
-**运动测试方法**:
-```bash
-# SLAM 运行中,用键盘遥控小车直行 1-2m 再原地转 360°
-ros2 launch car1_slam slam.launch.py
-# 新终端
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-
-# 盯着 RViz 里的墙:
-# - 墙重影/糊开 → 是 odom 漂移,P0-1 解决
-# - 墙清晰但机身附近有固定点跟着转 → 是自遮挡,需要 laser_filters
-```
-
-**如果确认需要 laser_filters**:
-
-1. **安装软件包**
-   ```bash
-   sudo apt install ros-humble-laser-filters
-   ```
-
-2. **实测标定过滤角度**（**不能直接搬 lander_pi 数值**）
-   
-   lander_pi 用的是 0~2π 约定,COIN-D6 用的是 -π~π 约定,直接搬数值会错。
-   
-   ```bash
-   # 启动雷达,对着空旷处
-   ros2 launch car1_peripherals lidar.launch.py
-   
-   # 新终端,实时查看雷达数据
-   ros2 topic echo /scan
-   
-   # 手动遮挡机身不同方向(后方/左后/右后),观察:
-   # - 哪些角度索引的 ranges 值异常近(<0.2m)
-   # - 记录这些索引,换算成弧度(-π~π)
-   
-   # 例如:索引 180-540(共 720 点) 有异常近距离读数
-   # 换算:180/720*2π - π ≈ 0.57 rad
-   #      540/720*2π - π ≈ 2.71 rad
-   ```
-
-3. **创建配置文件**
-   ```bash
-   # 已存在占位文件,需根据实测修改
-   nano peripherals/car1_peripherals/config/laser_filters.yaml
-   ```
-   
-   ```yaml
-   /**:
-     ros__parameters:
-       filter1:
-         name: angular_bounds_filter
-         type: laser_filters/LaserScanAngularBoundsFilterInPlace
-         params:
-           lower_angle: 0.57   # 实测得出的起始角度(弧度)
-           upper_angle: 2.71   # 实测得出的结束角度
-       
-       filter2:
-         name: range_filter
-         type: laser_filters/LaserScanRangeFilter
-         params:
-           use_message_range_limits: false
-           lower_threshold: 0.10  # 忽略 <10cm 的点(肯定是机身)
-           upper_threshold: 16.0
-           lower_replacement_value: .nan
-           upper_replacement_value: .inf
-   ```
-
-4. **集成到 lidar.launch.py**
-   
-   参照 lander_pi 的实现,在 `peripherals/car1_peripherals/launch/lidar.launch.py` 添加:
-   
-   ```python
-   laser_filter_node = Node(
-       package='laser_filters',
-       executable='scan_to_scan_filter_chain',
-       name='laser_filter',
-       parameters=[os.path.join(peripherals_pkg, 'config', 'laser_filters.yaml')],
-       remappings=[
-           ('scan', 'scan_raw'),           # 输入:原始雷达数据
-           ('scan_filtered', 'scan')       # 输出:过滤后数据
-       ]
-   )
-   ```
-
-5. **重启验证**
-   ```bash
-   # 重新编译(如果改了 launch)
-   colcon build --packages-select car1_peripherals
-   
-   # 重启 SLAM
-   ros2 launch car1_slam slam.launch.py
-   
-   # 观察 RViz,机身附近的固定假障碍应消失
-   ```
-
-**预期效果**:
-- 机身附近不再有跟着车转的固定点云
-- 地图中不再出现不存在的"假墙"
-- 建图更准确
-
-**时间估计**: 1-2 小时(含实测标定)
-
-**涉及文件**:
-- `peripherals/car1_peripherals/config/laser_filters.yaml`
-- `peripherals/car1_peripherals/launch/lidar.launch.py`
-
----
-
-### 🟡 P1 级优化（强烈建议,提升稳定性）
-
-#### P1-1: IMU 偏置估计（简化方案）
-
-**问题**: 当前 IMU 未校准,零偏和刻度误差会被 EKF 积分,导致姿态漂移。
-
-**lander_pi 完整方案**: 用转台或 6 面静置法生成 SM 矩阵 + bias 向量,通过 `imu_calib` 节点先矫正再滤波。这需要专业工具,难度高。
-
-**car1 简化方案**: 启用 Madgwick 滤波器的**自动偏置估计**功能。
-
-**实施步骤**:
-
-1. **修改 IMU 滤波器配置**
-   
-   编辑 `driver/controller/launch/chassis_controller.launch.py`:
-   
-   ```python
-   imu_filter_node = Node(
-       package='imu_filter_madgwick',
-       executable='imu_filter_madgwick_node',
-       name='imu_filter',
-       parameters=[{
-           'use_mag': False,
-           'publish_tf': False,
-           'world_frame': 'enu',
-           'fixed_frame': 'base_link',
-           'do_bias_estimation': True,     # 新增:启用偏置估计
-           'bias_alpha': 0.01,              # 新增:偏置估计滤波系数
-       }],
-       remappings=[
-           ('imu/data_raw', 'car1_base_driver/imu_raw'),
-           ('imu/data', 'imu'),
-       ],
-       output='screen'
-   )
-   ```
-
-2. **重新编译**
-   ```bash
-   colcon build --packages-select controller
-   ```
-
-3. **重启验证**
-   ```bash
-   # 重启 bringup
-   ros2 launch car1_bringup bringup.launch.py
-   
-   # 查看 IMU 数据,静止时角速度应更接近 0
-   ros2 topic echo /imu --once
-   ```
-
-**预期效果**:
-- 滤波器自动学习并补偿陀螺零偏
-- 静止时姿态更稳定
-- 运动时累积误差减小
-
-**效果评估**:
-- 不如 SM 矩阵校准,但比完全不校准好很多
-- 适合对精度要求不极端的场景
-
-**时间估计**: 5 分钟
-
-**涉及文件**:
-- `driver/controller/launch/chassis_controller.launch.py`
-
----
-
-#### P1-2: EKF 协方差动态调整
-
-**问题**: 当前 EKF 的协方差矩阵固定不变,无法根据运动状态调整对里程计/IMU 的信任度。
-
-**lander_pi 方案**: 针对运动/静止两种状态设置不同的协方差:
-- 运动时:里程计置信度正常
-- 静止时:里程计置信度极高(1e-9),强制 EKF 相信"车没动",抑制 IMU 漂移
-
-**实施步骤**:
-
-1. **修改 odom_publisher**
-   
-   编辑 `driver/controller/controller/odom_publisher_node.py`:
-   
-   在文件开头添加静止时的协方差常量:
-   
-   ```python
-   ODOM_POSE_COVARIANCE_STOP = [
-       1e-9, 0, 0, 0, 0, 0,
-       0, 1e-9, 0, 0, 0, 0,
-       0, 0, 1e6, 0, 0, 0,
-       0, 0, 0, 1e6, 0, 0,
-       0, 0, 0, 0, 1e6, 0,
-       0, 0, 0, 0, 0, 1e-9
-   ]
-   
-   ODOM_TWIST_COVARIANCE_STOP = [
-       1e-9, 0, 0, 0, 0, 0,
-       0, 1e-9, 0, 0, 0, 0,
-       0, 0, 1e6, 0, 0, 0,
-       0, 0, 0, 1e6, 0, 0,
-       0, 0, 0, 0, 1e6, 0,
-       0, 0, 0, 0, 0, 1e-9
-   ]
-   ```
-   
-   在 `_publish_odom()` 方法中,发布前添加判断:
-   
-   ```python
-   # 判断是否静止(线速度和角速度都接近 0)
-   if abs(self.linear_x) < 0.01 and abs(self.angular_z) < 0.01:
-       self.odom_msg.pose.covariance = ODOM_POSE_COVARIANCE_STOP
-       self.odom_msg.twist.covariance = ODOM_TWIST_COVARIANCE_STOP
-   else:
-       self.odom_msg.pose.covariance = ODOM_POSE_COVARIANCE
-       self.odom_msg.twist.covariance = ODOM_TWIST_COVARIANCE
-   ```
-
-2. **重新编译**
-   ```bash
-   colcon build --packages-select controller --symlink-install
-   ```
-
-3. **重启验证**
-   ```bash
-   ros2 launch car1_bringup bringup.launch.py
-   
-   # 查看静止时的 odom 协方差
-   ros2 topic echo /odom_raw --once | grep covariance
-   ```
-
-**预期效果**:
-- 静止时 yaw 漂移进一步减小
-- EKF 对静止状态的判断更准确
-
-**时间估计**: 10 分钟
-
-**涉及文件**:
-- `driver/controller/controller/odom_publisher_node.py`
-
----
-
-### 🟢 P2 级优化（可选,锦上添花）
-
-#### P2-1: 地图保存服务节点
-
-**当前方式**: 手动运行 CLI 命令
-```bash
-cd ~/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps
-ros2 run nav2_map_server map_saver_cli -f "map_01" --ros-args -p map_subscribe_transient_local:=true
-```
-
-**lander_pi 方式**: 提供 ROS 服务接口,可通过 `ros2 service call` 或 RViz 插件保存。
-
-**实施步骤**:
-
-1. **创建地图保存节点**
-   
-   创建文件 `slam/car1_slam/car1_slam/map_save.py`:
-   
-   ```python
-   #!/usr/bin/env python3
-   import os
-   import rclpy
-   from rclpy.node import Node
-   from std_srvs.srv import Trigger
-   
-   class MapSaveNode(Node):
-       def __init__(self):
-           super().__init__('map_save_node')
-           self.create_service(Trigger, '~/save_map', self.save_map_callback)
-           self.get_logger().info('Map save service ready')
-       
-       def save_map_callback(self, request, response):
-           self.get_logger().info('Saving map...')
-           map_dir = os.path.expanduser('~/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps')
-           cmd = f'cd {map_dir} && ros2 run nav2_map_server map_saver_cli -f "map_01" --ros-args -p map_subscribe_transient_local:=true'
-           ret = os.system(cmd)
-           
-           response.success = (ret == 0)
-           response.message = 'Map saved successfully' if ret == 0 else 'Failed to save map'
-           return response
-   
-   def main():
-       rclpy.init()
-       node = MapSaveNode()
-       rclpy.spin(node)
-       rclpy.shutdown()
-   
-   if __name__ == '__main__':
-       main()
-   ```
-
-2. **修改 setup.py**
-   
-   在 `slam/car1_slam/setup.py` 的 `console_scripts` 中添加:
-   
-   ```python
-   'map_save = car1_slam.map_save:main',
-   ```
-
-3. **重新编译**
-   ```bash
-   colcon build --packages-select car1_slam
-   ```
-
-4. **使用方式**
-   ```bash
-   # SLAM 运行中,新终端
-   ros2 service call /map_save_node/save_map std_srvs/srv/Trigger
-   ```
-
-**预期效果**:
-- 保存地图更方便
-- 可集成到 GUI 或脚本中
-
-**时间估计**: 20 分钟
-
-**涉及文件**:
-- `slam/car1_slam/car1_slam/map_save.py` (新建)
-- `slam/car1_slam/setup.py`
-
----
-
-#### P2-2: IMU SM 矩阵校准（完整方案,高精度需求）
-
-**适用场景**: 对姿态精度要求极高的应用(如长时间 SLAM、多传感器融合)。
-
-**前置条件**: 需要专业设备(三轴转台或精密水平台)。
-
-**参考 lander_pi 实现**:
-- 校准文件: `calibration/config/imu_calib.yaml`
-- 校准节点: `imu_calib` (apply_calib)
-- 滤波器: `imu_complementary_filter`
-
-**SM 矩阵含义**:
-```yaml
-SM:  # 3x3 Scale-Misalignment 矩阵
-  - 1.0028  -0.0108   0.0078    # 校正刻度误差和轴间串扰
-  - -0.0020  1.0047  -0.0339
-  - -0.0183 -0.0083   1.0035
-bias:  # 零偏向量
-  - 0.0505   0.2005  -0.0975
-```
-
-**校准方法**:
-1. 六面静置法:IMU 每个面朝上静置 10 分钟,记录数据
-2. 转台法:用三轴转台旋转 IMU,记录角速度
-3. 用标定算法(如 Allan 方差)计算 SM 矩阵和 bias
-
-**移植 lander_pi imu_calib**:
-1. 复制 `imu_calib` 包到 car1 工作区
-2. 修改话题 remap:`/ros_robot_controller/imu_raw` → `/car1_base_driver/imu_raw`
-3. 生成 `imu_calib.yaml`(需专业工具)
-4. 在 `chassis_controller.launch.py` 中插入 `imu_calib` 节点
-
-**时间估计**: 数小时到数天(取决于设备和经验)
-
----
-
-### 优化实施顺序建议
-
-```
-第 1 天(核心问题):
-  1. P0-1: 里程计标定(30 分钟)
-  2. 运动测试,判断是否需要 laser_filters
-  3. 如需要,P0-2: laser_filters 集成(1-2 小时)
-
-第 2 天(稳定性提升):
-  4. P1-1: IMU 偏置估计(5 分钟)
-  5. P1-2: EKF 协方差动态(10 分钟)
-  6. 完整建图测试,验证效果
-
-第 3 天(可选,按需):
-  7. P2-1: 地图保存服务(20 分钟)
-  8. P2-2: IMU SM 校准(如有设备和需求)
-```
-
----
-
-### 验收标准
-
-**P0 级验收**:
-- [ ] 里程计标定完成,`calibrate_params.yaml` 有实际值
-- [ ] 静止时 odom yaw 偏置 < 0.5°
-- [ ] 直行 1m 误差 < 3cm
-- [ ] 原地转 360° 误差 < 5°
-- [ ] 运动时墙不重影(或 laser_filters 后机身附近无假障碍)
-
-**P1 级验收**:
-- [ ] IMU 偏置估计启用,静止时角速度 < 0.001 rad/s
-- [ ] EKF 协方差动态调整生效,静止时协方差为 1e-9
-
-**P2 级验收**:
-- [ ] 地图保存服务可调用
-- [ ] (如做)IMU SM 校准文件存在且生效
-
----
-
-### 相关代码参考
-
-**lander_pi 关键文件**:
-- 里程计标定: `src/lander_pi/calibration/calibration/calibrate_linear.py`, `calibrate_angular.py`
-- IMU 校准: `src/lander_pi/calibration/config/imu_calib.yaml`
-- IMU 滤波: `src/lander_pi/peripherals/launch/imu_filter.launch.py`
-- laser_filters: `src/lander_pi/peripherals/config/lidar_filters_config_ld19.yaml`
-- EKF 协方差: `src/lander_pi/driver/controller/controller/odom_publisher_node.py` (L16-46)
-- 地图保存: `src/lander_pi/slam/slam/map_save.py`
-
-**car1 待修改文件**:
-- `driver/controller/config/calibrate_params.yaml`
-- `driver/controller/launch/chassis_controller.launch.py`
-- `driver/controller/controller/odom_publisher_node.py`
-- `peripherals/car1_peripherals/config/laser_filters.yaml`
-- `peripherals/car1_peripherals/launch/lidar.launch.py`
-- `slam/car1_slam/car1_slam/map_save.py` (新建)
+## 历史记录：SLAM/里程计优化（2026-06，已完成）
+
+以下优化项已全部完成，详见 Phase 3 头部 "✅ 航向问题已彻底解决" 小节及内存文件：
+
+- **P0-1 里程计标定** ✅ linear=0.961, angular=0.964（直线 0.5%、角度 1.1% 残差）
+- **底盘速度单位错配修复** ✅ ROS 端直发 m/s + 固件轮径 0.08→0.097（残留 6% 由系数补）
+- **IMU 航向链** ✅ 固件 scale + 协方差 + EKF imu0_relative + base_link→imu_link TF + EKF 关 odom0 vyaw（闭环 0.25°/圈）
+- **slam_toolbox 配置** ✅ 启动延迟 10s + 单 robot_state_publisher 入口
+- **校准文件归属约定** ✅ `calibrate_params.yaml` 留 `controller/config/`，`servo_offsets.yaml` 留 `calibration/config/`，未来 IMU `imu_calib.yaml` 跟 servo_offsets 同位
+
+### 仍可选的未来增强（按需做）
+
+| 项 | 时间 | 触发条件 |
+|---|---|---|
+| **编码器闭环 odom** | 半天（需 Windows 烧固件） | 长时间运动有明显累积漂移 / 麦轮打滑频繁 |
+| **IMU Madgwick `do_bias_estimation=True`** | 5 分钟 | 静止 yaw 仍漂 |
+| **EKF 静止协方差动态调整** | 10 分钟 | 静止时位姿不稳 |
+| **IMU SM 矩阵校准** | 数小时（需转台） | 长时 SLAM 精度要求极高 |
+| **地图保存 ROS 服务节点** | 20 分钟 | 想用 GUI/脚本触发存图（替代手动 CLI） |
+| **`laser_filters` 集成** | 1-2 小时 | 建图后机身附近出现跟着转的固定假障碍 |
 
 ---
 
@@ -1944,682 +572,132 @@ Level 5: 导航 + 视觉 + 抓取（全自主任务）
 
 ---
 
-### Level 1：运动学基础（纯计算验证）
+### Level 1：运动学基础 ✅ 已完成
 
-#### 目标
+**已完成组件**：
+- **Transform 模块** (`arm/kinematics/kinematics/transform.py`): PWM↔角度转换；270° 舵机，center=1500，PWM_TO_RAD=0.002356，direction=+1，offset=0；`TCP_OFFSET_Z=0.0762m`
+- **IK 求解器** (`ik_analytical.py`): 解析解（固定/自动/忽略俯仰），`solution_to_pwm()` 直出 PWM
+- **Safe Arm Controller** (`arm/car1_arm_controller/.../arm_controller.py`): `move_to_pose` / `set_gripper` / `go_home` / `emergency_stop` / `pick` / `place`，含分步移动 + 限位检查 + 可中断等待
+- **交互式测试** (`interactive_ik_test.py`): ROS2 模式 + `--direct` 直连串口模式，FK 误差 0.00mm，PWM 闭环验证通过
 
-验证 IK/FK 求解正确，补充角度↔PWM 转换，确保后续控制的数学基础正确。
-
-#### 当前状态
-
-- [x] `fk_demo.py` — 正运动学正解
-- [x] `ik_demo.py` — 逆运动学解析解
-- [x] `interactive_ik_test.py --direct` — 交互式 IK 测试（直连串口，实时计算+发送）
-- [x] `angle2pulse` / `pulse2angle` 转换函数
-- [x] IK 求解结果与实际舵机 PWM 的对应关系验证
-
-#### 核心组件（已完成）
-
-**1. Transform 模块** (`arm/kinematics/kinematics/transform.py`)
-- ✅ PWM ↔ 角度转换函数：`pulse2angle()`, `angle2pulse_single()`, `pwm_array_to_angles()`, `angles_to_pwm_array()`
-- ✅ 参数：270° 舵机，center=1500，PWM_TO_RAD=0.002356，direction=+1，offset=0
-- ✅ TCP_OFFSET_Z = 0.0762m（tcp_link 相对 arm_link5）
-- ✅ 限位检查：`check_pwm_limits()`, `check_angle_limits()`
-
-**2. IK 求解器** (`arm/kinematics/kinematics/ik_analytical.py`)
-- ✅ 解析解 IK（固定/自动/忽略俯仰角三种模式）
-- ✅ `solution_to_pwm()` — 直接输出 PWM 值（集成 transform 层）
-- ✅ `solution_to_dict()` — 输出关节角度字典
-
-**3. Safe Arm Controller** (`arm/car1_arm_controller/car1_arm_controller/arm_controller.py`)
-- ✅ `move_to_pose(x, y, z, pitch)` — 通过 `/arm_controller/target_pose` 话题
-- ✅ `set_gripper(close)` — `/arm_controller/set_gripper` 服务
-- ✅ `go_home()` — `/arm_controller/go_home` 服务
-- ✅ `emergency_stop()` — `/arm_controller/emergency_stop` 服务
-- ✅ `pick()` / `place()` — 高层抓取/放置服务
-- ✅ `_move_stepwise()` — 分步移动（底座先转，臂后动）
-- ✅ `_check_limits()` — 关节限位检查
-- ✅ `_wait()` — 可中断等待（响应 emergency stop）
-
-**4. 验证工具** (`arm/kinematics/kinematics/interactive_ik_test.py`)
-- ✅ 交互式 IK 测试（输入目标 → IK 求解 → 显示 PWM → 可选发送）
-- ✅ 两种模式：ROS2 模式（需 bringup）/ 直连串口模式（`--direct`）
-- ✅ FK 验证（计算位置 vs 目标位置，误差检查）
-- ✅ 闭环验证（发送后读取实际 PWM，对比目标）
-- ✅ 覆盖 TODO 原 Phase 1-3 的全部验证功能
-
-#### 验证方法
-
-**使用 `interactive_ik_test.py` 进行完整验证**
-
-此工具已集成 Phase 1-3 的所有验证功能，一站式完成：
-
-```bash
-cd ~/ros2_ws/src/xflz_robot_car1/arm/kinematics/kinematics
-
-# ROS2 模式（需先启动 bringup）
-ros2 launch car1_bringup bringup.launch.py
-# 新终端
-python3 interactive_ik_test.py
-
-# 直连串口模式（需先停掉 bringup）
-sudo chmod 666 /dev/ttyUSB0
-python3 interactive_ik_test.py --direct
-```
-
-**测试流程**：
-1. 输入目标 TCP 位置 (x, y, z) 和俯仰角
-2. 自动计算 IK 解，显示关节角度和 PWM 值
-3. FK 验证：显示计算位置 vs 目标位置的误差（应 < 1.5mm）
-4. 限位检查：自动检查 PWM 是否在 500-2500 安全范围内
-5. 确认后发送到实机执行
-6. 读取舵机实际 PWM，对比目标 PWM（闭环验证）
-
-**Phase 1: Transform 层验证** ✅
-- 输入 PWM [1500, 1500, 1500, 1500, 1500]，验证角度全为 0
-- 输入 PWM [1500, 1850, 2109, 1850, 1500]，验证角度转换正确
-- 往返转换（PWM → 角度 → PWM）误差为 0
-
-**Phase 2: IK 闭环验证** ✅
-- 输入多个测试位置（如 [0.25, 0.0, 0.15]）
-- IK 求解 → PWM → 发送 → 读取实际 PWM → 对比误差
-- FK 验证误差 < 1.5mm
-
-**Phase 3: 已知点验证** ✅
-- 在桌面放置物理标记（用尺子测量坐标）
-- 输入标记坐标，机械臂移动到该位置
-- 人工目测 tcp_link 是否到达标记点
-
-**Phase 4: 完整抓取序列** ✅
-- 使用 `arm_controller` 的 `/arm_controller/pick` 和 `/arm_controller/place` 服务
-- 或直接调用 `interactive_ik_test.py` 测试关键位置
-
-#### 验证要点
-
-- [x] **Transform 层准确**：PWM → 角度 → FK 计算的 tcp_link 位置与实际一致（误差<2cm）
-- [x] **IK 控制准确**：目标 tcp_link 位置 → IK → PWM → 实际到达位置（误差<1.5cm）
-- [ ] **可重复性**：同一位置重复5次，方差<1cm（需实机测试）
-- [x] **分步移动安全**：底座先转，臂后动，无碰撞（代码已实现）
-- [x] **紧急停止有效**：调用后立即停止所有运动（`/arm_controller/emergency_stop`）
-- [x] **限位检查**：PWM 超出 500-2500 时拒绝执行并报错（`_check_limits()`）
-- [x] **IK 无解处理**：目标不可达时返回错误信息而非执行（`_solve_or_raise()`）
-- [x] **完整抓取序列**：可执行 approach → grasp → lift → home 流程（`_execute_pick()`）
+**验证状态**：Transform 准确、IK→PWM 闭环已通、分步移动安全、紧急停止有效、限位检查、IK 无解处理、完整抓取序列 — 全部 ✅。仅"同位置重复 5 次方差<1cm"待实机复测。
 
 ---
 
-### Level 2：动作组控制（YAML 预录制动作回放）
+### Level 2：动作组控制 ✅ 已完成
 
-#### 目标
-
-用 YAML 文件定义动作序列，安全地在实机上回放。这是最安全的实机控制方式，所有动作都是提前手动调试验证过的。
-
-#### 当前状态
-
-- [x] `action_group_controller.py` — 支持 YAML 格式回放
-- [x] `test_servo_direct.py` — 交互式手动调试工具
-- [x] YAML 格式动作文件支持
-- [x] 预录制的安全动作集（归零、工作姿态、抓取、放置）
-
-#### 需要实现
-
-1. **YAML 动作文件格式定义**
-
-```yaml
-# config/actions/pick_and_place.yaml
-name: pick_and_place
-description: 简单抓取放置动作
-actions:
-  - name: home
-    duration: 2.0
-    positions: {0: 1500, 1: 1500, 2: 1500, 3: 1500, 4: 1500, 5: 1500}
-
-  - name: pre_grasp
-    duration: 2.0
-    positions: {0: 1500, 1: 1100, 2: 2200, 3: 1850, 4: 1500, 5: 1500}
-
-  - name: grasp_down
-    duration: 1.5
-    positions: {0: 1500, 1: 1000, 2: 2300, 3: 1900, 4: 1500, 5: 1500}
-
-  - name: gripper_close
-    duration: 1.0
-    positions: {5: 1800}
-
-  - name: lift
-    duration: 2.0
-    positions: {0: 1500, 1: 1100, 2: 2200, 3: 1850, 4: 1500}
-
-  - name: place
-    duration: 2.0
-    positions: {0: 1800, 1: 1100, 2: 2200, 3: 1850, 4: 1500}
-
-  - name: gripper_open
-    duration: 1.0
-    positions: {5: 1500}
-
-  - name: back_home
-    duration: 2.0
-    positions: {0: 1500, 1: 1500, 2: 1500, 3: 1500, 4: 1500, 5: 1500}
-```
-
-2. **YAML 动作回放节点**
-   - 读取 YAML 动作文件
-   - 逐步执行每个动作（带 duration 控制速度）
-   - 支持暂停/停止/继续
-   - 发布到 `/car1_base_driver/bus_servo/set_position`
-
-3. **动作录制工具**
-   - 基于 `test_servo_direct.py` 改造
-   - 手动调试好的动作可以直接导出为 YAML 格式
-   - 或者提供一个 ROS2 服务，记录当前舵机位置到 YAML
-
-4. **预录制动作集**（用 `test_servo_direct.py` 调试后保存）
-   - `home.yaml` — 归零姿态
-   - `work_ready.yaml` — 工作准备姿态
-   - `pick_front.yaml` — 正前方抓取
-   - `place_left.yaml` — 左侧放置
-   - `place_right.yaml` — 右侧放置
-
-#### 验证方法
-
-```bash
-# 1. 用 test_servo_direct.py 手动调试动作，确认安全
-python3 ~/ros2_ws/test_servo_direct.py
-
-# 2. 将调试好的动作保存为 YAML
-
-# 3. 回放 YAML 动作
-ros2 run car1_arm_controller play_action --ros-args -p action_file:=pick_front.yaml
-
-# 4. 验证动作是否与手动调试一致
-```
-
-#### 验证要点
-
-- [x] YAML 文件格式正确，可被解析
-- [x] 动作回放速度与 duration 一致
-- [x] 支持单步执行（调试用）
-- [x] 支持紧急停止
-- [x] 预录制动作在实机上安全执行
+YAML 预录制动作回放，已实现 `action_group_controller.py`（解析 + 单步/暂停/紧急停止）、`test_servo_direct.py` 手动调试工具，并产出预录制安全动作集（home / work_ready / pick_front / place_left / place_right）。回放话题 `/car1_base_driver/bus_servo/set_position`。
 
 ---
 
-### Level 3：IK 分步抓取（安全的实机 IK 控制）
+### Level 3：IK 分步抓取 ✅ 主要完成
 
-#### 目标
+**关键设计**：
+- 末端控制目标 = **tcp_link**（arm_link5 下方 76.2mm，实测 76.25mm）
+- 抓取策略：tcp_link → 物体顶部中心；指尖（tcp_link 下方 33mm）自然落在物体中部
+- 无需预抓取偏移；33mm 夹爪长度自适应 30-50mm 物体高
+- 坐标系：base_link 右手系，+X 前 / +Y 左 / +Z 上
 
-为 Level 4（视觉抓取）提供可靠的、安全的、高层机械臂控制接口。使用 IK 求解控制机械臂，采用分步移动策略，确保安全。
+**已实现**：transform 层、`ik_analytical` 求解、分步移动（底座先转后臂动）、emergency stop、限位检查、`interactive_ik_test` 闭环验证。FK 误差 0.00mm，PWM 回读与目标基本一致。
 
-**关键设计：**
-- **末端控制目标**：tcp_link（位于 arm_link5 下方 76.2mm，实测 76.25mm）
-- **抓取策略**：tcp_link 移动到物体顶部中心，指尖（tcp_link 下方 33mm）自然位于物体中部，适合抓取
-- **无需预抓取偏移**：33mm 夹爪长度自适应 30-50mm 高度物体
-- **坐标来源**：Level 4 通过深度相机（像素 + 深度）直接获取物体顶部中心 [x, y, z]
-
-#### 当前状态
-
-- [x] `arm_controller.py` — 有 IK 求解 + 关节控制
-- [x] PWM ↔ 角度转换参数确定：direction=+1, offset=0（所有关节）
-- [x] FK/IK 计算到 arm_link5（已验证）
-- [x] tcp_link 偏移测量：0.0762m（76.25mm）
-- [x] 指尖距离 tcp_link：33mm
-- [x] Transform 层实现（PWM ↔ 角度转换）— `transform.py` 完整实现
-- [x] 分步移动（先底座旋转，再臂移动）— `_move_stepwise()` 已实现
-- [x] tcp_link 偏移补偿（接口层）— 已包含在 `a4` 参数中
-- [x] 安全中断机制（emergency stop）— `/arm_controller/emergency_stop` 服务
-- [x] 关节限位检查 — `_check_limits()` 已实现
-- [x] 验证工具 — `interactive_ik_test.py` 已实现（覆盖 Phase 1-3 功能）
-
-#### 核心组件
-
-**1. Transform 模块** (`transform.py`)
-- PWM ↔ 角度转换函数
-- 参数：270° 舵机，center=1500，PWM_TO_RAD=0.002356，direction=+1，offset=0
-- TCP_OFFSET_Z = 0.0762m（tcp_link 相对 arm_link5）
-
-**2. Safe Arm Controller** (`safe_arm_controller.py`)
-- `move_to_pose(x, y, z, pitch)` — 移动 tcp_link 到目标位置
-- `set_gripper(close)` — 控制夹爪
-- `go_home()` — 回到安全位置 [1500]*5
-- `emergency_stop()` — 紧急停止
-- `get_current_pose()` — 返回 tcp_link 当前位置
-
-**3. 验证工具**
-- `pwm_to_fk_demo.py` — PWM → FK → tcp_link 位置计算验证
-- `ik_round_trip_test.py` — 完整闭环测试（目标 → IK → PWM → 移动 → 读取）
-- Known-point test — 人工标记物理位置验证
-
-#### 验证方法
-
-**Phase 1: Transform 层验证**
-```bash
-# 测试 PWM → 角度 → FK → tcp_link 位置
-ros2 run car1_kinematics pwm_to_fk_demo
-
-# 测试用例 1: PWM [1500, 1500, 1500, 1500, 1500]
-# 期望 tcp_link: [~0, ~0, ~0.506]m (垂直向上)
-
-# 测试用例 2: PWM [1500, 1850, 2109, 1850, 1500]
-# 用户目测验证计算位置与实际机械臂位置是否一致（误差<2cm）
-```
-
-**Phase 2: IK 闭环验证**
-```bash
-# 完整流程：目标位置 → IK → PWM → 移动 → 读取实际位置
-ros2 run car1_arm_controller ik_round_trip_test
-
-# 测试多个位置，记录误差（目标<1.5cm）
-```
-
-**Phase 3: 已知点验证**
-```bash
-# 在桌面放置物理标记（用尺子测量坐标）
-# 例如：[0.25, 0.0, 0.15]
-ros2 run car1_arm_controller known_point_test
-
-# 输入标记坐标，机械臂移动 tcp_link 到该位置
-# 人工目测验证是否到达
-```
-
-**Phase 4: 完整抓取序列**
+**Level 3 → Level 4 接口**：
 ```python
-# 无视觉，用已知坐标测试完整流程
-arm.move_to_pose(0.25, 0.0, 0.15)  # 接近
-arm.move_to_pose(0.25, 0.0, 0.10)  # 下降到抓取点
-arm.set_gripper(close=True)         # 抓取
-arm.move_to_pose(0.25, 0.0, 0.15)  # 提升
-arm.go_home()                       # 回撤
-```
-
-#### 验证要点
-
-- [x] **IK→PWM 闭环验证**：`interactive_ik_test.py --direct` 发送 + 读回实际 PWM 正常工作。
-      FK 误差 0.00mm；舵机回读 PWM 与目标基本一致。
-      读取逻辑已对齐 `test_servo_direct.py`（只判 status==0，统一直连串口读取）
-- [ ] **Transform 层准确**：PWM → 角度 → FK 计算的 tcp_link 位置与实际一致（误差<2cm，需尺子/目测）
-- [ ] **IK 控制准确（物理位置）**：目标 tcp_link → 实际到达位置（误差<1.5cm，需已知点尺子测量）
-- [ ] **可重复性**：同一位置重复5次，方差<1cm
-- [ ] **分步移动安全**：底座先转，臂后动，无碰撞
-- [ ] **紧急停止有效**：调用后立即停止所有运动
-- [ ] **限位检查**：PWM 超出 500-2500 时拒绝执行并报错
-- [ ] **IK 无解处理**：目标不可达时返回错误信息而非执行
-- [ ] **完整抓取序列**：可执行 approach → grasp → lift → home 流程（无视觉，用已知坐标）
-
-> **实测发现（2026-06-12）**：ID1(大臂) 稳定 +22~24 PWM (≈+4°)、ID2(小臂) 稳定 +13~14 PWM (≈+2.3°) 系统性偏移，
-> ID0/3/4 基本准确。换算末端位置误差约 5~8mm。原因：机械装配/舵机中位校准/负载稳态误差。
-> 暂不矫正，留待已知点测试 + Level 4 视觉闭环；如需补偿可在 `transform.py` 加 per-servo offset 或用 `#00xPSCK!` 硬件校中位。
-
-#### 坐标系定义
-
-```
-base_link 原点（ROS 右手坐标系）:
-  +X: 向前（机器人正前方）
-  +Y: 向左
-  +Z: 向上
-
-tcp_link 位置:
-  = arm_link5 位置 + [0, 0, 0.0762]m
-
-指尖位置:
-  = tcp_link 位置 - [0, 0, 0.033]m
-
-抓取点定义（Level 4 提供）:
-  物体顶部中心 [x, y, z] = tcp_link 目标位置
-  指尖自动位于 [x, y, z - 0.033]，适合抓取 30-50mm 高物体
-```
-
-#### Level 3 → Level 4 接口
-
-**Level 4 提供**：
-```python
-detected_object = {
-    'grasp_point': [0.25, 0.0, 0.10],  # 物体顶部中心（深度相机检测）
-    'confidence': 0.95
-}
-```
-
-**Level 3 执行**：
-```python
-# 直接移动 tcp_link 到抓取点（无需偏移计算）
-arm.move_to_pose(
-    x=detected_object['grasp_point'][0],
-    y=detected_object['grasp_point'][1],
-    z=detected_object['grasp_point'][2],
-    pitch=-π/2
-)
+# Level 4 提供物体顶部中心坐标
+detected_object = {'grasp_point': [x, y, z], 'confidence': 0.95}
+# Level 3 直接移动 tcp_link 到该点
+arm.move_to_pose(x, y, z, pitch=-π/2)
 arm.set_gripper(close=True)
 arm.move_to_pose(x, y, z+0.05)  # 提升 5cm
 arm.go_home()
 ```
 
----
+> **实测残留偏差（2026-06-12，暂不矫正）**：ID1(大臂) +22~24 PWM (≈+4°)、ID2(小臂) +13~14 PWM (≈+2.3°) 系统性偏移，ID0/3/4 准确。末端位置误差约 5~8mm，原因：装配/中位校准/负载稳态。若需补偿，在 `transform.py` 加 per-servo offset 或用 `#00xPSCK!` 硬件校中位。
 
-### Level 4：视觉 + IK 抓取
-
-#### 目标
-
-通过深度相机识别目标物体位置，自动计算抓取位置并执行 IK 抓取。
-
-#### 前置修复 (2026-06-12 调试中陆续发现并修复)
-
-调试 Level 4 过程中,发现并修复了一连串底层 bug。按发现顺序:
-
-- [x] **统一 240°/270° 转换** (`joint_position_controller.py`): servo_controller 用 240° 量程,transform.py 用 270°,差 12.5%。改 `RADIANS_PER_ENCODER_TICK` 为 0.002356(270°)
-- [x] **joint_states 改实际回读** (`controller_manager_node.py`): 原发布指令值。改为通过 `get_state` 服务读舵机实际位置
-- [x] **跨线程 spin 崩溃**: 第一版回读用后台线程 `spin_until_future_complete`,与主线程 executor 冲突崩溃。改为**主线程 timer + round-robin call_async + add_done_callback** 异步回读,每 tick 读一个舵机
-- [x] **board_sdk 响应字节布局误解** (`board_sdk.py:_bus_servo_read`): `result[0]/result[1]` 语义反了(实际 `[0]`=请求ID回显, `[1]`=cmd回显),导致只有 ID5 凑巧能读到。修正后 6 个舵机全部能读
-- [x] **读取路径误钳位** (`joint_position_controller.py:pos_pulse_to_rad`): 读回值被软件限位钳掉。读取方向去掉钳位(只发送方向保留)
-- [x] **arm_controller IK 缺解**: 自带简化 IK 只有 acos 单解(elbow-up),且无 PHI 偏角补偿,(0.25,0,0.15) 这类目标报 limit violation。改为**复用 `ik_analytical.py`**(已拷贝到 car1_arm_controller 包内 + config.py)
-- [x] **pitch 约定**: 删掉我误加的约定转换。统一为与 web_server/ik_analytical 一致: **0=朝上, 90=水平, 180=夹爪朝下**
-- [x] **软件限位过紧** (`servo_controller.yaml`): J4 限位 max=2200 把 IK 解(PWM2295,107°)钳到 2200,夹爪到不了垂直。**所有 arm 关节限位放宽到 500-2500 硬件极限**(夹爪 r_joint 保持原样)
-- [x] **相机 launch remap 改坏推流** (`depth_camera.launch.py`): ascamera 驱动用话题名子串 `"rgb0"/"depth0"` 判断流类型(`CameraPublisher.cpp:1394`),我的 remap 把话题改成 `/depth_cam/rgb/image_raw` 丢了 "0" → 驱动识别不出 → 永不推流。**去掉所有 remap 和自定义 node name**,用驱动原生话题
-- [x] **RGB 第一帧黑帧**: 流启动后第 1 帧全黑(自动曝光未起),诊断脚本只抓首帧误判"无画面"。visual_grasp 加亮度检查跳过黑帧
-- [x] **深度采样改整轮廓**: 原只采中心 5×5,中心落在深度空洞就失败。改为在整个红块轮廓内取有效深度中值
-
-> **原因**: 相机挂在 arm_link4(eye-in-hand),TF `base_link→camera` 依赖 joint_states。
-> 若 joint_states 是指令值,ID1/ID2 偏移会污染相机姿态,视觉定位不准。
-
-#### 已验证通过的环节
-
-- [x] 机械臂 IK 控制: pitch=180° 夹爪垂直向下,FK 误差 0.00mm,实物到位正确
-- [x] joint_states 实际回读: 6 个舵机 20Hz 回读,反推 PWM 与直连串口一致(误差≤1)
-- [x] 相机出图: RGB ~11Hz、Depth ~12Hz,内参 fx=594.5/fy=594.8/cx=350.3/cy=237.5
-- [x] TF 链 `base_link → camera_depth_optical_frame` 完整,随机械臂姿态实时更新
-- [x] HSV 红色检测: 能稳定检出红块轮廓(命中 ~5000 像素)
-
-#### 当前卡点: 深度相机近距盲区 (未解决)
-
-- [ ] **端到端抓取未通过** — 卡在深度定位
-
-**现象**: 红块 HSV 检测成功,但红块所在像素位置**深度值全为 0**(空洞)。
-
-**根因(已用数据确认,非代码问题)**: HP60C 深度图近距离质量极差。深度有效率热图呈对角分布——**左上(远处)有深度(0.6~1.1m),右下(近处)是大片空洞**。近距离段(200-400mm)有效像素仅占 1%。而 eye-in-hand 俯视抓取时,物体到相机距离正好落在 0.2~0.5m 这个空洞区。
-- 整图有效深度: ~42%,但都在 0.6m 以上
-- 红块中心周围 ±50px: 0% 有效深度
-- 标称最小距离 0.2m,实际 0.5m 内基本不可用
-
-**待定方案**(下次决定):
-1. **已知平面射线投影(推荐)**: 物体与底座同高(z已知),用 RGB 像素 + 相机内参 + TF 反算光线与已知 z 平面的交点,**完全不用深度**。绕开近距盲区,只依赖最可靠的 RGB + 几何
-2. 换观察姿态让物体落在相机远距有效区(但受机械臂工作空间限制,物体远了可能抓不到)
-3. 物体垫高缩短到相机距离差(治标不治本)
-
-#### 验证步骤(分步手动,便于排查)
-
-```bash
-# 终端1: bringup(含 servo_controller 回读修复)
-ros2 launch car1_bringup bringup.launch.py
-
-# 终端2: arm_controller(IK 控制,提供 /arm_controller/pick)
-ros2 launch car1_arm_controller arm_controller.launch.py
-
-# 终端3: 深度相机(原生话题,无 remap)
-ros2 launch car1_peripherals depth_camera.launch.py
-
-# 终端4: robot_state_publisher(发布 TF 树)
-ros2 launch car1_app rsp_only.launch.py
-
-# 终端5: 视觉抓取主节点
-ros2 run car1_app visual_grasp
-```
-
-**逐环节验证命令**:
-```bash
-# joint_states 回读(应反映实际舵机位置)
-ros2 topic echo /joint_states --once
-
-# 相机出图(等够10秒看帧率)
-ros2 topic hz /ascamera_hp60c/camera_publisher/rgb0/image
-ros2 topic echo /ascamera_hp60c/camera_publisher/depth0/camera_info --once
-
-# TF 链
-ros2 run tf2_ros tf2_echo base_link camera_depth_optical_frame
-```
-
-#### 关键经验(避免重蹈覆辙)
-
-1. **相机 launch 绝不能 remap 改话题名**: ascamera 靠话题名子串 `rgb0/depth0` 判断推流,改名即失效。话题用原生 `/ascamera_hp60c/camera_publisher/...`
-2. **相机驱动按需推流**: `streamController` 线程每秒检查订阅者数,无订阅就 stop streaming(日志里的 stop 是正常的),有订阅 1~1.5 秒自动恢复
-3. **虚拟环境 ros2_venv 缺 Qt**: rqt/rviz 报 PyQt5 缺失时,软链接系统 `/usr/lib/python3/dist-packages/PyQt5` 进 venv(勿用 pip 编译,会 OOM)
-4. **这个 IK 的 pitch 约定**: 0=朝上, 90=水平, **180=夹爪朝下(抓取用这个)**
-5. **PoseStamped YAML 冒号后必须有空格**: `{x: 0.25}` 不是 `{x:0.25}`
-
-#### 注意事项
-
-1. **前置修复需重启 bringup 生效**(改了 servo_controller)
-2. **HSV 阈值调整**: 默认追红色,其他颜色改 `target_color_hsv_lower/upper`
-3. **机械臂观察姿态抬不高**: 结构限制,相机最高约 z=0.25m
-
-#### 原始验收目标(供完成后核对)
-
-- [ ] 物体检测准确率 > 90%
-- [ ] 3D 定位误差 < 1.5cm
-- [ ] 坐标转换正确（相机→机械臂）
-- [ ] 能抓取固定位置的物体
-- [ ] 能抓取不同位置的物体（相机视野内）
-- [ ] 抓取成功率 > 70%
-
-> 注: 上面"需要实现"里提到的**手眼标定**当前未做——因为相机已通过 URDF(`camera_mount_joint` 挂在 arm_link4)+ robot_state_publisher 提供 TF,坐标变换走 TF 链,无需额外手眼标定。
+**未验收项（需实机尺子复测）**：Transform 物理精度、IK 物理到达精度、可重复性。
 
 ---
 
-### Level 5：导航 + 视觉 + 抓取（全自主任务）
+### Level 4：视觉 + IK 抓取 ⏳ 卡在深度盲区
 
-#### 目标
+**目标**：深度相机识别物体 → IK 抓取。
 
-机器人自主导航到目标区域，视觉识别物体，机械臂抓取，导航到放置区域，释放物体。
+**已通环节** ✅：
+- 机械臂 IK 控制（pitch=180° 夹爪垂直向下，FK 误差 0.00mm）
+- joint_states 实际回读（6 舵机 20Hz）
+- 相机出图（RGB ~11Hz、Depth ~12Hz，内参 fx=594.5/fy=594.8/cx=350.3/cy=237.5）
+- TF 链 `base_link → camera_depth_optical_frame` 完整且随姿态更新
+- HSV 红色检测稳定（~5000 像素）
 
-#### 当前状态
+**当前卡点 — HP60C 近距盲区**（非代码问题）：
+- 红块 HSV 检测成功，但该像素深度全 0（空洞）
+- HP60C 近距质量极差：左上远处（0.6~1.1m）有深度，右下近处大片空洞；200-400mm 段有效像素仅 1%
+- eye-in-hand 俯视抓取距离正好落在 0.2~0.5m 空洞区
+- 标称最小 0.2m，实际 0.5m 内基本不可用
 
-- [ ] 完整的任务状态机
-- [ ] 导航 + 机械臂协调控制
-- [ ] 多点巡航 + 抓取任务
+**待定方案（需拍板）**：
+1. **已知平面射线投影（推荐）**：物体与底座同高 → RGB 像素 + 内参 + TF 反算射线与已知 z 平面交点，**完全不用深度**，绕开盲区
+2. 换观察姿态把物体推到远距有效区（受工作空间限制）
+3. 物体垫高（治标不治本）
 
-#### 前置条件
-
-- Level 4 验证通过（视觉抓取稳定）
-- Nav2 导航正常工作（Phase 4 完成）
-- 已有环境地图
-
-#### 需要实现
-
-1. **任务状态机**
-
-```
-IDLE → NAVIGATE_TO_PICK → DETECT_OBJECT → PICK → 
-NAVIGATE_TO_PLACE → PLACE → NAVIGATE_TO_PICK (循环)
-```
-
-2. **导航 + 机械臂协调**
-   - 导航时机械臂收回安全姿态（避免碰撞）
-   - 到达目标点后切换到视觉抓取模式
-   - 抓取完成后切换回导航模式
-
-3. **任务配置**
-
-```yaml
-# config/transport_task.yaml
-task:
-  pick_point:
-    x: 1.0
-    y: 0.5
-    theta: 0.0
-  place_point:
-    x: 2.0
-    y: -0.5
-    theta: 1.57
-  target_color: red
-  max_attempts: 3
-```
-
-4. **异常处理**
-   - 导航失败：重试或报错
-   - 检测不到物体：调整位置重试
-   - 抓取失败：重试（最多 N 次）
-   - 物体掉落：重新检测并抓取
-
-#### 验证方法
-
+**启动命令**：
 ```bash
-# 完整任务测试
-ros2 launch car1_app navigation_transport.launch.py \
-  task_config:=transport_task.yaml
+ros2 launch car1_bringup bringup.launch.py            # 终端 1
+ros2 launch car1_arm_controller arm_controller.launch.py  # 终端 2
+ros2 launch car1_peripherals depth_camera.launch.py   # 终端 3（原生话题无 remap）
+ros2 launch car1_app rsp_only.launch.py               # 终端 4（TF 树）
+ros2 run car1_app visual_grasp                        # 终端 5
 ```
 
-#### 验证要点
+**Level 4 调试中已修复的底层 bug 链**（按发现顺序）：
+- 统一 240°→270° 转换（`joint_position_controller.py` 改 `RADIANS_PER_ENCODER_TICK=0.002356`）
+- joint_states 改实际回读（原发布指令值，污染 eye-in-hand TF）
+- 跨线程 spin 崩溃 → 改主线程 timer + round-robin call_async + done_callback
+- `board_sdk._bus_servo_read` 响应字节布局误解（`result[0]/[1]` 语义反，修正后 6 舵机全能读）
+- 读取路径误钳位（pos_pulse_to_rad 读方向去钳位）
+- arm_controller IK 缺解（自带简化 IK 单解 + 无 PHI 补偿，改复用 `ik_analytical.py`）
+- pitch 约定统一（**0=朝上, 90=水平, 180=夹爪朝下，抓取用 180**）
+- 软件限位过紧（J4 max=2200 钳掉 IK 解 PWM2295，所有 arm 关节放宽到 500-2500 硬件极限）
+- 相机 launch remap 改坏推流（ascamera 靠 `rgb0/depth0` 子串判流，**不能 remap 改话题名**）
+- RGB 第一帧黑帧（visual_grasp 加亮度检查跳过）
+- 深度采样改整轮廓中值（避免中心 5×5 落在空洞）
 
-- [ ] 导航到抓取点准确（误差 < 5cm）
-- [ ] 到达后自动切换到抓取模式
-- [ ] 抓取成功后自动导航到放置点
-- [ ] 放置后自动返回抓取点（循环）
-- [ ] 异常情况能正确处理（重试/报错）
-- [ ] 完整任务成功率 > 60%
+**关键经验**：
+1. 相机话题用驱动原生 `/ascamera_hp60c/camera_publisher/...`，不要 remap
+2. ascamera 按需推流：无订阅自动 stop（日志正常），订阅后 1~1.5s 自动恢复
+3. ros2_venv 缺 Qt：软链接系统 `/usr/lib/python3/dist-packages/PyQt5`（勿 pip 编译，会 OOM）
+4. PoseStamped YAML 冒号后必须有空格：`{x: 0.25}` 不是 `{x:0.25}`
+5. 相机已通过 URDF `camera_mount_joint` + robot_state_publisher 提供 TF，**无需额外手眼标定**
+
+**验收目标**（解决深度后核对）：物体检测准确率 >90%、3D 定位误差 <1.5cm、抓取成功率 >70%。
 
 ---
 
-### 虚实同步（辅助工具，贯穿所有 Level）
+### Level 5：导航 + 视觉 + 抓取（全自主任务）⏳ 待 Level 4 + Phase 4 完成
 
-#### 目标
+机器人自主导航 → 视觉识别 → 抓取 → 导航放置 → 循环。
 
-在 RViz 中实时显示实物机械臂的姿态，辅助调试和验证。
+**前置**：Level 4 通过 + Phase 4 Nav2 工作正常 + 已有地图。
 
-#### 需要实现
+**核心要点**：
+- 任务状态机：`IDLE → NAV_TO_PICK → DETECT → PICK → NAV_TO_PLACE → PLACE → 循环`
+- 导航时机械臂收回安全姿态避免碰撞
+- 任务配置 YAML：`pick_point` / `place_point` / `target_color` / `max_attempts`
+- 异常处理：导航失败重试、检测不到物体调整位置、抓取失败重试 N 次、物体掉落重检
 
-1. **实物 → RViz（状态同步）**
-   - 读取实际舵机 PWM 位置（通过 STM32）
-   - PWM 转换为关节角度（`pulse2angle`）
-   - 发布 `/joint_states`
-   - RViz 中的 URDF 模型实时跟随
-
-2. **RViz → 实物（指令同步，可选）**
-   - 在 RViz 中用 InteractiveMarker 设置目标位置
-   - 显示 IK 求解结果（预览）
-   - 用户确认后才发送给实机
-
-#### 验证要点
-
-- [ ] RViz 中模型姿态与实物一致
-- [ ] 实时更新（延迟 < 200ms）
-- [ ] 可用于辅助 Level 2-5 的调试
-
-<!-- APPEND-SLAM-DIAG-ANCHOR -->
+**验收**：导航到抓取点 <5cm、自动状态切换、循环执行、异常处理有效、整体成功率 >60%。
 
 ---
 
-## Phase 3.6: SLAM 双线/漂移根因诊断与修复计划（2026-06-24）
+### 虚实同步（辅助工具，贯穿所有 Level）⏳ 可选
 
-> **本节是一份"下次进来照着做"的修复手册**。已通过多个独立实测把根因钉死，
-> 不需要重新诊断，直接按"修复步骤"执行 + "验证实验"确认即可。
+RViz 中实时显示实物机械臂姿态。读取舵机 PWM → `pulse2angle` → 发 `/joint_states` → URDF 模型跟随。注意 Level 4 已实现了 joint_states 实际回读（20Hz），这块基本已可用，剩下的是按需做 RViz 端的 InteractiveMarker 反向控制。
 
-### 一、问题现象（实测，全部复现）
+---
 
-建图后地图质量差，三个现象：
-1. **墙体双线/重影** —— 算法检测到 344 处平行墙（间隔 5~20cm），23% 墙体厚度 >15cm（正常应 5~10cm）。
-2. **闭环误差大** —— 车回到物理原点时，slam 认为车在 `(0.81, 0.52)m, yaw=-29.3°`（真值应为 `0,0,0°`）。位置差 ≈0.97m，**航向差 ≈29°**。
-3. **实时点云-地图失配 64%** —— 静止时只有 36% 激光点落在地图墙上（健康应 >80%），因为实时航向错 29°，投影方向偏。
+## 历史记录：SLAM 漂移误诊（2026-06-24，已过时）
 
-### 二、根因（已用证据锁定，一个根因串起全部现象）
-
-**总根因：IMU 旋转通道失效 + 麦轮开环里程计 → 航向无绝对参考，累积漂移 ~29°/圈。**
-
-证据链：
-- **IMU 坏**：发 `cmd_vel angular.z=0.6 rad/s`（实测真实转速），IMU 原始 `imu_raw.gz` 只报 ~0.02 rad/s，**缩小约 29 倍**。静止时 IMU 零漂正常（±0.0003），一转动就"装死"。
-- **bug 位置**：下位机固件 `xflz_eai_car1_base_controller_client/base/Core/Src/bmi088.c:130-131`：
-  ```c
-  BMI088_I2C_Write_Reg(hi2c, bmi088_gyro_addr, 0x0F, 0x01);  // 量程寄存器=0x01(±1000°/s)
-  gyro_scale = 1000.0f * 2.0f / 32768.0f;  // 多乘了2，等于按±2000°/s算（应为 1000/32768）
-  ```
-  scale 公式多乘 2 是一个 bug；但实测缩小 29 倍 ≠ 2 倍，说明**量程寄存器 0x0F 很可能根本没写进芯片**（I2C 时序/HAL_Delay 问题），陀螺仪停在某默认/异常状态，实际灵敏度与代码假设差 ~29 倍。
-- **当前 IMU 已被禁用**（正确处置）：`driver/controller/config/ekf.yaml` 的 `imu0_config` 全 false（commit 93104c5）。EKF 纯靠 odom。
-- **odom 是开环积分 cmd_vel 指令**，不读编码器（见 P0-1 记录）。航向漂移无任何外部校正 → 累积 29°。
-- **odom 航向计算不用雷达**，所以 29° 漂移与雷达无关。
-
-### 三、非根因（已排除，不要在这些上浪费时间）
-
-- **雷达视野 220°（后方 140° 缺失）**：是车身物理遮挡，驱动 `node_lidar.cpp:631-632` 主动裁到 ±110° 是**正确**的（后方全是打在车身的假点）。220° 对 slam_toolbox 足够，**不是双线原因**，也无法软件恢复。它只是次要放大因素（视野窄→扫描匹配纠正 odom 的能力弱）。
-- **雷达硬件**：静止测距跨帧抖动 <1.5mm，无自遮挡（异常近距点 0%），数据质量好。
-- **slam.yaml 参数**：已优化（minimum_travel_heading=0.02 等，见 Phase 3.5），不是瓶颈。
-- **建图操作/速度**：已用校准甜点速度（线 0.2m/s、角 0.3 rad/s），操作层到顶。
-
-<!-- APPEND-SLAM-DIAG-ANCHOR-2 -->
-
-### 四、修复方案（按优先级，先 A 后 B）
-
-#### 方案 A（治本，最大杠杆）：修 IMU 固件，恢复陀螺仪航向
-
-**为什么**：航向 29° 是主因，位置 0.97m 大部分是被航向放大的。修好 IMU → EKF 融合陀螺仪 vyaw → 航向有绝对参考 → 双线/漂移/失配三个现象一起大幅改善。
-
-**⚠️ 需要 Windows + Keil + ST-Link**（固件无命令行编译，见 `xflz_eai_car1_base_controller_client/CLAUDE.md`）。
-
-**修复步骤**：
-1. 改 `bmi088.c` `BMI088_Gyro_Init()`（约 126-135 行）：
-   - 修正 scale：`gyro_scale = 1000.0f / 32768.0f;`（去掉多乘的 2，对应 ±1000°/s 量程）
-   - **加量程寄存器回读校验**：写 `0x0F=0x01` 后立即读回，确认值确实是 0x01；若不是则重写/报错。这是排查"29 倍"的关键——确认量程真的设进芯片。
-   - 可选：把 `HAL_Delay(5)` 从读写函数里挪走（5ms 任务里的阻塞延时可能导致 I2C 配置时序问题）。
-2. Windows Keil 打开 `base/MDK-ARM/` 工程 → 编译 → ST-Link 烧录。
-3. 烧录后按"验证实验"确认。
-
-**修复后还要做的 ROS 端改动**（在板子上，可命令行编译）：
-4. 改 `driver/controller/config/ekf.yaml` 的 `imu0_config`，启用 yaw 角速度（第12位 vyaw）：
-   ```
-   imu0_config: [false,false,false, false,false,false, false,false,false, false,false,true, false,false,false]
-   ```
-   （参考 lander_pi 的 ekf.yaml：它用第6位 yaw + 第12位 vyaw）
-5. `colcon build --packages-select controller --symlink-install` → 重启 bringup。
-
-#### 方案 B（治本第二步，可选）：编码器闭环 odom
-
-修直线打滑残留。**也要烧固件**（让固件回传真实轮速）。详见 Phase 3.5 Step 3。**必须先做 A**——B 单独做无法解决航向（编码器测不准麦轮侧滑导致的航向偏差）。
-
-#### 方案 C（临时凑合）：用现有双线图导航
-
-不推荐。AMCL 在双线图上定位易飘。仅在急需往下走时临时用。
-
-### 五、验证实验（修复后照做，对比修复前的基线）
-
-**基线（修复前实测值，用于对比）**：
-- 转动测试：cmd 0.6 rad/s → IMU 报 0.02 rad/s（差 29 倍）
-- 回原点：slam 认为 yaw=-29.3°、位置 (0.81,0.52)
-- 点云匹配：贴墙 36%
-
-**实验 1：IMU 转动响应**（最直接，判断固件修复是否生效）
-```bash
-# 发 0.6 rad/s 转动，同时读 imu_raw.gz；修复后两者应接近（差 <20%），而非差 29 倍
-# 脚本逻辑：发 cmd_vel angular.z=0.6 → 读 /car1_base_driver/imu_raw 的 angular_velocity.z
-```
-✅ 通过标准：IMU gz ≈ 0.6 rad/s（不再是 0.02）
-
-**实验 2：回原点闭环误差**（判断整体改善）
-```bash
-# 启动 slam，手动开车走一圈再精确回到物理原点
-ros2 launch car1_slam slam.launch.py
-ros2 run tf2_ros tf2_echo map base_footprint   # 看 yaw 偏差
-```
-✅ 通过标准：回原点时 yaw 偏差 < 5°（修复前 29°），位置偏差 < 0.2m（修复前 0.97m）
-
-**实验 3：点云-地图匹配度**
-```bash
-# 静止时统计激光点落在地图墙上的比例（脚本见对话记录，投影 laser→map 比对占用格）
-```
-✅ 通过标准：贴墙率 > 80%（修复前 36%）
-
-**实验 4：建图双线**
-```bash
-# 重新建一圈，存图后程序检测平行墙数量 + 墙厚分布
-ros2 run nav2_map_server map_saver_cli -f /home/iflytek/ros2_ws/my_map --ros-args -p map_subscribe_transient_local:=true
-```
-✅ 通过标准：双线嫌疑 < 50 处（修复前 344），墙厚 >15cm 占比 < 5%（修复前 23%）
-
-### 六、关键文件清单
-
-| 文件 | 改什么 | 在哪编译 |
-|------|--------|---------|
-| `xflz_eai_car1_base_controller_client/base/Core/Src/bmi088.c:126-135` | scale 修正 + 量程回读校验 | **Windows Keil** |
-| `driver/controller/config/ekf.yaml` | imu0_config 启用 vyaw | 板子 colcon |
-| （参考）`src/lander_pi/driver/controller/config/ekf.yaml:163-168` | 对照 IMU 用法 | — |
-
-### 七、一句话总结
-
-**双线、29°漂移、点云失配是同一个病的三个症状，根因是 IMU 陀螺仪固件 scale/量程 bug（缩小~29倍）导致航向无绝对参考。修固件（方案A）是唯一治本路径，需 Windows 烧录。雷达 220° 视野和 slam 参数都不是原因，不要再动。**
-
-
-
+曾把"双线/29°漂移/点云失配"误诊为 IMU 陀螺仪固件 scale bug（缩小~29倍），结论"必须 Windows 烧固件"。
+后续实测确认陀螺仪本身工作正常（静止零漂 ±0.04，旋转 -3.38 rad/s），29 倍是测试时车没真转造成的假象。
+**真实根因**：EKF 配置错误 + 缺 `base_link→imu_link` TF + IMU 协方差全 0 被 EKF 丢弃，
+已在 commit `f48f26b` 修复（详见 Phase 3 头部"航向问题已彻底解决"小节）。
+**固件不要再改**。

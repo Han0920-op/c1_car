@@ -102,8 +102,9 @@ car1_base_driver ──────────▶ car1_servo_controller
 
 ### Velocity Command Routing
 
-- `/cmd_vel` — External commands (Nav2, teleop)
-- `/controller/cmd_vel` — Internal commands (app nodes, used by chassis controller directly)
+- `/cmd_vel` — External commands (teleop, app). `odom_publisher` applies a ±0.2 m/s safety clamp on this channel.
+- `/controller/cmd_vel` — Internal high-speed commands from Nav2 (no clamp).
+- Nav2 path: `controller_server` → `/cmd_vel_nav` → `velocity_smoother` → `/controller/cmd_vel` → `odom_publisher`. The two `cmd_vel` remaps in `car1_navigation/launch/include/navigation_base.launch.py` must stay in place; otherwise Nav2 output falls back to `/cmd_vel` and gets clamped to ±0.2 m/s.
 
 ### Arm Control Interfaces
 
@@ -162,7 +163,7 @@ Vision grasp pipeline: RGB-D camera → HSV color detection → depth-based 3D l
 ### Navigation Stack
 
 - Global planner: ThetaStar
-- Local planner: TEB (omnidirectional mode for mecanum)
+- Local planner: MPPI (nav2_mppi_controller, DiffDrive motion model — Y-axis disabled via vy_std=0, vy_max=0; mecanum lateral motion not exploited)
 - Localization: AMCL
 - SLAM: slam_toolbox (2D laser)
 - Note: LaserScan topics use SensorDataQoS — set RViz Reliability to "Best Effort"

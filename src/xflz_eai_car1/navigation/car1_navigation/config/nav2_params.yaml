@@ -18,8 +18,8 @@ amcl:
     global_frame_id: "map"
     lambda_short: 0.1
     laser_likelihood_max_dist: 2.0
-    laser_max_range: 100.0
-    laser_min_range: -1.0
+    laser_max_range: 8.0
+    laser_min_range: 0.10
     laser_model_type: "likelihood_field"
     max_beams: 60
     max_particles: 2000
@@ -30,11 +30,11 @@ amcl:
     recovery_alpha_fast: 0.0
     recovery_alpha_slow: 0.0
     resample_interval: 1
-    robot_model_type: "nav2_amcl::OmniMotionModel"
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
     sigma_hit: 0.2
     tf_broadcast: true
-    transform_tolerance: 1.0
+    transform_tolerance: 0.3
     update_min_a: 0.2
     update_min_d: 0.25
     z_hit: 0.5
@@ -42,7 +42,7 @@ amcl:
     z_rand: 0.5
     z_short: 0.05
     scan_topic: /scan
-    set_initial_pose: false
+    set_initial_pose: true
     initial_pose:
       x: 0.0
       y: 0.0
@@ -54,7 +54,7 @@ bt_navigator:
     use_sim_time: false
     global_frame: map
     robot_base_frame: base_footprint
-    odom_topic: /odom
+    odom_topic: /odometry/filtered
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 1000
@@ -65,6 +65,7 @@ bt_navigator:
     navigate_through_poses:
       plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
     default_nav_to_pose_bt_xml: "$(find-pkg-share car1_navigation)/config/behavior_trees/navigate_to_pose_without_backup.xml"
+    default_nav_through_poses_bt_xml: "$(find-pkg-share car1_navigation)/config/behavior_trees/navigate_through_poses_without_backup.xml"
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
       - nav2_compute_path_through_poses_action_bt_node
@@ -124,35 +125,41 @@ controller_server:
     controller_plugins: ["FollowPath"]
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
+      required_movement_radius: 0.1
       movement_time_allowance: 10.0
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.05
+      xy_goal_tolerance: 0.10
       yaw_goal_tolerance: 0.1
     FollowPath:
-      plugin: "nav2_mppi_controller::MPPIController"
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      angular_dist_threshold: 0.5
+      forward_sampling_distance: 0.4
+      rotate_to_heading_angular_vel: 1.8
+      max_angular_accel: 3.2
+      simulate_ahead_time: 1.0
+      primary_controller: "nav2_mppi_controller::MPPIController"
       time_steps: 56
       model_dt: 0.05
       batch_size: 2000
       vx_std: 0.2
-      vy_std: 0.2
+      vy_std: 0.0
       wz_std: 0.4
-      vx_max: 0.26
-      vx_min: -0.26
-      vy_max: 0.26
+      vx_max: 0.4
+      vx_min: -0.4
+      vy_max: 0.0
       wz_max: 3.0
       ax_max: 2.5
       ax_min: -2.5
-      ay_max: 2.5
+      ay_max: 0.0
       az_max: 3.2
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.1
       temperature: 0.3
       gamma: 0.015
-      motion_model: "Omni"
+      motion_model: "DiffDrive"
       visualize: false
       reset_period: 1.0
       TrajectoryVisualizer:
@@ -160,7 +167,7 @@ controller_server:
         time_step: 3
       AckermannConstraints:
         min_turning_r: 0.0
-      critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic", "PathAngleCritic", "PreferForwardCritic"]
+      critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic", "PathAngleCritic"]
       ConstraintCritic:
         enabled: true
         cost_power: 1
@@ -174,11 +181,6 @@ controller_server:
         enabled: true
         cost_power: 1
         cost_weight: 3.0
-        threshold_to_consider: 0.5
-      PreferForwardCritic:
-        enabled: true
-        cost_power: 1
-        cost_weight: 5.0
         threshold_to_consider: 0.5
       CostCritic:
         enabled: true
@@ -232,13 +234,17 @@ behavior_server:
     local_footprint_topic: local_costmap/published_footprint
     global_footprint_topic: global_costmap/published_footprint
     cycle_frequency: 10.0
-    behavior_plugins: ["spin", "wait", "clear_costmap"]
+    behavior_plugins: ["spin", "drive_on_heading", "assisted_teleop", "wait"]
     spin:
       plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
     wait:
       plugin: "nav2_behaviors::Wait"
-    clear_costmap:
-      plugin: "nav2_behaviors::ClearEntireCostmap"
+    assisted_teleop:
+      plugin: "nav2_behaviors::AssistedTeleop"
     local_frame: odom
     global_frame: map
     robot_base_frame: base_footprint
@@ -254,11 +260,11 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.26, 0.26, 3.0]
-    min_velocity: [-0.26, -0.26, -3.0]
+    max_velocity: [0.4, 0.0, 3.0]
+    min_velocity: [-0.4, 0.0, -3.0]
     max_accel: [2.5, 2.5, 3.2]
     max_decel: [-2.5, -2.5, -3.2]
-    odom_topic: "odom"
+    odom_topic: "odometry/filtered"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
@@ -275,12 +281,12 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      robot_radius: 0.10
+      footprint: "[[0.18, 0.135], [0.18, -0.135], [-0.18, -0.135], [-0.18, 0.135]]"
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.16
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.18
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: true
@@ -311,7 +317,7 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_footprint
-      robot_radius: 0.10
+      footprint: "[[0.18, 0.135], [0.18, -0.135], [-0.18, -0.135], [-0.18, 0.135]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -334,8 +340,8 @@ global_costmap:
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.16
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.18
       always_send_full_costmap: true
 
 map_server:
@@ -351,7 +357,6 @@ map_saver:
     save_map_timeout: 5.0
     free_thresh_default: 0.25
     occupied_thresh_default: 0.65
-    map_subscribe_transient_local: true
 
 lifecycle_manager_localization:
   ros__parameters:

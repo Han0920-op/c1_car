@@ -107,8 +107,10 @@ class OdomPublisherNode(Node):
         )
 
         # Subscribers
-        self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 1)
-        self.create_subscription(Twist, 'controller/cmd_vel', self.controller_cmd_vel_callback, 1)
+        # /cmd_vel — external commands (teleop, direct pub): clamped to ±0.2 for safety
+        self.create_subscription(Twist, 'cmd_vel', self.app_cmd_vel_callback, 1)
+        # /controller/cmd_vel — internal commands (Nav2 via velocity_smoother): no clamp
+        self.create_subscription(Twist, 'controller/cmd_vel', self.cmd_vel_callback, 1)
         self.create_subscription(Pose2D, 'set_odom', self.set_odom_callback, 1)
 
         # cmd_vel timeout
@@ -146,7 +148,7 @@ class OdomPublisherNode(Node):
         self.angular_z = 0.0
 
     def cmd_vel_callback(self, msg):
-        """Handle velocity commands from navigation or teleop."""
+        """Handle velocity commands from internal controller (Nav2, no clamp)."""
         self.linear_x = msg.linear.x
         self.linear_y = msg.linear.y
         self.angular_z = msg.angular.z
@@ -154,8 +156,11 @@ class OdomPublisherNode(Node):
         speeds = self.mecanum.set_velocity(self.linear_x, self.linear_y, self.angular_z)
         self.motor_pub.publish(speeds)
 
-    def controller_cmd_vel_callback(self, msg):
-        """Handle velocity commands from internal controller."""
+    def app_cmd_vel_callback(self, msg):
+        """Handle external velocity commands (teleop): clamp to ±0.2 m/s for safety."""
+        msg.linear.x = max(-0.2, min(0.2, msg.linear.x))
+        msg.linear.y = max(-0.2, min(0.2, msg.linear.y))
+        msg.angular.z = max(-0.2, min(0.2, msg.angular.z))
         self.cmd_vel_callback(msg)
 
     def _check_cmd_timeout(self):
