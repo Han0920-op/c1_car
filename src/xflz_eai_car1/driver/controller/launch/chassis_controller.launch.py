@@ -18,16 +18,17 @@ def generate_launch_description():
     ekf_config = os.path.join(chassis_pkg, 'config', 'ekf.yaml')
     init_pose_config = os.path.join(chassis_pkg, 'config', 'init_pose.yaml')
 
-    # IMU Madgwick filter
+    # IMU Complementary filter (参考 lander_pi，支持零偏估计)
     imu_filter_node = Node(
-        package='imu_filter_madgwick',
-        executable='imu_filter_madgwick_node',
+        package='imu_complementary_filter',
+        executable='complementary_filter_node',
         name='imu_filter',
         parameters=[{
             'use_mag': False,
             'publish_tf': False,
-            'world_frame': 'enu',
-            'fixed_frame': 'base_link',
+            'do_bias_estimation': True,    # 启用零偏在线估计
+            'do_adaptive_gain': True,      # 启用自适应增益
+            'bias_alpha': 0.1,             # 加快零偏收敛速度（0.01→0.1）
         }],
         remappings=[
             ('imu/data_raw', 'car1_base_driver/imu_raw'),
