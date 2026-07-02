@@ -157,10 +157,14 @@ class OdomPublisherNode(Node):
         self.motor_pub.publish(speeds)
 
     def app_cmd_vel_callback(self, msg):
-        """Handle external velocity commands (teleop): clamp to ±0.2 m/s for safety."""
-        msg.linear.x = max(-0.2, min(0.2, msg.linear.x))
-        msg.linear.y = max(-0.2, min(0.2, msg.linear.y))
-        msg.angular.z = max(-0.2, min(0.2, msg.angular.z))
+        """Handle external velocity commands (teleop): adjusted limits for SLAM mapping.
+
+        Linear: ±0.3 m/s for stable mapping
+        Angular: ±1.0 rad/s for faster rotation during mapping
+        """
+        msg.linear.x = max(-0.3, min(0.3, msg.linear.x))
+        msg.linear.y = max(-0.3, min(0.3, msg.linear.y))
+        msg.angular.z = max(-1.0, min(1.0, msg.angular.z))
         self.cmd_vel_callback(msg)
 
     def _check_cmd_timeout(self):
