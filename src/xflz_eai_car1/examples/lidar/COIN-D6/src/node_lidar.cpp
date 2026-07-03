@@ -666,8 +666,10 @@ int node_start(int argc, char **argv)
 				if (lidar_angle_deg < lidar_fov_min_deg || lidar_angle_deg > lidar_fov_max_deg)
 					continue;
 
-				// Convert to ROS angle: negate (CW->CCW) + 180° offset
-				float ros_angle = (180.0f - lidar_angle_deg) * DEG2RAD;
+				// Convert to ROS angle: 雷达0°朝车尾反装，需+180°旋转让0°→前方
+				// 雷达0°→ROS 180°-0°=180°(后), 雷达180°→ROS 180°-180°=0°(前)
+				// 然后取负变逆时针：-(180° - lidar) = lidar - 180°
+				float ros_angle = (lidar_angle_deg - 180.0f) * DEG2RAD;
 
 				// Find index in output array
 				int idx = (int)((ros_angle - ros_angle_min) / ros_angle_increment + 0.5f);
