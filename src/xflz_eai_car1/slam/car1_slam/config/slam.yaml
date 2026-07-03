@@ -15,7 +15,7 @@ slam_toolbox:
     base_frame: base_footprint
     scan_topic: /scan
     use_scan_matching: true
-    use_scan_barycenter: false   # 改：旋转时重心偏移会引入假位移
+    use_scan_barycenter: true
     mode: mapping
 
     # Procesing rate (sec)
@@ -35,10 +35,11 @@ slam_toolbox:
     map_start_pose: [0.0, 0.0, 0.0]
     map_start_at_dock: true
 
-    # Scan acceptance thresholds (旋转测试优化：降低heading阈值提高关键帧触发频率)
+    # Scan acceptance thresholds (without these slam_toolbox falls back to
+    # 0.5m / 0.5rad defaults, so the map only updates after large moves)
     minimum_travel_distance: 0.01
-    minimum_travel_heading: 0.015   # 0.02 → 0.015 (约0.86°)
-    scan_buffer_size: 50            # 100 → 50 (减轻matcher负载)
+    minimum_travel_heading: 0.02
+    scan_buffer_size: 100
     scan_buffer_maximum_scan_distance: 12.0
 
     debug_logging: false

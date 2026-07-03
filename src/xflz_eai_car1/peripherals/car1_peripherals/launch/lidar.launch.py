@@ -26,7 +26,6 @@ def generate_launch_description():
             'min_range': 0.05,
             'frequency': 10.0,
             'version': 4,
-            'inverted': False,
         }],
         output='screen'
     )

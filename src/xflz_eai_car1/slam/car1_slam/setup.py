@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'map_save = car1_slam.map_save:main',
+            'slam_teleop = car1_slam.slam_teleop:main',
         ],
     },
 )
