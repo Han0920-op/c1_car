@@ -15,7 +15,7 @@ slam_toolbox:
     base_frame: base_footprint
     scan_topic: /scan
     use_scan_matching: true
-    use_scan_barycenter: true
+    use_scan_barycenter: false   # 旋转时重心偏移会引入假位移
     mode: mapping
 
     # Procesing rate (sec)
