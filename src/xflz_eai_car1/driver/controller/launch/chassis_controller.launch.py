@@ -26,9 +26,11 @@ def generate_launch_description():
         parameters=[{
             'use_mag': False,
             'publish_tf': False,
-            'do_bias_estimation': True,    # 启用零偏在线估计
+            # bias 在线估计启用，但使用极小的 alpha（0.005）让零偏估计时间常数变长（~200s）。
+            # 配合 rf2o 激光里程计后，静止时 rf2o 提供零漂移参考，动态权重自动调整。
+            'do_bias_estimation': True,
+            'bias_alpha': 0.005,           # 极小 alpha，零偏估计非常慢
             'do_adaptive_gain': True,      # 启用自适应增益
-            'bias_alpha': 0.1,             # 加快零偏收敛速度（0.01→0.1）
         }],
         remappings=[
             ('imu/data_raw', 'car1_base_driver/imu_raw'),
