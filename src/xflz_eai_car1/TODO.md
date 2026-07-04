@@ -340,6 +340,53 @@ ros2 launch car1_navigation rviz_navigation.launch.py
 - [ ] **D8 AMCL 收敛**：在 8 m 房间内 5 s 内收敛粒子云
 - [ ] 多点导航：Python 串行 `goToPose` 循环工作（不是 `followWaypoints`）
 
+### ⚠️ 当前已知问题（2026-07-04）
+
+#### 问题 1：navigation.launch.py 需要手动加载地图
+
+**现象**：
+- `navigation.launch.py` 启动后 AMCL 显示 "Waiting for map"
+- 需要手动执行 `ros2 service call /map_server/load_map` 才能加载地图
+- RViz 不会自动启动（即使修改了 launch 文件）
+
+**根本原因**：
+- `navigation.launch.py` 的地图路径传递机制有问题
+- 从 `navigation.launch.py` → `localization.launch.py` → `map_server` 的参数传递链中断
+- `OpaqueFunction` 用于延迟求值 `LaunchConfiguration`，但实际传递时仍有问题
+
+**临时解决方案**：
+1. 启动导航：`ros2 launch car1_navigation navigation.launch.py map:=slam_map`
+2. 手动加载地图：
+   ```bash
+   ros2 service call /map_server/load_map nav2_msgs/srv/LoadMap "{map_url: '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/slam_map.yaml'}"
+   ```
+3. 手动启动 RViz：
+   ```bash
+   ros2 run rviz2 rviz2 -d ~/ros2_ws/src/xflz_eai_car1/navigation/car1_navigation/rviz/navigation.rviz
+   ```
+
+**需要修复的文件**：
+- `car1_navigation/launch/navigation.launch.py`（地图路径传递）
+- `car1_navigation/launch/include/localization.launch.py`（map_server 参数接收）
+
+**已修复的配置问题**（2026-07-04）：
+- ✅ 插件命名格式：`nav2_behaviors::Spin` → `nav2_behaviors/Spin`
+- ✅ 控制器切换：MPPI → DWB（更稳定，避免崩溃）
+- ✅ BT 插件列表：移除 Humble 中不存在的插件
+- ✅ 行为树 XML：移除 `is_recovery` 参数（Humble 不支持）
+- ✅ BT 文件路径：`$(find-pkg-share ...)` → 绝对路径
+- ✅ lifecycle_manager bond_timeout：4s → 10s
+
+#### 问题 2：极小地图导致的潜在问题
+
+**现象**：
+- 当前测试地图 `slam_map.pgm` 只有 29×38 像素（1.45m × 1.9m）
+- 这么小的地图可能导致 costmap、planner 等组件行为异常
+
+**建议**：
+- 重新建一个更大的地图（至少 4×4 米，建议 80×80 像素以上）
+- 建图时覆盖更大范围，多角度扫描
+
 ### 已写入 auto-memory 的关键决策（防止以后绕回）
 
 - `mecanum_lateral_disabled_in_nav.md` — Nav2 全栈按差速车配置；底盘 vy 通路完好，app/teleop 可直发 `/controller/cmd_vel.linear.y`

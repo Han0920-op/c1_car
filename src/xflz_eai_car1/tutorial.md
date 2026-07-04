@@ -1913,51 +1913,263 @@ ros2 topic pub /controller/cmd_vel geometry_msgs/msg/Twist "{angular: {z: 0.5}}"
 > **所需时间**：30 分钟  
 > **硬件要求**：雷达 + 底盘 + 已保存的地图
 
-### 4.1 启动导航
+### 4.1 编译导航包
 
 ```bash
-# 编译导航包
+cd ~/ros2_ws
 colcon build --packages-select car1_navigation
 source install/setup.bash
-
-# 启动导航（指定地图）
-ros2 launch car1_navigation navigation.launch.py map:=map_01
-
-# 新终端启动 RViz
-ros2 launch car1_navigation rviz_navigation.launch.py
 ```
 
-### 4.2 导航操作
+### 4.2 启动导航系统
 
-1. **设置初始位姿**：
-   - 在 RViz 中点击 **2D Pose Estimate**
-   - 在地图上点击机器人当前位置
-   - 拖动箭头设置朝向
-   - 观察机器人模型与地图对齐
+#### 方式 1：完整启动（推荐，包含所有组件）
 
-2. **设置导航目标**：
-   - 点击 **Nav2 Goal**
-   - 在地图上点击目标位置
-   - 拖动箭头设置目标朝向
-   - 机器人自动规划路径并导航
+```bash
+# 终端 1：启动导航（默认地图为 slam_map）
+ros2 launch car1_navigation navigation.launch.py map:=slam_map
 
-3. **观察导航过程**：
-   - 绿色线：全局路径
-   - 红色线：局部路径
-   - 蓝色区域：代价地图（障碍物膨胀）
+# 如果使用其他地图
+# ros2 launch car1_navigation navigation.launch.py map:=my_map
+```
 
-**验证要点**：
-- [ ] 地图加载成功
-- [ ] AMCL 定位正常
-- [ ] 路径规划成功
-- [ ] 机器人能到达目标点
-- [ ] 能自动避障
+**此命令会自动启动**：
+- 底盘驱动（bringup）
+- 激光雷达（lidar）
+- 定位系统（AMCL）
+- 导航服务器（planner、controller、bt_navigator）
 
-**可能的问题**：
-- **定位不准**：重新设置初始位姿
-- **规划失败**：目标点在障碍物内或不可达
-- **导航卡住**：调整 Nav2 参数或清除代价地图
-- **震荡**：TEB 参数需调优
+#### ⚠️ 当前已知问题：需要手动加载地图
+
+启动后，`map_server` 不会自动加载地图，需要手动执行：
+
+```bash
+# 终端 2：手动加载地图
+ros2 service call /map_server/load_map nav2_msgs/srv/LoadMap "{map_url: '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/slam_map.yaml'}"
+
+# 如果使用其他地图，修改路径
+# ros2 service call /map_server/load_map nav2_msgs/srv/LoadMap "{map_url: '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/my_map.yaml'}"
+```
+
+**验证地图加载成功**：
+```bash
+# 应该看到以下输出：
+# [map_server]: Loading yaml file: .../slam_map.yaml
+# [amcl]: Received a 29 X 38 map @ 0.050 m/pix
+```
+
+#### 启动 RViz 可视化
+
+```bash
+# 终端 3：手动启动 RViz
+ros2 run rviz2 rviz2 -d ~/ros2_ws/src/xflz_eai_car1/navigation/car1_navigation/rviz/navigation.rviz
+```
+
+> **注意**：当前 `navigation.launch.py` 的 RViz 自动启动功能有问题，需要手动启动。
+
+### 4.3 RViz 配置
+
+如果 RViz 显示不正常，按以下步骤配置：
+
+1. **设置 Fixed Frame**：
+   - 左上角 **Global Options → Fixed Frame** 设为 `map`
+
+2. **添加地图**：
+   - 点击左下角 **Add** 按钮
+   - 选择 **By topic** → `/map` → **Map**
+   - 展开 Map 设置，确保：
+     - **Topic** → **Reliability**: `Reliable`
+     - **Topic** → **Durability**: `Transient Local`
+
+3. **添加激光扫描**：
+   - **Add** → **By topic** → `/scan` → **LaserScan**
+   - 设置 **Reliability** 为 `Best Effort`
+
+4. **添加 AMCL 粒子云**：
+   - **Add** → **By display type** → **PoseArray**
+   - 展开 PoseArray，设置 **Topic** 为 `/particle_cloud`
+
+5. **添加机器人模型**：
+   - **Add** → **By display type** → **RobotModel**
+   - **Description Topic** 设为 `/robot_description`
+
+6. **添加路径规划显示**（可选）：
+   - **Add** → **By topic** → `/plan` → **Path**（全局路径）
+   - **Add** → **By topic** → `/local_plan` → **Path**（局部路径）
+
+7. **添加代价地图**（可选）：
+   - **Add** → **By topic** → `/global_costmap/costmap` → **Map**
+   - **Add** → **By topic** → `/local_costmap/costmap` → **Map**
+
+### 4.4 导航操作步骤
+
+#### 步骤 1：设置初始位姿
+
+机器人需要知道自己在地图上的初始位置。
+
+1. 在 RViz 顶部工具栏点击 **2D Pose Estimate** 按钮
+2. 在地图上**点击**机器人的当前实际位置
+3. **按住鼠标拖动**设置机器人的朝向（箭头方向）
+4. 释放鼠标
+
+**验证定位成功**：
+- AMCL 粒子云（绿色箭头）应该快速收敛到机器人周围
+- 机器人模型应该与实际位置对齐
+- 激光扫描点云应该与地图墙体重合
+
+> **提示**：如果定位不准，可以多次设置初始位姿，或者稍微移动机器人让 AMCL 重新收敛。
+
+#### 步骤 2：发送导航目标
+
+1. 在 RViz 顶部工具栏点击 **2D Goal Pose** 按钮
+2. 在地图上**点击**目标位置
+3. **按住鼠标拖动**设置目标朝向
+4. 释放鼠标
+
+**观察导航过程**：
+- **绿色路径**：全局规划路径（从起点到终点的完整路径）
+- **红色路径**：局部规划路径（当前实时跟随的路径）
+- **蓝色/紫色区域**：代价地图（障碍物膨胀区域）
+- 机器人会自动沿路径导航到目标点
+
+#### 步骤 3：取消导航（如需要）
+
+如果想中途取消导航：
+```bash
+# 新终端
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose "{}" --feedback
+# 按 Ctrl+C 取消
+```
+
+或者在 RViz 中重新设置一个新的目标位置。
+
+### 4.5 验证要点
+
+完成以下验证项：
+
+- [ ] **地图加载成功**：RViz 中能看到地图
+- [ ] **AMCL 定位正常**：粒子云收敛，机器人位姿与地图对齐
+- [ ] **路径规划成功**：设置目标后能看到绿色全局路径
+- [ ] **机器人移动**：机器人沿路径自动移动
+- [ ] **到达目标点**：机器人能准确到达目标位置（误差 <10cm）
+- [ ] **自动避障**：路径上放置障碍物，机器人能自动绕开
+
+### 4.6 常见问题与解决
+
+#### 问题 1：定位不准确
+
+**现象**：机器人模型与实际位置不对齐，粒子云发散。
+
+**解决**：
+1. 重新设置初始位姿，尽量准确
+2. 移动机器人让 AMCL 重新收敛
+3. 检查激光扫描是否正常：`ros2 topic echo /scan`
+4. 检查 TF 树是否完整：`ros2 run tf2_tools view_frames`
+
+#### 问题 2：路径规划失败
+
+**现象**：设置目标后没有绿色路径，或显示 "Goal is not reachable"。
+
+**解决**：
+1. 确认目标点不在障碍物内（不要设在黑色区域）
+2. 确认目标点在地图范围内
+3. 尝试设置更近的目标点
+4. 检查全局代价地图：`ros2 run rviz2 rviz2`，添加 `/global_costmap/costmap`
+
+#### 问题 3：机器人不移动
+
+**现象**：路径规划成功，但机器人静止不动。
+
+**解决**：
+1. 检查 `controller_server` 是否运行：
+   ```bash
+   ros2 node list | grep controller_server
+   ```
+2. 检查 `/cmd_vel_nav` 话题是否有数据：
+   ```bash
+   ros2 topic echo /cmd_vel_nav
+   ```
+3. 检查底盘驱动是否正常：
+   ```bash
+   ros2 topic echo /odom
+   ```
+
+#### 问题 4：导航震荡或抖动
+
+**现象**：机器人在原地震荡，或路径跟随不稳定。
+
+**解决**：
+1. 调整控制器参数（`nav2_params.yaml` 中的 DWB 参数）
+2. 检查里程计数据质量
+3. 降低速度限制
+
+#### 问题 5：地图未加载
+
+**现象**：AMCL 显示 "Waiting for map"，RViz 中看不到地图。
+
+**解决**：
+```bash
+# 手动加载地图
+ros2 service call /map_server/load_map nav2_msgs/srv/LoadMap "{map_url: '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/slam_map.yaml'}"
+```
+
+### 4.7 多点导航（Python API）
+
+如果需要让机器人自动巡逻多个点，可以使用 Python API：
+
+```python
+from nav2_simple_commander.robot_navigator import BasicNavigator
+from geometry_msgs.msg import PoseStamped
+import rclpy
+
+rclpy.init()
+navigator = BasicNavigator()
+
+# 等待导航系统准备就绪
+navigator.waitUntilNav2Active()
+
+# 定义多个目标点
+goal_poses = []
+
+# 目标点 1
+goal_pose1 = PoseStamped()
+goal_pose1.header.frame_id = 'map'
+goal_pose1.header.stamp = navigator.get_clock().now().to_msg()
+goal_pose1.pose.position.x = 1.0
+goal_pose1.pose.position.y = 0.0
+goal_pose1.pose.orientation.w = 1.0
+goal_poses.append(goal_pose1)
+
+# 目标点 2
+goal_pose2 = PoseStamped()
+goal_pose2.header.frame_id = 'map'
+goal_pose2.header.stamp = navigator.get_clock().now().to_msg()
+goal_pose2.pose.position.x = 0.0
+goal_pose2.pose.position.y = 1.0
+goal_pose2.pose.orientation.w = 1.0
+goal_poses.append(goal_pose2)
+
+# 循环导航
+for goal_pose in goal_poses:
+    navigator.goToPose(goal_pose)
+    while not navigator.isTaskComplete():
+        feedback = navigator.getFeedback()
+        # 可以在这里处理反馈信息
+        pass
+    
+    result = navigator.getResult()
+    if result == TaskResult.SUCCEEDED:
+        print(f'到达目标点')
+    else:
+        print(f'导航失败')
+
+navigator.lifecycleShutdown()
+```
+
+保存为 `multi_point_nav.py`，运行：
+```bash
+python3 multi_point_nav.py
+```
 
 ---
 
