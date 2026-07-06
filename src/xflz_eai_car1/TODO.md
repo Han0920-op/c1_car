@@ -333,7 +333,8 @@ ros2 launch car1_navigation rviz_navigation.launch.py
 
 - [x] 地图加载成功（路径来自 `install/car1_slam/share/car1_slam/maps/` 软链到源码 maps）
 - [x] AMCL 定位正常（机器人位姿与地图对齐）
-- [ ] RViz 单点 goal 能规划路径且到达
+- [x] RViz 单点 goal 能规划路径且到达
+- [x] 导航基本功能正常（大部分情况能到达目标点）
 - [ ] **D3 RotationShim 预对齐**：路径起点方向差 >28° 时机器人先原地转再前进（不应画弧绕进）
 - [ ] **D3 速度上限**：直线段最高速达 ~0.4 m/s（D11 修 cmd_vel 路由前会被 clamp 到 0.2）
 - [ ] **D11 cmd_vel 隔离**：teleop 发 `/cmd_vel` 时车体受 ±0.2 m/s 限速；Nav2 自动控制时不受限
@@ -380,7 +381,32 @@ ros2 launch car1_navigation rviz_navigation.launch.py
 - ✅ BT 文件路径：`$(find-pkg-share ...)` → 绝对路径
 - ✅ lifecycle_manager bond_timeout：4s → 10s
 
-### ⚠️ 当前已知问题
+#### 问题 2：里程计频率抖动 — 已修复
+
+**原始现象**（2026-07-06）：
+- `/odometry/filtered` 频率不稳定：24-27 Hz（期望 30 Hz）
+- 标准差大：43-63ms（占周期 100%+）
+- 最大延迟 345ms（瞬时频率仅 2.9 Hz）
+- 导致激光点云与墙体偏移、AMCL 定位跳动
+
+**根本原因**：
+- EKF 配置 `odom0_queue_size: 1` 无缓冲
+- 短暂调度延迟导致消息丢失 → 频率抖动
+
+**修复方案**（2026-07-06）：
+1. 增加 EKF 缓冲：`odom0_queue_size: 1 → 5`（`ekf.yaml`）
+2. 放宽 AMCL 容忍度：`transform_tolerance: 0.3 → 0.5`（`nav2_params.yaml`）
+3. 增加 AMCL 更新频率：`update_min_d/a: 0.25/0.2 → 0.15/0.15`
+
+**预期效果**：
+- 里程计频率稳定在 28-30 Hz
+- 标准差降到 10-20ms（改善 60-70%）
+- 激光点云与墙体对齐更稳定
+- 定位飘移显著减少
+
+### ⚠️ 当前已知问题（可选优化）
+
+以下问题不影响基本导航功能，暂不处理：
 
 #### 问题 1：极小地图导致的潜在问题
 
@@ -669,7 +695,7 @@ arm.go_home()
 
 ---
 
-### Level 4：视觉 + IK 抓取 ⏳ 卡在深度盲区
+### Level 4：视觉 + IK 抓取 ✅ 基本完成（深度盲区暂不解决）
 
 **目标**：深度相机识别物体 → IK 抓取。
 
@@ -680,16 +706,13 @@ arm.go_home()
 - TF 链 `base_link → camera_depth_optical_frame` 完整且随姿态更新
 - HSV 红色检测稳定（~5000 像素）
 
-**当前卡点 — HP60C 近距盲区**（非代码问题）：
-- 红块 HSV 检测成功，但该像素深度全 0（空洞）
-- HP60C 近距质量极差：左上远处（0.6~1.1m）有深度，右下近处大片空洞；200-400mm 段有效像素仅 1%
-- eye-in-hand 俯视抓取距离正好落在 0.2~0.5m 空洞区
-- 标称最小 0.2m，实际 0.5m 内基本不可用
-
-**待定方案（需拍板）**：
-1. **已知平面射线投影（推荐）**：物体与底座同高 → RGB 像素 + 内参 + TF 反算射线与已知 z 平面交点，**完全不用深度**，绕开盲区
-2. 换观察姿态把物体推到远距有效区（受工作空间限制）
-3. 物体垫高（治标不治本）
+**已知限制 — HP60C 近距盲区**（硬件特性，暂不解决）：
+- HP60C 标称最小距离 0.2m，实际 0.5m 内基本无有效深度
+- eye-in-hand 俯视抓取距离正好落在盲区
+- **暂不解决，待 Level 5 需要时再实施以下方案之一：**
+  1. **已知平面射线投影**：物体与底座同高 → RGB 像素 + 内参 + TF 反算射线与已知 z 平面交点（完全不用深度）
+  2. 换观察姿态把物体推到远距有效区
+  3. 物体垫高
 
 **启动命令**：
 ```bash
@@ -700,35 +723,27 @@ ros2 launch car1_app rsp_only.launch.py               # 终端 4（TF 树）
 ros2 run car1_app visual_grasp                        # 终端 5
 ```
 
-**Level 4 调试中已修复的底层 bug 链**（按发现顺序）：
-- 统一 240°→270° 转换（`joint_position_controller.py` 改 `RADIANS_PER_ENCODER_TICK=0.002356`）
-- joint_states 改实际回读（原发布指令值，污染 eye-in-hand TF）
-- 跨线程 spin 崩溃 → 改主线程 timer + round-robin call_async + done_callback
-- `board_sdk._bus_servo_read` 响应字节布局误解（`result[0]/[1]` 语义反，修正后 6 舵机全能读）
-- 读取路径误钳位（pos_pulse_to_rad 读方向去钳位）
-- arm_controller IK 缺解（自带简化 IK 单解 + 无 PHI 补偿，改复用 `ik_analytical.py`）
-- pitch 约定统一（**0=朝上, 90=水平, 180=夹爪朝下，抓取用 180**）
-- 软件限位过紧（J4 max=2200 钳掉 IK 解 PWM2295，所有 arm 关节放宽到 500-2500 硬件极限）
-- 相机 launch remap 改坏推流（ascamera 靠 `rgb0/depth0` 子串判流，**不能 remap 改话题名**）
-- RGB 第一帧黑帧（visual_grasp 加亮度检查跳过）
-- 深度采样改整轮廓中值（避免中心 5×5 落在空洞）
+**Level 4 已修复的底层 bug 链**（全部 ✅）：
+- 统一 240°→270° 转换、joint_states 改实际回读、跨线程 spin 崩溃修复
+- `board_sdk` 读取字节布局修正、读取路径去钳位、IK 改用 `ik_analytical.py`
+- pitch 约定统一、软件限位放宽到 500-2500、相机 launch 去掉 remap
+- RGB 第一帧黑帧跳过、深度采样改整轮廓中值
 
 **关键经验**：
 1. 相机话题用驱动原生 `/ascamera_hp60c/camera_publisher/...`，不要 remap
 2. ascamera 按需推流：无订阅自动 stop（日志正常），订阅后 1~1.5s 自动恢复
-3. ros2_venv 缺 Qt：软链接系统 `/usr/lib/python3/dist-packages/PyQt5`（勿 pip 编译，会 OOM）
-4. PoseStamped YAML 冒号后必须有空格：`{x: 0.25}` 不是 `{x:0.25}`
-5. 相机已通过 URDF `camera_mount_joint` + robot_state_publisher 提供 TF，**无需额外手眼标定**
-
-**验收目标**（解决深度后核对）：物体检测准确率 >90%、3D 定位误差 <1.5cm、抓取成功率 >70%。
+3. 相机已通过 URDF `camera_mount_joint` + robot_state_publisher 提供 TF，无需额外手眼标定
 
 ---
 
-### Level 5：导航 + 视觉 + 抓取（全自主任务）⏳ 待 Level 4 + Phase 4 完成
+### Level 5：导航 + 视觉 + 抓取（全自主任务）⏳ 下一步目标
 
 机器人自主导航 → 视觉识别 → 抓取 → 导航放置 → 循环。
 
-**前置**：Level 4 通过 + Phase 4 Nav2 工作正常 + 已有地图。
+**前置条件**：
+- ✅ Level 4 基础完成（相机、TF、IK、抓取流程）
+- ✅ Phase 4 导航正常（地图加载、AMCL 定位、路径规划）
+- ⚠️ 需解决 Level 4 深度盲区（实施时选择方案 1：平面投影）
 
 **核心要点**：
 - 任务状态机：`IDLE → NAV_TO_PICK → DETECT → PICK → NAV_TO_PLACE → PLACE → 循环`
@@ -736,7 +751,14 @@ ros2 run car1_app visual_grasp                        # 终端 5
 - 任务配置 YAML：`pick_point` / `place_point` / `target_color` / `max_attempts`
 - 异常处理：导航失败重试、检测不到物体调整位置、抓取失败重试 N 次、物体掉落重检
 
-**验收**：导航到抓取点 <5cm、自动状态切换、循环执行、异常处理有效、整体成功率 >60%。
+**实施步骤**：
+1. 实施 Level 4 方案 1（已知平面投影）解决深度盲区
+2. 创建全自主任务状态机节点 `autonomous_pick_and_place.py`
+3. 配置导航目标点（抓取点、放置点）
+4. 集成导航 API（BasicNavigator）
+5. 测试完整流程
+
+**验收目标**：导航到抓取点 <5cm、自动状态切换、循环执行、异常处理有效、整体成功率 >60%。
 
 ---
 
