@@ -331,8 +331,8 @@ ros2 launch car1_navigation rviz_navigation.launch.py
 
 ### 验证要点
 
-- [ ] 地图加载成功（路径来自 `install/car1_slam/share/car1_slam/maps/` 软链到源码 maps）
-- [ ] AMCL 定位正常（机器人位姿与地图对齐）
+- [x] 地图加载成功（路径来自 `install/car1_slam/share/car1_slam/maps/` 软链到源码 maps）
+- [x] AMCL 定位正常（机器人位姿与地图对齐）
 - [ ] RViz 单点 goal 能规划路径且到达
 - [ ] **D3 RotationShim 预对齐**：路径起点方向差 >28° 时机器人先原地转再前进（不应画弧绕进）
 - [ ] **D3 速度上限**：直线段最高速达 ~0.4 m/s（D11 修 cmd_vel 路由前会被 clamp 到 0.2）
@@ -340,34 +340,37 @@ ros2 launch car1_navigation rviz_navigation.launch.py
 - [ ] **D8 AMCL 收敛**：在 8 m 房间内 5 s 内收敛粒子云
 - [ ] 多点导航：Python 串行 `goToPose` 循环工作（不是 `followWaypoints`）
 
-### ⚠️ 当前已知问题（2026-07-04）
+### ✅ 已解决问题（2026-07-06）
 
-#### 问题 1：navigation.launch.py 需要手动加载地图
+#### 问题 1：地图加载问题 — 已修复
 
-**现象**：
+**原始现象**（2026-07-04）：
 - `navigation.launch.py` 启动后 AMCL 显示 "Waiting for map"
 - 需要手动执行 `ros2 service call /map_server/load_map` 才能加载地图
-- RViz 不会自动启动（即使修改了 launch 文件）
 
 **根本原因**：
-- `navigation.launch.py` 的地图路径传递机制有问题
-- 从 `navigation.launch.py` → `localization.launch.py` → `map_server` 的参数传递链中断
-- `OpaqueFunction` 用于延迟求值 `LaunchConfiguration`，但实际传递时仍有问题
+- `nav2_params.yaml` 中 `map_server.yaml_filename: ""`（空字符串）
+- `localization.launch.py` 使用 `RewrittenYaml` 只重写了 `use_sim_time`，未重写 `yaml_filename`
+- 后续通过 Node 参数字典传递 `{'yaml_filename': map_file}` 被 `RewrittenYaml` 生成的空值覆盖
 
-**临时解决方案**：
-1. 启动导航：`ros2 launch car1_navigation navigation.launch.py map:=slam_map`
-2. 手动加载地图：
-   ```bash
-   ros2 service call /map_server/load_map nav2_msgs/srv/LoadMap "{map_url: '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/slam_map.yaml'}"
-   ```
-3. 手动启动 RViz：
-   ```bash
-   ros2 run rviz2 rviz2 -d ~/ros2_ws/src/xflz_eai_car1/navigation/car1_navigation/rviz/navigation.rviz
-   ```
+**修复方案**（2026-07-06）：
+- 将 `yaml_filename` 加入 `RewrittenYaml` 的 `param_rewrites` 字典：
+  ```python
+  configured_params = RewrittenYaml(
+      source_file=nav2_params,
+      param_rewrites={
+          'use_sim_time': use_sim_time,
+          'yaml_filename': map_file  # 关键修复
+      },
+      convert_types=True
+  )
+  ```
+- 修改文件：`car1_navigation/launch/include/localization.launch.py`
 
-**需要修复的文件**：
-- `car1_navigation/launch/navigation.launch.py`（地图路径传递）
-- `car1_navigation/launch/include/localization.launch.py`（map_server 参数接收）
+**验证结果**：
+- ✅ 地图自动加载，无需手动调用服务
+- ✅ AMCL 立即开始定位
+- ✅ RViz 正常显示地图
 
 **已修复的配置问题**（2026-07-04）：
 - ✅ 插件命名格式：`nav2_behaviors::Spin` → `nav2_behaviors/Spin`
@@ -377,7 +380,9 @@ ros2 launch car1_navigation rviz_navigation.launch.py
 - ✅ BT 文件路径：`$(find-pkg-share ...)` → 绝对路径
 - ✅ lifecycle_manager bond_timeout：4s → 10s
 
-#### 问题 2：极小地图导致的潜在问题
+### ⚠️ 当前已知问题
+
+#### 问题 1：极小地图导致的潜在问题
 
 **现象**：
 - 当前测试地图 `slam_map.pgm` 只有 29×38 像素（1.45m × 1.9m）

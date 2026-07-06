@@ -1936,36 +1936,22 @@ ros2 launch car1_navigation navigation.launch.py map:=slam_map
 **此命令会自动启动**：
 - 底盘驱动（bringup）
 - 激光雷达（lidar）
-- 定位系统（AMCL）
+- 定位系统（AMCL + map_server，地图自动加载）
 - 导航服务器（planner、controller、bt_navigator）
-
-#### ⚠️ 当前已知问题：需要手动加载地图
-
-启动后，`map_server` 不会自动加载地图，需要手动执行：
-
-```bash
-# 终端 2：手动加载地图
-ros2 service call /map_server/load_map nav2_msgs/srv/LoadMap "{map_url: '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/slam_map.yaml'}"
-
-# 如果使用其他地图，修改路径
-# ros2 service call /map_server/load_map nav2_msgs/srv/LoadMap "{map_url: '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/my_map.yaml'}"
-```
+- RViz 可视化界面（如果 `use_rviz:=true`，默认启用）
 
 **验证地图加载成功**：
 ```bash
-# 应该看到以下输出：
+# 查看日志，应该看到：
 # [map_server]: Loading yaml file: .../slam_map.yaml
-# [amcl]: Received a 29 X 38 map @ 0.050 m/pix
+# [map_server]: Loaded map with size: XX x YY
+# [amcl]: Received a XX X YY map @ 0.050 m/pix
+
+# 或通过话题验证
+ros2 topic echo /map --once
 ```
 
-#### 启动 RViz 可视化
-
-```bash
-# 终端 3：手动启动 RViz
-ros2 run rviz2 rviz2 -d ~/ros2_ws/src/xflz_eai_car1/navigation/car1_navigation/rviz/navigation.rviz
-```
-
-> **注意**：当前 `navigation.launch.py` 的 RViz 自动启动功能有问题，需要手动启动。
+> **✅ 修复说明**（2026-07-06）：地图加载问题已解决，`map_server` 现在会自动加载地图，无需手动调用服务。
 
 ### 4.3 RViz 配置
 
@@ -2103,15 +2089,16 @@ ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose "{}" --f
 2. 检查里程计数据质量
 3. 降低速度限制
 
-#### 问题 5：地图未加载
+#### 问题 5：地图未加载（已修复）
 
 **现象**：AMCL 显示 "Waiting for map"，RViz 中看不到地图。
 
 **解决**：
-```bash
-# 手动加载地图
-ros2 service call /map_server/load_map nav2_msgs/srv/LoadMap "{map_url: '/home/iflytek/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/slam_map.yaml'}"
-```
+- ✅ **此问题已在 2026-07-06 修复**，地图现在会自动加载
+- 如果仍遇到此问题，检查：
+  1. 地图文件是否存在：`ls ~/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps/slam_map.*`
+  2. map_server 节点是否运行：`ros2 node list | grep map_server`
+  3. 查看 map_server 日志：检查是否有加载错误
 
 ### 4.7 多点导航（Python API）
 

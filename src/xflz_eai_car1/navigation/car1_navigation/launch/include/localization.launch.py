@@ -21,7 +21,10 @@ def generate_launch_description():
 
     configured_params = RewrittenYaml(
         source_file=nav2_params,
-        param_rewrites={'use_sim_time': use_sim_time},
+        param_rewrites={
+            'use_sim_time': use_sim_time,
+            'yaml_filename': map_file
+        },
         convert_types=True
     )
 
@@ -29,7 +32,7 @@ def generate_launch_description():
         package='nav2_map_server',
         executable='map_server',
         name='map_server',
-        parameters=[configured_params, {'yaml_filename': map_file}],
+        parameters=[configured_params],
         output='screen'
     )
 
