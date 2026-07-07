@@ -205,8 +205,10 @@ class SerialReader:
                         if self._port != port or self._baud != baud:
                             break
                     try:
+                        if not ser.is_open:
+                            break
                         data = ser.read(READ_CHUNK)
-                    except (serial.SerialException, OSError) as e:
+                    except (serial.SerialException, OSError, TypeError) as e:
                         self._post_status(False, f"read error: {e}")
                         break
                     if data:
