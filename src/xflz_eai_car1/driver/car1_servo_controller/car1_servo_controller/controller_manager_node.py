@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 # encoding: utf-8
-"""Controller manager node: orchestrates servo control for car1 robot arm and gripper."""
+"""Controller manager node: orchestrates servo control for car1 robot arm and gripper.
+
+Design (rewritten):
+  - joint_states cache defaults to the LAST COMMANDED position (updated on every
+    command). This keeps TF / RViz / visual_grasp consistent with what we asked
+    the arm to do, without hammering the serial bus with round-robin reads.
+  - Actual servo readback is ON-DEMAND via the /servo_controller/refresh_positions
+    service. Callers (e.g. visual_grasp before detection) call it at critical
+    moments; the service returns success=False on timeout so callers can decide
+    whether to proceed with the commanded value or abort.
+  - The old 5Hz round-robin readback is removed. It caused mismatched responses
+    (no ID validation), stale caches, and unreliable joint_states.
+"""
 import math
 import time
 import threading
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import JointState
 from car1_servo_controller_msgs.msg import ServosPosition, ServoPosition, ServoState, ServoStateList
@@ -55,6 +69,9 @@ class ControllerManagerNode(Node):
             self.joint_controllers[joint_name] = controller
             self.connected_ids[str(servo_id)] = joint_name
 
+        # Reverse lookup: servo_id -> joint_name (for updating cache on command)
+        self.id_to_joint = {ctrl.servo_id: jn for jn, ctrl in self.joint_controllers.items()}
+
         # Create servo manager
         self.servo_manager = ServoManager(self, self.connected_ids)
 
@@ -81,7 +98,7 @@ class ControllerManagerNode(Node):
 
         # Publishers
         self.joint_states_pub = self.create_publisher(JointState, '/joint_states', 10)
-        self.servo_states_pub = self.create_publisher(ServoStateList, '~/servo_states', 1)
+        self.servo_states_pub = self.create_publisher(ServoStateList, '~/servo_states', 10)
 
         # Subscribers
         self.create_subscription(
@@ -102,42 +119,78 @@ class ControllerManagerNode(Node):
         self.init_client.wait_for_service()
         self.get_logger().info('car1_base_driver ready.')
 
-        # Create client for reading actual servo positions
+        # Client for reading actual servo positions (used on-demand only).
+        # Uses a ReentrantCallbackGroup so its response can be dispatched while
+        # a service callback is waiting on the future. Without this, the single
+        # executor thread would sit inside _refresh_positions_callback and never
+        # deliver the get_state response — every read times out.
+        self._readback_cbg = ReentrantCallbackGroup()
         self.get_state_client = self.create_client(
-            GetBusServoState, namespace + '/car1_base_driver/bus_servo/get_state'
+            GetBusServoState,
+            namespace + '/car1_base_driver/bus_servo/get_state',
+            callback_group=self._readback_cbg,
         )
-        # Wait so the timer doesn't start ticking before service discovery completes.
-        # Without this, service_is_ready() may stay False and _kick_off_one_read silently
-        # returns every tick → no PRAD sent → joint_states stuck at init (all zeros).
         self.get_logger().info('Waiting for car1_base_driver/bus_servo/get_state...')
         self.get_state_client.wait_for_service()
-        self.get_logger().info('get_state service ready, readback enabled.')
+        self.get_logger().info('get_state service ready.')
 
-        # Cache for last known actual positions (fallback when readback fails)
+        # Cache: joint_name -> last known pulse position.
+        # Initialised to configured init pose; updated by:
+        #   1) command callbacks (immediately, source of truth by default)
+        #   2) refresh_positions service (on-demand real readback)
         self.last_actual_positions = {}
+        self._cache_lock = threading.Lock()
         for joint_name, controller in self.joint_controllers.items():
             self.last_actual_positions[joint_name] = controller.initial_position_raw
 
-        # Track in-flight read futures per joint to avoid stacking requests
-        self.pending_read_futures = {}
+        # Configurable read timeout (per-servo, seconds)
+        self.read_timeout = self.get_parameter_or(
+            'read_timeout', rclpy.parameter.Parameter('read_timeout', value=1.5)
+        ).value
 
-        # Round-robin index for staggering servo reads across publish ticks
-        self._read_cursor = 0
-
-        # Publish joint states via main-thread timer (avoids cross-thread executor issues)
+        # Publish joint states via timer (from cache; no serial I/O in this path)
         publish_rate = self.get_parameter_or(
             'publish_rate', rclpy.parameter.Parameter('publish_rate', value=5.0)
         ).value
         self.publish_period = 1.0 / publish_rate
         self.publish_timer = self.create_timer(self.publish_period, self._publish_joint_states_tick)
 
-        # Service: init_finish
+        # Services
         self.create_service(Trigger, '~/init_finish', self._init_finish_callback)
-        self.get_logger().info('\033[1;32mservo_controller started\033[0m')
+        # On-demand actual readback: refreshes cache with real servo positions.
+        # Returns success=True only if ALL servos were read within read_timeout.
+        # On timeout the cache is partially updated (the servos that did respond)
+        # and success=False so callers can decide their fallback policy.
+        # Same ReentrantCallbackGroup as the client — the callback waits on the
+        # client's future, so both must be reentrant.
+        self.create_service(
+            Trigger,
+            '~/refresh_positions',
+            self._refresh_positions_callback,
+            callback_group=self._readback_cbg,
+        )
+        self.get_logger().info('\033[1;32mservo_controller started (on-demand readback)\033[0m')
 
     def _init_finish_callback(self, request, response):
         response.success = True
         return response
+
+    # --- Cache update helpers ------------------------------------------------
+
+    def _update_cache_from_command(self, servo_positions):
+        """After sending a command, write the target pulses into the cache.
+
+        This makes joint_states / TF reflect what we asked for, which is
+        accurate enough for visual grasp (FK verified <1.5mm error). Real
+        readback is only needed for safety-critical verification.
+        """
+        with self._cache_lock:
+            for p in servo_positions:
+                jn = self.id_to_joint.get(int(p.id))
+                if jn is not None:
+                    self.last_actual_positions[jn] = int(p.position)
+
+    # --- Command callbacks ---------------------------------------------------
 
     def servo_controller_callback(self, msg):
         """Handle servo position commands (pulse, rad, or deg units)."""
@@ -174,8 +227,12 @@ class ControllerManagerNode(Node):
                     valid_positions.append(servo_pos)
             self.servo_manager.set_position(msg.duration, valid_positions)
 
+        # Sync cache with the values we just commanded.
+        self._update_cache_from_command(valid_positions)
+
     def joint_controller_callback(self, msg):
         """Handle JointState commands (radians)."""
+        commanded = []
         for name, position in zip(msg.name, msg.position):
             if name in self.joint_controllers:
                 controller = self.joint_controllers[name]
@@ -184,14 +241,14 @@ class ControllerManagerNode(Node):
                 servo_pos.id = controller.servo_id
                 servo_pos.position = float(pulse)
                 self.servo_manager.set_position(0.02, [servo_pos])
+                commanded.append(servo_pos)
                 time.sleep(0.005)
+        self._update_cache_from_command(commanded)
+
+    # --- joint_states publisher ---------------------------------------------
 
     def _publish_joint_states_tick(self):
-        """Timer callback (main thread): publish cached positions, kick off async readback."""
-        # Kick off async read for one servo per tick (round-robin to avoid bus congestion)
-        self._kick_off_one_read()
-
-        # Publish current cache
+        """Publish cached positions. No serial I/O here — pure cache read."""
         joint_msg = JointState()
         joint_msg.header.stamp = self.get_clock().now().to_msg()
         joint_msg.header.frame_id = 'base_link'
@@ -199,12 +256,14 @@ class ControllerManagerNode(Node):
         servo_list_msg = ServoStateList()
         servo_list_msg.header = joint_msg.header
 
+        with self._cache_lock:
+            snapshot = dict(self.last_actual_positions)
+
         for joint_name, controller in self.joint_controllers.items():
-            pulse = self.last_actual_positions.get(joint_name, controller.initial_position_raw)
+            pulse = snapshot.get(joint_name, controller.initial_position_raw)
 
             joint_msg.name.append(joint_name)
-            rad = controller.pos_pulse_to_rad(pulse)
-            joint_msg.position.append(rad)
+            joint_msg.position.append(controller.pos_pulse_to_rad(pulse))
 
             servo_state = ServoState()
             servo_state.id = controller.servo_id
@@ -214,52 +273,117 @@ class ControllerManagerNode(Node):
         self.joint_states_pub.publish(joint_msg)
         self.servo_states_pub.publish(servo_list_msg)
 
-    def _kick_off_one_read(self):
-        """Send one async read request per tick (round-robin), update cache via callback."""
+    # --- On-demand refresh service ------------------------------------------
+
+    def _refresh_positions_callback(self, request, response):
+        """Blocking read of all joints. Updates cache with real readback.
+
+        Result:
+          success=True  → every joint refreshed within read_timeout.
+          success=False → at least one joint timed out or gave a bad reply;
+                          message lists the failures. Callers can still use
+                          the (partially updated) cache from joint_states if
+                          they accept the risk.
+        """
+        deadline = time.time() + max(0.1, float(self.read_timeout) * len(self.joint_controllers))
+        failed = []
+        refreshed = []
+
+        for joint_name, controller in self.joint_controllers.items():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                failed.append(f'{joint_name}(overall timeout)')
+                continue
+
+            per_call_timeout = min(float(self.read_timeout), remaining)
+            pulse = self._read_one_joint_blocking(controller.servo_id, per_call_timeout)
+
+            if pulse is None:
+                failed.append(f'{joint_name}(timeout)')
+                continue
+            if not (500 <= pulse <= 2500):
+                failed.append(f'{joint_name}(bad pulse {pulse})')
+                continue
+
+            with self._cache_lock:
+                self.last_actual_positions[joint_name] = pulse
+            refreshed.append(f'{joint_name}={pulse}')
+
+        response.success = (len(failed) == 0)
+        if response.success:
+            response.message = 'refreshed: ' + ', '.join(refreshed)
+            self.get_logger().info(f'refresh_positions OK: {response.message}')
+        else:
+            response.message = 'failed: [' + ', '.join(failed) + '] refreshed: [' + ', '.join(refreshed) + ']'
+            self.get_logger().warn(f'refresh_positions PARTIAL: {response.message}')
+        return response
+
+    def _read_one_joint_blocking(self, servo_id, timeout_sec):
+        """Send a get_state request and wait up to timeout_sec for the reply.
+
+        Verifies the reply ID matches the request (defense against out-of-order
+        responses that plagued the old async round-robin path).
+
+        Returns pulse (int) on success, None on timeout / bad reply.
+        """
         if not self.get_state_client.service_is_ready():
-            return
+            return None
 
-        joint_names = list(self.joint_controllers.keys())
-        if not joint_names:
-            return
-
-        # Round-robin: read one joint per tick
-        joint_name = joint_names[self._read_cursor % len(joint_names)]
-        self._read_cursor += 1
-
-        # Skip if previous read for this joint hasn't returned yet
-        prev = self.pending_read_futures.get(joint_name)
-        if prev is not None and not prev.done():
-            return
-
-        controller = self.joint_controllers[joint_name]
         req = GetBusServoState.Request()
         cmd = GetBusServoCmd()
-        cmd.id = controller.servo_id
+        cmd.id = servo_id
         cmd.get_position = 1
         req.cmd = [cmd]
 
         future = self.get_state_client.call_async(req)
-        self.pending_read_futures[joint_name] = future
-        future.add_done_callback(lambda f, jn=joint_name: self._on_read_response(jn, f))
 
-    def _on_read_response(self, joint_name, future):
-        """Callback when get_state response arrives; update cache."""
+        # Poll the future in a bounded loop. rclpy.spin_until_future_complete
+        # would deadlock a single-threaded executor when this handler is itself
+        # running on the executor, so we hand-roll a short poll.
+        deadline = time.time() + timeout_sec
+        while rclpy.ok() and time.time() < deadline:
+            if future.done():
+                break
+            time.sleep(0.01)
+
+        if not future.done():
+            future.cancel()
+            return None
+
         try:
-            response = future.result()
-            if response and response.success and response.state:
-                state = response.state[0]
-                if state.position and state.position[0] > 0:
-                    self.last_actual_positions[joint_name] = state.position[0]
-        except Exception:
-            pass  # Keep stale cache value
+            resp = future.result()
+        except Exception as e:
+            self.get_logger().warn(f'read servo {servo_id} raised: {e}')
+            return None
+
+        if not (resp and resp.success and resp.state):
+            return None
+
+        state = resp.state[0]
+        # Validate the response is for the servo we asked about. This is the
+        # key check the old code was missing — without it, mismatched replies
+        # got silently written into the wrong joint's cache.
+        actual_id = state.present_id[0] if state.present_id else None
+        if actual_id is not None and actual_id != servo_id:
+            self.get_logger().warn(
+                f'get_state ID mismatch: asked {servo_id}, got {actual_id}, dropping')
+            return None
+
+        if not state.position:
+            return None
+        return int(state.position[0])
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = ControllerManagerNode()
+    # MultiThreadedExecutor lets the get_state response arrive on a different
+    # thread while the refresh_positions callback is still waiting on its
+    # future. Otherwise the single spin thread deadlocks on itself.
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

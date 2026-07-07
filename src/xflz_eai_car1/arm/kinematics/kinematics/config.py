@@ -149,7 +149,7 @@ def derive_geometry(cal: RobotCalibration) -> DerivedGeometry:
         Y_TCP=Y_TCP,
 
         # Workspace
-        maxReach=L1 + L2,
+        maxReach=L1 + L2 + L_TCP,  # 修复：应包含 TCP 长度
         minReach=abs(L1 - L2)
     )
 

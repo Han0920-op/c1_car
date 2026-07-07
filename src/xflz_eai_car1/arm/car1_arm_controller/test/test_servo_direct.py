@@ -111,7 +111,12 @@ def recv_packet(ser, timeout=1.0, expected_func=None):
 
                         # 如果指定了期望的功能字，且当前包不匹配，继续读取下一个包
                         if expected_func is not None and func != expected_func:
-                            state = 0  # 重新开始，读取下一个包
+                            # 跳过非期望包：必须同时清空 frame/data_len/recv_count，
+                            # 否则残留数据会把下一个包的字节污染成假的帧头/长度。
+                            state = 0
+                            frame = []
+                            data_len = 0
+                            recv_count = 0
                             continue
 
                         return func, data

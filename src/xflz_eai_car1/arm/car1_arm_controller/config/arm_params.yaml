@@ -30,3 +30,9 @@
     # 运动参数
     default_duration: 2.0      # 默认运动时间（秒）
     gripper_duration: 1.0      # 夹爪运动时间（秒）
+
+    # 抓取参数
+    # tcp_link 定义位置到夹爪最前端还差 33mm，抓取时 TCP 要停高 33mm，
+    # 让指尖到达检测到的红块表面位置（否则指尖会撞地面/桌面）
+    gripper_depth: -0.033      # TCP 高于目标 33mm（负值 = 抬高）
+    pre_grasp_height: 0.03     # 预抓取高度（目标上方 3cm）

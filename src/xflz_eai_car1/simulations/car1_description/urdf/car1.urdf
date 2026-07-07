@@ -866,7 +866,7 @@
     name="camera_depth_joint"
     type="fixed">
     <origin
-      xyz="-0.0002257 0.00199994 0.02494901"
+      xyz="-0.0002257 -0.01744006 0.02494901"
       rpy="-1.57079706 -1.57079266 -1.56958489" />
     <parent
       link="camera_mount_link" />

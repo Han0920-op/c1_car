@@ -455,47 +455,64 @@ class Board:
         self.enable_recv = enable
 
     def _recv_task(self):
-        """Background thread: parse incoming serial packets."""
+        """Background thread: parse incoming serial packets.
+
+        Wrapped in a top-level try/except so a serial hiccup (e.g. another
+        process briefly opens the same tty) does NOT kill the receive thread.
+        If it dies, no bus_servo responses ever arrive again and every service
+        call times out — which is very hard to notice because the process
+        looks alive.
+        """
         while True:
-            if not self.enable_recv:
-                time.sleep(0.01)
-                continue
-            recv_data = self.port.read()
-            if not recv_data:
-                continue
-            for dat in recv_data:
-                if self.state == PacketState.STARTBYTE1:
-                    if dat == 0xAA:
-                        self.state = PacketState.STARTBYTE2
-                elif self.state == PacketState.STARTBYTE2:
-                    if dat == 0x55:
-                        self.state = PacketState.FUNCTION
-                    else:
+            try:
+                if not self.enable_recv:
+                    time.sleep(0.01)
+                    continue
+                recv_data = self.port.read()
+                if not recv_data:
+                    continue
+                for dat in recv_data:
+                    if self.state == PacketState.STARTBYTE1:
+                        if dat == 0xAA:
+                            self.state = PacketState.STARTBYTE2
+                    elif self.state == PacketState.STARTBYTE2:
+                        if dat == 0x55:
+                            self.state = PacketState.FUNCTION
+                        else:
+                            self.state = PacketState.STARTBYTE1
+                    elif self.state == PacketState.FUNCTION:
+                        if dat < int(PacketFunction.PACKET_FUNC_NONE):
+                            self.frame = [dat, 0]
+                            self.state = PacketState.LENGTH
+                        else:
+                            self.frame = []
+                            self.state = PacketState.STARTBYTE1
+                    elif self.state == PacketState.LENGTH:
+                        self.frame[1] = dat
+                        self.recv_count = 0
+                        if dat == 0:
+                            self.state = PacketState.CHECKSUM
+                        else:
+                            self.state = PacketState.DATA
+                    elif self.state == PacketState.DATA:
+                        self.frame.append(dat)
+                        self.recv_count += 1
+                        if self.recv_count >= self.frame[1]:
+                            self.state = PacketState.CHECKSUM
+                    elif self.state == PacketState.CHECKSUM:
+                        crc8 = _checksum_crc8(bytes(self.frame))
+                        if crc8 == dat:
+                            func = PacketFunction(self.frame[0])
+                            data = bytes(self.frame[2:])
+                            if func in self.parsers:
+                                self.parsers[func](data)
                         self.state = PacketState.STARTBYTE1
-                elif self.state == PacketState.FUNCTION:
-                    if dat < int(PacketFunction.PACKET_FUNC_NONE):
-                        self.frame = [dat, 0]
-                        self.state = PacketState.LENGTH
-                    else:
-                        self.frame = []
-                        self.state = PacketState.STARTBYTE1
-                elif self.state == PacketState.LENGTH:
-                    self.frame[1] = dat
-                    self.recv_count = 0
-                    if dat == 0:
-                        self.state = PacketState.CHECKSUM
-                    else:
-                        self.state = PacketState.DATA
-                elif self.state == PacketState.DATA:
-                    self.frame.append(dat)
-                    self.recv_count += 1
-                    if self.recv_count >= self.frame[1]:
-                        self.state = PacketState.CHECKSUM
-                elif self.state == PacketState.CHECKSUM:
-                    crc8 = _checksum_crc8(bytes(self.frame))
-                    if crc8 == dat:
-                        func = PacketFunction(self.frame[0])
-                        data = bytes(self.frame[2:])
-                        if func in self.parsers:
-                            self.parsers[func](data)
-                    self.state = PacketState.STARTBYTE1
+            except Exception as e:
+                # Reset the parser state so we don't try to resume mid-frame
+                # with corrupt bytes. Log lightly to avoid spam if the port
+                # is really gone.
+                self.state = PacketState.STARTBYTE1
+                self.frame = []
+                self.recv_count = 0
+                print(f'[_recv_task] serial error: {e}, will retry')
+                time.sleep(0.1)

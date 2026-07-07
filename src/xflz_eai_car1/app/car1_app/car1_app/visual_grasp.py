@@ -11,10 +11,11 @@ Uses eye-in-hand camera (mounted on arm_link4) with look-then-move strategy:
 """
 import enum
 import math
+import time
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, JointState
 from geometry_msgs.msg import PoseStamped, PointStamped
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
@@ -29,11 +30,13 @@ class State(enum.Enum):
     INIT = 0
     MOVE_TO_OBSERVE = 1
     WAIT_STABLE = 2
-    DETECT = 3
-    COMPUTE_TARGET = 4
-    PICK = 5
-    DONE = 6
-    FAILED = 7
+    REFRESH_JOINTS = 3   # Force servo readback so TF reflects real joint angles
+    DETECT = 4
+    WAIT_CONFIRMATION = 5  # Pause after detection for user review
+    COMPUTE_TARGET = 6
+    PICK = 7
+    DONE = 8
+    FAILED = 9
 
 
 class VisualGraspNode(Node):
@@ -83,6 +86,12 @@ class VisualGraspNode(Node):
         self.base_frame = self.get_parameter('base_frame').value
         self.dry_run = self.get_parameter('dry_run').value
 
+        # Wait for user confirmation after detection (for debugging)
+        self.wait_for_confirmation = self.declare_parameter('wait_for_confirmation', True).value
+
+        # Visualization (OpenCV windows)
+        self.enable_viz = self.declare_parameter('enable_viz', True).value
+
         # CV Bridge
         self.bridge = CvBridge()
 
@@ -107,6 +116,13 @@ class VisualGraspNode(Node):
         # Detection result
         self.detected_point_base = None
 
+        # Latest detection data (for visualization)
+        self._last_detection = None
+        self._last_tf_stamp = None
+
+        # Latest joint states (for visualization)
+        self._latest_joint_states = None
+
         # Pick service future (async)
         self._pick_future = None
 
@@ -122,6 +138,11 @@ class VisualGraspNode(Node):
         )
         self.camera_info_sub = self.create_subscription(
             CameraInfo, '/ascamera_hp60c/camera_publisher/depth0/camera_info', self.camera_info_callback, 10
+        )
+
+        # Subscribe to joint_states for visualization
+        self.joint_states_sub = self.create_subscription(
+            JointState, '/joint_states', self._joint_states_callback, 10
         )
 
         # Publisher for target pose
@@ -141,15 +162,45 @@ class VisualGraspNode(Node):
         self.debug_image_pub = self.create_publisher(Image, '/visual_grasp/debug_image', 1)
         self.mask_pub = self.create_publisher(Image, '/visual_grasp/mask', 1)
 
+        # Visualization publisher: composite image (RGB + Depth + Mask + annotations)
+        self.viz_pub = self.create_publisher(Image, '/visual_grasp/visualization', 1)
+
         # Service client for pick
         self.pick_client = self.create_client(Trigger, '/arm_controller/pick')
+
+        # Service client for on-demand servo readback. joint_states normally
+        # reflects commanded values (fast, avoids serial bus contention); we
+        # call this AFTER the arm has settled at the observation pose so TF
+        # reflects the real joint angles before we detect the object.
+        self.refresh_client = self.create_client(
+            Trigger, '/servo_controller/refresh_positions')
+        self._refresh_future = None
+        self._refresh_attempts = 0
+        self._refresh_max_attempts = 3
+
+        # User action state for WAIT_CONFIRMATION (triggered via ROS services)
+        self._user_action = None
+        self.create_service(
+            Trigger, '/visual_grasp/confirm', self._confirm_callback)
+        self.create_service(
+            Trigger, '/visual_grasp/skip', self._skip_callback)
+        self.create_service(
+            Trigger, '/visual_grasp/abort', self._abort_callback)
 
         # Timer for state machine (10 Hz)
         self.timer = self.create_timer(0.1, self.state_machine_tick)
 
+        # Visualization info (no OpenCV window needed — publishes to ROS topic)
+        if self.enable_viz:
+            self.get_logger().info('Visualization enabled (publishing to /visual_grasp/visualization)')
+
         self.get_logger().info('Visual grasp node started.')
         self.get_logger().info(f'Observation pose: [{self.observe_x}, {self.observe_y}, {self.observe_z}, {self.observe_pitch:.3f}]')
         self.get_logger().info(f'HSV range: {hsv_lower} - {hsv_upper}')
+
+    def _joint_states_callback(self, msg):
+        """Cache latest joint states for visualization."""
+        self._latest_joint_states = msg
 
     def rgb_callback(self, msg):
         """Cache RGB image."""
@@ -183,8 +234,12 @@ class VisualGraspNode(Node):
             self._handle_move_to_observe()
         elif self.state == State.WAIT_STABLE:
             self._handle_wait_stable()
+        elif self.state == State.REFRESH_JOINTS:
+            self._handle_refresh_joints()
         elif self.state == State.DETECT:
             self._handle_detect()
+        elif self.state == State.WAIT_CONFIRMATION:
+            self._handle_wait_confirmation()
         elif self.state == State.COMPUTE_TARGET:
             self._handle_compute_target()
         elif self.state == State.PICK:
@@ -193,6 +248,285 @@ class VisualGraspNode(Node):
             self._handle_done()
         elif self.state == State.FAILED:
             self._handle_failed()
+
+        # Publish visualization continuously (every tick, ~10Hz)
+        if self.enable_viz:
+            self._update_visualization_continuous()
+
+    def _format_joint_angles(self):
+        """Format current joint angles from latest joint_states."""
+        if self._latest_joint_states is None:
+            return "N/A"
+
+        js = self._latest_joint_states
+        arm_joints = ['arm_joint1', 'arm_joint2', 'arm_joint3', 'arm_joint4', 'arm_joint5']
+        angles = []
+        for jn in arm_joints:
+            if jn in js.name:
+                idx = js.name.index(jn)
+                angles.append(f"{math.degrees(js.position[idx]):+.0f}°")
+            else:
+                angles.append("?")
+
+        return ", ".join(angles)
+
+    def _update_visualization_continuous(self):
+        """
+        Continuously publish visualization (called every tick).
+        Shows current camera view even if detection hasn't succeeded yet.
+        """
+        if self.rgb_image is None:
+            return  # Need at least RGB
+
+        try:
+            h, w = self.rgb_image.shape[:2]
+
+            # === Column 1: RGB ===
+            rgb_viz = self.rgb_image.copy()
+            cv2.putText(rgb_viz, "RGB", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            # If we have a detection, overlay it with actual contour + bounding box
+            if self._last_detection is not None:
+                u, v = self._last_detection['centroid']
+                contour = self._last_detection.get('contour')
+                bbox = self._last_detection.get('bbox')
+
+                # Draw actual detected contour (green outline of the red cube)
+                if contour is not None:
+                    cv2.drawContours(rgb_viz, [contour], -1, (0, 255, 0), 2)
+
+                # Draw bounding box (yellow rectangle around detected region)
+                if bbox is not None:
+                    bx, by, bw, bh = bbox
+                    cv2.rectangle(rgb_viz, (bx, by), (bx+bw, by+bh), (0, 255, 255), 2)
+
+                # Draw large red cross at centroid (grasp point)
+                cv2.drawMarker(rgb_viz, (u, v), (0, 0, 255),
+                               cv2.MARKER_CROSS, 30, 3)
+                # Label it
+                cv2.putText(rgb_viz, "TARGET", (u+20, v-20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # === Column 2: Depth ===
+            if self.depth_image is not None:
+                depth_normalized = cv2.normalize(self.depth_image, None, 0, 255,
+                                                  cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                depth_color = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+                cv2.putText(depth_color, "Depth", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+                if self._last_detection is not None:
+                    u, v = self._last_detection['centroid']
+                    depth_z = self._last_detection['depth_z']
+                    contour = self._last_detection.get('contour')
+                    bbox = self._last_detection.get('bbox')
+
+                    # Draw actual detected contour (white outline)
+                    if contour is not None:
+                        cv2.drawContours(depth_color, [contour], -1, (255, 255, 255), 2)
+
+                    # Draw bounding box
+                    if bbox is not None:
+                        bx, by, bw, bh = bbox
+                        cv2.rectangle(depth_color, (bx, by), (bx+bw, by+bh), (0, 255, 255), 2)
+
+                    # Draw large white cross at centroid
+                    cv2.drawMarker(depth_color, (u, v), (255, 255, 255),
+                                   cv2.MARKER_CROSS, 30, 3)
+                    # Depth value label
+                    cv2.putText(depth_color, f"{depth_z*1000:.0f}mm",
+                                (u+20, v-25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (255, 255, 0), 2)
+            else:
+                # No depth image yet, show placeholder
+                depth_color = np.zeros((h, w, 3), dtype=np.uint8)
+                cv2.putText(depth_color, "Waiting for depth...", (10, h//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (128, 128, 128), 2)
+
+            # === Column 3: HSV Mask ===
+            # Generate mask on-the-fly (even if detection hasn't run yet)
+            hsv = cv2.cvtColor(self.rgb_image, cv2.COLOR_BGR2HSV)
+            mask = cv2.bitwise_or(
+                cv2.inRange(hsv, self.hsv_lower, self.hsv_upper),
+                cv2.inRange(hsv, self.hsv_lower2, self.hsv_upper2),
+            )
+            mask_color = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            cv2.putText(mask_color, "HSV Mask", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            if self._last_detection is not None:
+                u, v = self._last_detection['centroid']
+                # Draw large green cross
+                cv2.drawMarker(mask_color, (u, v), (0, 255, 0),
+                               cv2.MARKER_CROSS, 30, 3)
+                # Draw circle
+                cv2.circle(mask_color, (u, v), 15, (255, 255, 0), 2)
+
+            # === Resize and stack ===
+            scale = 0.666
+            new_h, new_w = int(h * scale), int(w * scale)
+            rgb_small = cv2.resize(rgb_viz, (new_w, new_h))
+            depth_small = cv2.resize(depth_color, (new_w, new_h))
+            mask_small = cv2.resize(mask_color, (new_w, new_h))
+            combined = np.hstack([rgb_small, depth_small, mask_small])
+
+            # === Top info bar ===
+            info_bar = np.zeros((60, combined.shape[1], 3), dtype=np.uint8)
+            if self._last_detection is not None:
+                u, v = self._last_detection['centroid']
+                depth_z = self._last_detection['depth_z']
+                info_text = (f"State: {self.state.name}  |  "
+                             f"Centroid: ({u}, {v}) px  |  "
+                             f"Depth: {depth_z*1000:.1f} mm")
+            else:
+                info_text = f"State: {self.state.name}  |  No detection yet"
+            cv2.putText(info_bar, info_text, (10, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+
+            # === Bottom coordinate bar ===
+            coord_bar = np.zeros((100, combined.shape[1], 3), dtype=np.uint8)
+
+            if self._last_detection is not None:
+                cam_xyz = self._last_detection['cam_xyz']
+                base_xyz = self._last_detection['base_xyz']
+                joint_str = self._format_joint_angles()
+
+                tf_age_str = "N/A"
+                if self._last_tf_stamp is not None:
+                    tf_age = (self.get_clock().now().nanoseconds -
+                              self._last_tf_stamp.sec * 1e9 -
+                              self._last_tf_stamp.nanosec) / 1e9
+                    tf_age_str = f"{tf_age:.3f}s"
+
+                coord_lines = [
+                    f"Camera: ({cam_xyz[0]:+.3f}, {cam_xyz[1]:+.3f}, {cam_xyz[2]:+.3f}) m",
+                    f"Base:   ({base_xyz[0]:+.3f}, {base_xyz[1]:+.3f}, {base_xyz[2]:+.3f}) m",
+                    f"Joints: [{joint_str}]  |  TF age: {tf_age_str}",
+                ]
+            else:
+                coord_lines = [
+                    "Camera: N/A",
+                    "Base:   N/A",
+                    "Waiting for detection...",
+                ]
+
+            y_off = 25
+            for line in coord_lines:
+                cv2.putText(coord_bar, line, (10, y_off),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                y_off += 30
+
+            # === Final composite ===
+            final = np.vstack([info_bar, combined, coord_bar])
+
+            # Publish
+            viz_msg = self.bridge.cv2_to_imgmsg(final, encoding='bgr8')
+            self.viz_pub.publish(viz_msg)
+
+        except Exception as e:
+            # Log error but don't crash the node
+            self.get_logger().error(f'Visualization failed: {e}', throttle_duration_sec=2.0)
+
+    def _update_visualization(self):
+        """
+        Update OpenCV visualization window (single window, 3-column layout).
+        Shows RGB + Depth + HSV Mask side-by-side with detection overlay.
+        """
+        if self.rgb_image is None or self.depth_image is None or self._last_detection is None:
+            return
+
+        centroid = self._last_detection['centroid']
+        depth_z = self._last_detection['depth_z']
+        cam_xyz = self._last_detection['cam_xyz']
+        base_xyz = self._last_detection['base_xyz']
+        mask = self._last_detection['mask']
+
+        u, v = centroid
+        h, w = self.rgb_image.shape[:2]
+
+        # === Column 1: RGB + Detection ===
+        rgb_viz = self.rgb_image.copy()
+        cv2.drawMarker(rgb_viz, (u, v), (0, 0, 255),
+                       cv2.MARKER_CROSS, 20, 2)
+        cv2.putText(rgb_viz, "RGB", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        # === Column 2: Depth (colormap) ===
+        # Normalize depth to 0-255 for visualization
+        depth_normalized = cv2.normalize(self.depth_image, None, 0, 255,
+                                          cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        depth_color = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+
+        # Mark same centroid (verifies D2C alignment)
+        cv2.drawMarker(depth_color, (u, v), (255, 255, 255),
+                       cv2.MARKER_CROSS, 20, 2)
+        cv2.putText(depth_color, f"{depth_z*1000:.0f}mm",
+                    (u+25, v-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 2)
+        cv2.putText(depth_color, "Depth", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # === Column 3: HSV Mask ===
+        mask_color = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        cv2.drawMarker(mask_color, (u, v), (0, 255, 0),
+                       cv2.MARKER_CROSS, 20, 2)
+        cv2.putText(mask_color, "HSV Mask", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        # === Resize columns for smaller display ===
+        # Original 640x480 → resize to 426x320 each column (1278 total width)
+        scale = 0.666
+        new_h, new_w = int(h * scale), int(w * scale)
+        rgb_small = cv2.resize(rgb_viz, (new_w, new_h))
+        depth_small = cv2.resize(depth_color, (new_w, new_h))
+        mask_small = cv2.resize(mask_color, (new_w, new_h))
+
+        # === Horizontal stack ===
+        combined = np.hstack([rgb_small, depth_small, mask_small])
+
+        # === Top info bar (60px) ===
+        info_bar = np.zeros((60, combined.shape[1], 3), dtype=np.uint8)
+        info_text = (f"State: {self.state.name}  |  "
+                     f"Centroid: ({u}, {v}) px  |  "
+                     f"Depth: {depth_z*1000:.1f} mm")
+        cv2.putText(info_bar, info_text, (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+
+        # === Bottom coordinate bar (100px) ===
+        coord_bar = np.zeros((100, combined.shape[1], 3), dtype=np.uint8)
+
+        joint_str = self._format_joint_angles()
+
+        # Calculate TF age if available
+        tf_age_str = "N/A"
+        if self._last_tf_stamp is not None:
+            tf_age = (self.get_clock().now().nanoseconds -
+                      self._last_tf_stamp.sec * 1e9 -
+                      self._last_tf_stamp.nanosec) / 1e9
+            tf_age_str = f"{tf_age:.3f}s"
+
+        coord_lines = [
+            f"Camera: ({cam_xyz[0]:+.3f}, {cam_xyz[1]:+.3f}, {cam_xyz[2]:+.3f}) m",
+            f"Base:   ({base_xyz[0]:+.3f}, {base_xyz[1]:+.3f}, {base_xyz[2]:+.3f}) m",
+            f"Joints: [{joint_str}]  |  TF age: {tf_age_str}",
+        ]
+
+        y_off = 25
+        for line in coord_lines:
+            cv2.putText(coord_bar, line, (10, y_off),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            y_off += 30
+
+        # === Final composite ===
+        final = np.vstack([info_bar, combined, coord_bar])
+
+        # Publish as ROS Image message (instead of cv2.imshow)
+        try:
+            viz_msg = self.bridge.cv2_to_imgmsg(final, encoding='bgr8')
+            self.viz_pub.publish(viz_msg)
+        except Exception as e:
+            self.get_logger().warn(f'Visualization publish failed: {e}')
 
     def _change_state(self, new_state):
         """Transition to new state."""
@@ -242,9 +576,77 @@ class VisualGraspNode(Node):
         """Wait for arm to reach observation pose and camera to stabilize."""
         elapsed = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
         if elapsed > 5.0:  # Increased from 3s to 5s for camera auto-exposure/white-balance
-            self.get_logger().info('Starting detection (arm stable, camera warmed up)...')
+            self.get_logger().info('Arm settled, refreshing servo positions...')
+            self._refresh_future = None
+            self._refresh_attempts = 0
+            self._change_state(State.REFRESH_JOINTS)
+
+    def _handle_refresh_joints(self):
+        """Force servo readback so TF reflects real angles before detection.
+
+        joint_states normally shows the commanded position. If a servo didn't
+        actually reach its target (blocked, torque limit, wrong IK solution)
+        the commanded values would give us a wrong TF and the object localisation
+        would be silently off. Refreshing here catches that.
+
+        Retries up to _refresh_max_attempts; on final failure we abort — better
+        to fail visibly than to grasp based on a wrong TF.
+        """
+        # First call: kick off async request
+        if self._refresh_future is None:
+            if not self.refresh_client.service_is_ready():
+                # Give discovery a moment; treat as one failed attempt after 2s.
+                elapsed = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
+                if elapsed > 2.0:
+                    self.get_logger().error(
+                        '/servo_controller/refresh_positions not available — TF may be stale')
+                    self._change_state(State.FAILED)
+                return
+            self._refresh_attempts += 1
+            self.get_logger().info(
+                f'refresh_positions attempt {self._refresh_attempts}/{self._refresh_max_attempts}')
+            self._refresh_future = self.refresh_client.call_async(Trigger.Request())
+            self._refresh_deadline = self.get_clock().now().nanoseconds / 1e9 + 12.0
+            return
+
+        # Waiting for response
+        if not self._refresh_future.done():
+            now_sec = self.get_clock().now().nanoseconds / 1e9
+            if now_sec > self._refresh_deadline:
+                self.get_logger().warn('refresh_positions client-side timeout')
+                self._refresh_future.cancel()
+                self._refresh_future = None
+                if self._refresh_attempts >= self._refresh_max_attempts:
+                    self.get_logger().error(
+                        'refresh_positions failed after retries; aborting grasp')
+                    self._change_state(State.FAILED)
+            return
+
+        # Response arrived
+        try:
+            resp = self._refresh_future.result()
+        except Exception as e:
+            self.get_logger().warn(f'refresh_positions raised: {e}')
+            resp = None
+        self._refresh_future = None
+
+        if resp and resp.success:
+            self.get_logger().info(f'refresh OK: {resp.message}')
+            # Give robot_state_publisher one tick to consume the fresh joint_states
+            # and update TF before we sample it in DETECT.
+            time.sleep(0.3)
             self.detection_attempts = 0
             self._change_state(State.DETECT)
+            return
+
+        # Partial / total failure
+        msg = resp.message if resp else 'no response'
+        self.get_logger().warn(f'refresh_positions not fully successful: {msg}')
+        if self._refresh_attempts >= self._refresh_max_attempts:
+            self.get_logger().error(
+                f'refresh_positions failed {self._refresh_max_attempts} times; aborting')
+            self._change_state(State.FAILED)
+        # else: fall through, next tick retries by leaving self._refresh_future = None
 
     def _handle_detect(self):
         """Detect object via HSV and depth."""
@@ -256,12 +658,19 @@ class VisualGraspNode(Node):
         if result is not None:
             self.detected_point_base = result
             self.get_logger().info(f'Object detected at base_link: [{result[0]:.3f}, {result[1]:.3f}, {result[2]:.3f}]')
+
+            # Visualization is handled by _update_visualization_continuous (called every tick)
+            # No need to call it here explicitly
+
             if self.dry_run:
                 self.get_logger().warn(
                     '[DRY_RUN] Localization only. Measure the cube with a ruler and compare to '
                     f'the base_link coords above [{result[0]:.3f}, {result[1]:.3f}, {result[2]:.3f}] '
                     '(target <1.5cm). NOT publishing target_pose, NOT calling pick. Stopping.')
                 self._change_state(State.DONE)
+            elif self.wait_for_confirmation:
+                # Pause for user to review visualization
+                self._change_state(State.WAIT_CONFIRMATION)
             else:
                 self._change_state(State.COMPUTE_TARGET)
         else:
@@ -290,6 +699,55 @@ class VisualGraspNode(Node):
             self.debug_image_pub.publish(self.bridge.cv2_to_imgmsg(img, encoding='bgr8'))
         except Exception as e:
             self.get_logger().error(f'debug image publish failed: {e}')
+
+    def _refresh_joints_sync(self):
+        """
+        Synchronously refresh servo positions before TF lookup.
+
+        Uses non-blocking call and waits with rclpy.spin_once() to keep executor alive.
+        Timeout: 1.5s per full 6-joint refresh. If timeout, use stale cache (log warning).
+
+        This is called from within _detect_and_localize (a timer callback), so we must
+        NOT block the executor with spin_until_future_complete (would deadlock).
+        Instead, we do a short bounded wait — if it doesn't return in time, the previous
+        joint_states / TF are used, which is a graceful degradation.
+        """
+        if not self.refresh_client.service_is_ready():
+            self.get_logger().warn(
+                'refresh_positions service not ready, TF may be stale',
+                throttle_duration_sec=5.0)
+            return
+
+        # Fire the request
+        future = self.refresh_client.call_async(Trigger.Request())
+
+        # Wait up to 1.5s for response, spinning the node so callbacks can run
+        deadline = self.get_clock().now().nanoseconds / 1e9 + 1.5
+        while self.get_clock().now().nanoseconds / 1e9 < deadline:
+            if future.done():
+                break
+            time.sleep(0.02)
+
+        if not future.done():
+            self.get_logger().warn(
+                'refresh_positions timed out — using stale TF',
+                throttle_duration_sec=5.0)
+            return
+
+        try:
+            resp = future.result()
+            if resp and resp.success:
+                self.get_logger().debug(f'refresh OK: {resp.message}')
+            else:
+                self.get_logger().warn(
+                    f'refresh partial: {resp.message if resp else "no response"}',
+                    throttle_duration_sec=5.0)
+        except Exception as e:
+            self.get_logger().warn(f'refresh raised: {e}', throttle_duration_sec=5.0)
+
+        # Give robot_state_publisher a moment to consume the new joint_states
+        # and update TF (typically 30-50ms is enough)
+        time.sleep(0.1)
 
     def _detect_and_localize(self):
         """
@@ -324,6 +782,11 @@ class VisualGraspNode(Node):
             self._publish_debug_image(self.rgb_image, None)
             return None
 
+        # Debug: print all contours
+        if len(contours) > 1:
+            areas = [cv2.contourArea(c) for c in contours]
+            self.get_logger().info(f'Found {len(contours)} contours, areas: {[f"{a:.0f}" for a in sorted(areas, reverse=True)[:5]]}')
+
         # Use largest contour
         largest = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(largest)
@@ -341,6 +804,10 @@ class VisualGraspNode(Node):
         u = M['m10'] / M['m00']
         v = M['m01'] / M['m00']
         u_int, v_int = int(round(u)), int(round(v))
+
+        # Debug: print bounding box to understand contour position
+        x, y, w_box, h_box = cv2.boundingRect(largest)
+        self.get_logger().info(f'Contour: area={area:.0f}, bbox=[x:{x}, y:{y}, w:{w_box}, h:{h_box}], centroid=({u_int},{v_int})')
 
         # Annotated debug image: RGB with detected contour + centroid marked.
         self._publish_debug_image(self.rgb_image, largest, (u_int, v_int))
@@ -402,6 +869,13 @@ class VisualGraspNode(Node):
         # hard-coded. /joint_states carries servo readback (real angles), so the TF tree
         # reflects the arm's actual pose. If the transform is unavailable, return None so
         # the caller retries -- never fall back to a stale/guessed pose.
+
+        # === Refresh joint positions IMMEDIATELY before TF lookup ===
+        # This ensures TF reflects the actual physical arm pose (not the commanded pose,
+        # which may differ due to IK inaccuracies or servo settling). Critical for accurate
+        # object localization in base_link frame.
+        self._refresh_joints_sync()
+
         try:
             # lookup_transform(target_frame, source_frame) returns the transform FROM source
             # TO target. To transform a point from camera_optical_frame to base_frame:
@@ -435,7 +909,93 @@ class VisualGraspNode(Node):
             f'cam_frame=({x_cam:.3f},{y_cam:.3f},{z_cam:.3f}) → '
             f'base_link=[{x_base:.3f},{y_base:.3f},{z_base:.3f}]')
 
+        # Save detection data for visualization
+        self._last_detection = {
+            'centroid': (u_int, v_int),
+            'depth_z': z_cam,
+            'cam_xyz': (x_cam, y_cam, z_cam),
+            'base_xyz': (x_base, y_base, z_base),
+            'mask': mask,  # Save mask for viz
+            'contour': largest,  # Save contour for viz (draws actual shape)
+            'bbox': cv2.boundingRect(largest),  # (x, y, w, h) for bounding box
+        }
+        self._last_tf_stamp = tf.header.stamp
+
         return (x_base, y_base, z_base)
+
+    def _confirm_callback(self, request, response):
+        """Service: user confirms detected target, continue to grasp."""
+        self._user_action = 'confirm'
+        response.success = True
+        response.message = 'Confirmed, will continue to grasp'
+        return response
+
+    def _skip_callback(self, request, response):
+        """Service: user skips this object."""
+        self._user_action = 'skip'
+        response.success = True
+        response.message = 'Skipped'
+        return response
+
+    def _abort_callback(self, request, response):
+        """Service: user aborts the grasp."""
+        self._user_action = 'abort'
+        response.success = True
+        response.message = 'Aborted'
+        return response
+
+    def _handle_wait_confirmation(self):
+        """
+        Pause after detection for user to review visualization.
+        Continuously re-detect to allow real-time adjustment of target position.
+
+        User triggers next action via ROS services (works over SSH, from launch, etc):
+          - Call /visual_grasp/confirm  → continue to grasp
+          - Call /visual_grasp/skip     → skip this object
+          - Call /visual_grasp/abort    → quit
+        """
+        if not hasattr(self, '_confirmation_printed'):
+            self.get_logger().info('=' * 60)
+            self.get_logger().info('=== PAUSED FOR REVIEW ===')
+            self.get_logger().info('Check visualization at /visual_grasp/visualization')
+            self.get_logger().info('Review:')
+            self.get_logger().info('  - RGB/Depth/Mask: Are the crosses on target center?')
+            self.get_logger().info('  - Bottom coords: Are base_link (x,y,z) reasonable?')
+            self.get_logger().info('  - You can MOVE the target, visualization updates in real-time')
+            self.get_logger().info('')
+            self.get_logger().info('Trigger next action via ROS services (in another terminal):')
+            self.get_logger().info('  Continue grasp: ros2 service call /visual_grasp/confirm std_srvs/srv/Trigger')
+            self.get_logger().info('  Skip object:    ros2 service call /visual_grasp/skip    std_srvs/srv/Trigger')
+            self.get_logger().info('  Abort:          ros2 service call /visual_grasp/abort   std_srvs/srv/Trigger')
+            self.get_logger().info('=' * 60)
+            self._confirmation_printed = True
+            # Reset user action flag
+            self._user_action = None
+
+        # Continuously re-detect to update visualization in real-time
+        if self.rgb_image is not None and self.depth_image is not None:
+            result = self._detect_and_localize()
+            if result is not None:
+                self.detected_point_base = result  # Update with latest detection
+
+        # Check if user triggered any service
+        if self._user_action == 'confirm':
+            self.get_logger().info('User confirmed, continuing to grasp...')
+            if self.detected_point_base is not None:
+                self.get_logger().info(f'Final target: base_link=[{self.detected_point_base[0]:.3f}, {self.detected_point_base[1]:.3f}, {self.detected_point_base[2]:.3f}]')
+            del self._confirmation_printed
+            self._user_action = None
+            self._change_state(State.COMPUTE_TARGET)
+        elif self._user_action == 'skip':
+            self.get_logger().warn('User skipped this object')
+            del self._confirmation_printed
+            self._user_action = None
+            self._change_state(State.DONE)
+        elif self._user_action == 'abort':
+            self.get_logger().warn('User aborted')
+            del self._confirmation_printed
+            self._user_action = None
+            self._change_state(State.FAILED)
 
     def _handle_compute_target(self):
         """Set arm_controller's pick_target WITHOUT moving the arm."""
