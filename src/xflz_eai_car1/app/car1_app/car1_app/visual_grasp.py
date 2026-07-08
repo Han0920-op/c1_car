@@ -15,6 +15,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from sensor_msgs.msg import Image, CameraInfo, JointState
 from geometry_msgs.msg import PoseStamped, PointStamped
 from std_srvs.srv import Trigger
@@ -27,16 +28,17 @@ from tf2_geometry_msgs import do_transform_point
 
 class State(enum.Enum):
     """State machine for visual grasp."""
-    INIT = 0
-    MOVE_TO_OBSERVE = 1
-    WAIT_STABLE = 2
-    REFRESH_JOINTS = 3   # Force servo readback so TF reflects real joint angles
-    DETECT = 4
-    WAIT_CONFIRMATION = 5  # Pause after detection for user review
-    COMPUTE_TARGET = 6
-    PICK = 7
-    DONE = 8
-    FAILED = 9
+    IDLE = 0             # Waiting for /visual_grasp/start service call
+    INIT = 1
+    MOVE_TO_OBSERVE = 2
+    WAIT_STABLE = 3
+    REFRESH_JOINTS = 4   # Force servo readback so TF reflects real joint angles
+    DETECT = 5
+    WAIT_CONFIRMATION = 6  # Pause after detection for user review
+    COMPUTE_TARGET = 7
+    PICK = 8
+    DONE = 9
+    FAILED = 10
 
 
 class VisualGraspNode(Node):
@@ -100,7 +102,10 @@ class VisualGraspNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # State machine
-        self.state = State.INIT
+        # Start in IDLE — waits for /visual_grasp/start service call to begin grasp.
+        # This makes the node long-running: after DONE/FAILED it returns to IDLE
+        # so the user can trigger another grasp without restarting the node.
+        self.state = State.IDLE
         self.state_start_time = self.get_clock().now()
         self.detection_attempts = 0
 
@@ -165,27 +170,47 @@ class VisualGraspNode(Node):
         # Visualization publisher: composite image (RGB + Depth + Mask + annotations)
         self.viz_pub = self.create_publisher(Image, '/visual_grasp/visualization', 1)
 
+        # Clients that we wait on inside timer callbacks MUST use a Reentrant
+        # callback group, otherwise their responses can't be delivered while
+        # the caller (a timer callback) is spinning-wait for the future.
+        self._client_cbg = ReentrantCallbackGroup()
+
         # Service client for pick
-        self.pick_client = self.create_client(Trigger, '/arm_controller/pick')
+        self.pick_client = self.create_client(
+            Trigger, '/arm_controller/pick', callback_group=self._client_cbg)
 
         # Service client for on-demand servo readback. joint_states normally
         # reflects commanded values (fast, avoids serial bus contention); we
         # call this AFTER the arm has settled at the observation pose so TF
         # reflects the real joint angles before we detect the object.
         self.refresh_client = self.create_client(
-            Trigger, '/servo_controller/refresh_positions')
+            Trigger, '/servo_controller/refresh_positions',
+            callback_group=self._client_cbg)
         self._refresh_future = None
         self._refresh_attempts = 0
         self._refresh_max_attempts = 3
 
         # User action state for WAIT_CONFIRMATION (triggered via ROS services)
         self._user_action = None
+        # User-facing services must use a ReentrantCallbackGroup on a separate
+        # thread from the state machine timer. Without this, ROS 2's default
+        # MutuallyExclusiveCallbackGroup would serialize the service handler
+        # BEHIND the running timer callback — and since the timer callback
+        # calls _refresh_joints_sync (which spins for up to 1.5s), the user's
+        # service call would visibly hang and never trigger the state change.
+        self._user_cbg = ReentrantCallbackGroup()
         self.create_service(
-            Trigger, '/visual_grasp/confirm', self._confirm_callback)
+            Trigger, '/visual_grasp/start', self._start_callback,
+            callback_group=self._user_cbg)
         self.create_service(
-            Trigger, '/visual_grasp/skip', self._skip_callback)
+            Trigger, '/visual_grasp/confirm', self._confirm_callback,
+            callback_group=self._user_cbg)
         self.create_service(
-            Trigger, '/visual_grasp/abort', self._abort_callback)
+            Trigger, '/visual_grasp/skip', self._skip_callback,
+            callback_group=self._user_cbg)
+        self.create_service(
+            Trigger, '/visual_grasp/abort', self._abort_callback,
+            callback_group=self._user_cbg)
 
         # Timer for state machine (10 Hz)
         self.timer = self.create_timer(0.1, self.state_machine_tick)
@@ -228,7 +253,9 @@ class VisualGraspNode(Node):
 
     def state_machine_tick(self):
         """Main state machine loop."""
-        if self.state == State.INIT:
+        if self.state == State.IDLE:
+            self._handle_idle()
+        elif self.state == State.INIT:
             self._handle_init()
         elif self.state == State.MOVE_TO_OBSERVE:
             self._handle_move_to_observe()
@@ -1060,25 +1087,90 @@ class VisualGraspNode(Node):
         self.get_logger().info('Calling /arm_controller/pick...')
         self._pick_future = self.pick_client.call_async(Trigger.Request())
 
+    def _handle_idle(self):
+        """
+        Idle state: waiting for /visual_grasp/start service call to trigger a grasp.
+
+        Emit a one-shot info log so the user knows the node is ready and waiting.
+        The visualization publisher keeps running (see state_machine_tick tail)
+        so you can still see the camera feed in rqt_image_view while idle.
+        """
+        if not hasattr(self, '_idle_printed'):
+            self.get_logger().info('=' * 60)
+            self.get_logger().info('Ready. Waiting for /visual_grasp/start service call...')
+            self.get_logger().info(
+                '  Trigger grasp: ros2 service call /visual_grasp/start std_srvs/srv/Trigger')
+            self.get_logger().info('=' * 60)
+            self._idle_printed = True
+        # No auto-transition; user triggers via _start_callback → state = INIT
+
     def _handle_done(self):
-        """Success state."""
+        """Grasp completed successfully — return to IDLE for the next one."""
+        self.get_logger().info('=' * 60)
         self.get_logger().info('Visual grasp completed successfully!')
-        # Stop the node
-        raise SystemExit(0)
+        self.get_logger().info('Returning to IDLE. Call /visual_grasp/start for next grasp.')
+        self.get_logger().info('=' * 60)
+        self._reset_for_next_run()
+        self._change_state(State.IDLE)
 
     def _handle_failed(self):
-        """Failure state."""
+        """Grasp failed — log then return to IDLE so the user can retry."""
+        self.get_logger().error('=' * 60)
         self.get_logger().error('Visual grasp failed')
-        # Stop the node
-        raise SystemExit(1)
+        self.get_logger().error('Returning to IDLE. Call /visual_grasp/start to retry.')
+        self.get_logger().error('=' * 60)
+        self._reset_for_next_run()
+        self._change_state(State.IDLE)
+
+    def _reset_for_next_run(self):
+        """Clear per-run state so the next grasp starts fresh."""
+        self.detected_point_base = None
+        self._last_detection = None
+        self._last_tf_stamp = None
+        self._pick_future = None
+        self._refresh_future = None
+        self._refresh_attempts = 0
+        self.detection_attempts = 0
+        self._user_action = None
+        # Also clear "one-shot" print flags on stateful handlers
+        for attr in ('_confirmation_printed', '_idle_printed'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+    def _start_callback(self, request, response):
+        """Service /visual_grasp/start — kick off a grasp attempt.
+
+        Only accepts the trigger when we're in IDLE; otherwise returns busy so
+        the caller knows a grasp is already in progress.
+        """
+        if self.state != State.IDLE:
+            response.success = False
+            response.message = f'Busy, currently in state {self.state.name}'
+            return response
+
+        # Camera info arrival gates INIT → MOVE_TO_OBSERVE, so as long as the
+        # camera is publishing, this will proceed. If not, INIT will just wait.
+        self.get_logger().info('/visual_grasp/start called — starting grasp sequence')
+        if hasattr(self, '_idle_printed'):
+            delattr(self, '_idle_printed')
+        self._change_state(State.INIT)
+        response.success = True
+        response.message = 'Started'
+        return response
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = VisualGraspNode()
+    # MultiThreadedExecutor lets service callbacks (start/confirm/skip/abort)
+    # be processed while the timer callback is running, and lets
+    # _refresh_joints_sync's internal call_async future actually be delivered.
+    from rclpy.executors import MultiThreadedExecutor
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt, SystemExit):
+        executor.spin()
+    except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()

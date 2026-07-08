@@ -26,6 +26,7 @@
     # 夹爪参数
     gripper_open_angle: 0.8    # 张开角度（弧度）
     gripper_close_angle: 0.0   # 闭合角度（弧度）
+    gripper_duration: 2.0      # 夹爪运动时间（秒）- 增大到 2s 确保舵机到位
 
     # 运动参数
     default_duration: 2.0      # 默认运动时间（秒）

@@ -2287,7 +2287,7 @@ ros2 launch car1_app track_and_grab.launch.py
 > **所需时间**：30-60 分钟  
 > **硬件要求**：HP60C 深度相机 + 机械臂 + 红色物体（30~50mm）  
 > **前置条件**：完成 Level 1.7（交互式 IK 验证通过）  
-> **当前状态（2026-06-18）**：机械臂/相机/TF/检测各环节已验证通过，**端到端抓取卡在观察姿态物理遮挡深度相机**（见 5.6.10）
+> **当前状态（2026-07-08）**：**一站式启动 + 重复抓取已完成**，支持服务触发的自动化抓取流程
 
 #### 5.6.1 功能概述
 
@@ -2295,8 +2295,15 @@ ros2 launch car1_app track_and_grab.launch.py
 
 ```
 观察姿态(俯视) → HSV 检测 → 深度+TF 算 base_link 坐标
-   → 发布 target_pose → 调用 /arm_controller/pick → 完成
+   → 暂停确认（可选） → 调用 /arm_controller/pick → 完成 → 回 IDLE
 ```
+
+**核心特性**（2026-07-08 更新）：
+- **一站式启动**：一条命令启动所有依赖（bringup + arm_controller + depth_camera + rqt_image_view）
+- **长驻式节点**：启动后保持 IDLE 状态，通过 `/visual_grasp/start` 服务触发抓取
+- **重复抓取**：抓取完成后自动回到 IDLE，可连续触发多次抓取，无需重启
+- **实时可视化**：三栏并排（RGB + Depth + HSV Mask）+ 坐标信息，通过 rqt 远程查看
+- **服务化控制**：所有交互通过 ROS 服务（start/confirm/skip/abort），SSH 远程友好
 
 **为什么不做持续视觉伺服**：相机挂在机械臂末端 `arm_link4`（eye-in-hand）,下压抓取时相机会跟着进去,失去目标视野。look-then-move 在视野好的高位看准,再 IK 下去抓,工程上最稳。
 
@@ -2304,7 +2311,309 @@ ros2 launch car1_app track_and_grab.launch.py
 
 **pitch 约定(与 ik_analytical/web_server 一致)**: `0=朝上, 90°=水平, 180°=夹爪朝下`。抓取用 180°。
 
-#### 5.6.2 启动文件功能介绍
+#### 5.6.2 一站式启动（推荐方式）
+
+**单条命令启动所有组件**：
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
+
+# 一键启动（默认配置）
+ros2 launch car1_app visual_grasp.launch.py
+```
+
+**启动内容**（自动分阶段启动，带延迟保证依赖就绪）：
+```
+t=0s    bringup（base_driver + servo_controller + robot_state_publisher）
+t=5s    arm_controller（IK + pick/place 服务）
+t=8s    depth_camera（HP60C 驱动）
+t=12s   visual_grasp 节点（IDLE 等待触发）
+t=14s   rqt_image_view（可视化窗口，自动打开）
+```
+
+**可选参数**（按需覆盖）：
+
+```bash
+# 如果某些组件已经在运行，可以单独关闭
+ros2 launch car1_app visual_grasp.launch.py start_bringup:=false
+
+# 可用参数：
+# - start_bringup:=false    # 跳过 bringup（如已在别处启动）
+# - start_arm:=false        # 跳过 arm_controller
+# - start_camera:=false     # 跳过 depth_camera
+# - start_rqt:=false        # 不打开 rqt 可视化窗口
+# - wait_for_confirmation:=false  # 检测后直接抓取，不暂停确认
+# - dry_run:=true           # 只检测不抓取（调试用）
+```
+
+**启动成功标志**：
+
+终端日志最后会显示：
+```
+[visual_grasp-11] ============================================================
+[visual_grasp-11] Ready. Waiting for /visual_grasp/start service call...
+[visual_grasp-11]   Trigger grasp: ros2 service call /visual_grasp/start std_srvs/srv/Trigger
+[visual_grasp-11] ============================================================
+[visual_grasp-11] Camera intrinsics: fx=594.5, fy=594.8, cx=350.3, cy=237.5
+```
+
+同时 rqt_image_view 窗口自动打开，显示实时三栏可视化。
+
+#### 5.6.3 重复抓取工作流
+
+**第一次抓取**：
+
+```bash
+# 在桌面放置红色物体（机械臂前方 20-30cm）
+
+# 另开终端，触发抓取
+ros2 service call /visual_grasp/start std_srvs/srv/Trigger
+```
+
+visual_grasp 会自动执行：
+```
+IDLE → INIT → MOVE_TO_OBSERVE → WAIT_STABLE → REFRESH_JOINTS 
+  → DETECT → WAIT_CONFIRMATION（暂停）
+```
+
+**观察可视化**（rqt_image_view 窗口）：
+- **RGB 栏**：检测框（黄色）、轮廓（绿色）、质心十字（红色）
+- **Depth 栏**：深度伪彩色图、质心十字（白色）、深度值标注
+- **Mask 栏**：HSV 匹配区域（白色）
+- **底部坐标**：
+  - `Camera: (x, y, z) m` — 红块在相机坐标系的位置
+  - `Base: (x, y, z) m` — 红块在 base_link 的坐标（**抓取目标**）
+  - `Joints: [j1°, j2°, ..., j5°]` — 当前关节角
+  - `TF age: X.XXs` — TF 数据新鲜度
+
+**确认坐标后触发抓取**：
+
+```bash
+# 检查 Base 坐标是否合理（x ≈ 0.2-0.3, y ≈ ±0.05, z ≈ 0.01-0.03）
+# 确认后触发抓取
+ros2 service call /visual_grasp/confirm std_srvs/srv/Trigger
+```
+
+机械臂自动执行：
+```
+COMPUTE_TARGET → PICK → DONE → 回到 IDLE
+```
+
+**第二次及后续抓取**：
+
+```bash
+# 放置新的红色物体
+
+# 再次触发（无需重启任何节点）
+ros2 service call /visual_grasp/start std_srvs/srv/Trigger
+
+# 确认
+ros2 service call /visual_grasp/confirm std_srvs/srv/Trigger
+```
+
+**跳过或中止**：
+
+```bash
+# 检测后不想抓这个物体，跳过
+ros2 service call /visual_grasp/skip std_srvs/srv/Trigger
+
+# 紧急中止
+ros2 service call /visual_grasp/abort std_srvs/srv/Trigger
+```
+
+#### 5.6.4 无确认模式（自动抓取）
+
+如果坐标已经验证准确，可以关闭确认环节：
+
+```bash
+# 停掉当前 launch（Ctrl+C）
+# 重启时加参数
+ros2 launch car1_app visual_grasp.launch.py wait_for_confirmation:=false
+```
+
+这样每次调用 `/visual_grasp/start` 后，检测成功就直接抓取，无需手动 confirm。
+
+#### 5.6.5 实时可视化说明
+
+**可视化布局**（`/visual_grasp/visualization` 话题）：
+
+```
+┌────────────────────────────────────────────────────────┐
+│ State: WAIT_CONFIRMATION | Centroid: (u,v) | Depth: Xmm │  ← 顶部状态栏
+├────────────┬────────────┬─────────────────────────────┤
+│ RGB        │ Depth      │ HSV Mask                    │
+│ + 检测轮廓 │ + 深度伪彩 │ + 匹配区域                  │  ← 三栏并排
+│ + BBox     │ + 质心十字 │ + 质心十字                  │
+│ + 质心十字 │ + 深度值   │                             │
+│ + TARGET   │            │                             │
+└────────────┴────────────┴─────────────────────────────┘
+│ Camera: (x, y, z) m                                    │  ← 底部坐标栏
+│ Base:   (x, y, z) m                                    │
+│ Joints: [j1°, j2°, j3°, j4°, j5°]  |  TF age: 0.05s   │
+└────────────────────────────────────────────────────────┘
+```
+
+**关键信息判读**：
+
+| 元素 | 用途 |
+|------|------|
+| `State` | 定位当前状态（IDLE/DETECT/WAIT_CONFIRMATION/PICK） |
+| `Centroid: (u, v)` | 像素坐标，验证检测中心 |
+| `Depth: Xmm` | 质心处深度，用尺子对比验证 |
+| RGB 红十字 vs Depth 白十字 | 对齐判断（偏差 <5px 正常） |
+| HSV Mask 白色区域 | 判断阈值是否合适（太宽=背景污染，太窄=红块缺失） |
+| `Base: (x, y, z)` | **核心坐标**，用尺子实测验证（x=前方距离, y=左右偏移, z=高度） |
+| `TF age` | <0.2s 正常，>0.5s 说明 joint_states 更新慢 |
+
+**如果 rqt 窗口未自动打开或需要手动启动**：
+
+```bash
+ros2 run rqt_image_view rqt_image_view /visual_grasp/visualization
+```
+
+#### 5.6.6 状态机流程
+
+```
+IDLE（待命）
+  ↓ 收到 /visual_grasp/start 服务调用
+INIT → MOVE_TO_OBSERVE → WAIT_STABLE(5s) → REFRESH_JOINTS
+  → DETECT → WAIT_CONFIRMATION（暂停，等 confirm/skip/abort）
+  ↓ 收到 /visual_grasp/confirm
+COMPUTE_TARGET → PICK → DONE → 回到 IDLE（可再次触发）
+```
+
+**关键改进**（2026-07-08）：
+- **IDLE 状态**：长驻等待，不再一次性运行后退出
+- **REFRESH_JOINTS**：检测前同步读取真实舵机位置，确保 TF 准确
+- **服务化交互**：所有触发通过 ROS 服务，解决 SSH 下键盘输入问题
+- **自动回 IDLE**：DONE/FAILED 后自动重置状态，支持重复抓取
+
+#### 5.6.7 可调参数
+
+在 launch 文件中预设的参数（可通过 launch 参数覆盖）：
+
+```python
+# 观察姿态 [x, y, z, pitch(rad)]，pitch=π 表示夹爪朝下
+observe_pose: [0.20, 0.0, 0.22, 3.14159]
+
+# 红色 HSV 阈值（双区间，覆盖 H=0-15 和 H=160-180）
+target_color_hsv_lower: [0, 100, 80]
+target_color_hsv_upper: [15, 255, 255]
+target_color_hsv_lower2: [160, 100, 80]
+target_color_hsv_upper2: [180, 255, 255]
+
+# 检测重试次数
+max_detection_attempts: 10
+
+# 其他
+dry_run: false                # true=只检测不抓取
+enable_viz: true              # 发布可视化图像
+wait_for_confirmation: true   # 检测后暂停确认
+```
+
+**修改方式**（编辑 launch 文件或运行时覆盖）：
+
+```bash
+# 运行时覆盖示例（不推荐，参数较多）
+ros2 launch car1_app visual_grasp.launch.py \
+  wait_for_confirmation:=false \
+  dry_run:=true
+```
+
+推荐直接编辑 `app/car1_app/launch/visual_grasp.launch.py` 文件中的参数。
+
+#### 5.6.8 分层验证（逐环节排查）
+
+**第 1 层：相机话题**
+```bash
+ros2 topic list | grep ascamera
+ros2 topic hz /ascamera_hp60c/camera_publisher/rgb0/image  # 等≥10秒，应~11Hz
+ros2 topic echo /ascamera_hp60c/camera_publisher/depth0/camera_info --once
+```
+
+**第 2 层：可视化窗口**
+- rqt_image_view 自动打开
+- 能看到红色物体
+- RGB/Depth/Mask 三栏都有内容
+
+**第 3 层：TF 链路**
+```bash
+ros2 run tf2_ros tf2_echo base_link camera_depth_optical_frame
+# 应持续打印变换，且随机械臂姿态变化
+```
+
+**第 4 层：检测功能**
+- 触发 start 后进入 WAIT_CONFIRMATION
+- RGB 栏有黄色检测框框住红块
+- Base 坐标显示合理值（x ≈ 0.2-0.3, z ≈ 0.01-0.03）
+
+**第 5 层：完整抓取**
+- confirm 后机械臂下压
+- 夹爪闭合
+- 提起物体
+- 回到 IDLE
+
+#### 5.6.9 常见问题
+
+| 现象 | 原因 | 解决方案 |
+|------|------|---------|
+| 启动卡住 | 依赖未就绪 | 等待足够时间（~15秒），看日志定位哪个组件未启动 |
+| rqt 窗口未打开 | 环境问题 | 手动启动：`ros2 run rqt_image_view rqt_image_view /visual_grasp/visualization` |
+| 可视化全黑 | 相机推流延迟 | 等待 10-15 秒，相机按需推流 |
+| 检测不到红色 | HSV 阈值不合适 | 看 Mask 栏，调整 launch 文件中的 HSV 参数 |
+| Base z 坐标异常大（>0.1m） | joint_states 不准 | 手动调用：`ros2 service call /servo_controller/refresh_positions std_srvs/srv/Trigger` |
+| confirm 服务调用卡住 | 旧版本 bug（已修复） | 确认使用 2026-07-08 之后的版本，callback group 已修复 |
+| 夹爪不张开 | gripper_duration 不够 | 见 5.6.17，增大 `arm_params.yaml` 中的 `gripper_duration: 2.0` |
+| 夹爪撞桌面 | TCP 偏移未补偿 | 见 5.6.17，设置 `gripper_depth: -0.033` |
+
+#### 5.6.10 架构说明（可选阅读）
+
+**一站式 launch 的实现**：
+
+- 使用 `IncludeLaunchDescription` 复用现有 launch 文件
+- 使用 `TimerAction` 实现阶段性延迟启动（避免竞态）
+- 使用 `launch_arguments` 显式传参避免参数名冲突（如 `start_bringup`）
+- `rqt_image_view` 用 `ExecuteProcess` 启动并传入话题参数
+
+**重复抓取的实现**：
+
+- 状态机增加 `IDLE` 状态
+- `DONE` 和 `FAILED` 不再 `raise SystemExit`，而是 `_change_state(State.IDLE)`
+- `_reset_for_next_run()` 清空 per-run 状态（检测结果、future、attempts）
+- 用户服务（start/confirm/skip/abort）使用独立 `ReentrantCallbackGroup` 避免阻塞
+- `main()` 使用 `MultiThreadedExecutor` 支持并发回调
+
+**服务化交互的原因**：
+
+- ROS launch 重定向 stdin，`select.select([sys.stdin], ...)` 检测不到键盘输入
+- ROS 服务通过网络调用，SSH 远程、后台运行、自动化脚本都友好
+- 服务调用有返回值（success/message），便于脚本判断
+
+#### 5.6.11 前置修改总结（已完成）
+
+以下底层 bug 已在 2026-06~07 修复，首次使用前需确保重新编译：
+
+| 组件 | 关键改动 |
+|------|---------|
+| `servo_controller` | 按需读回架构 + `refresh_positions` 服务 + callback group 修复 |
+| `base_driver` | `_recv_task` 异常兜底 + 响应包字节布局修正 |
+| `arm_controller` | IK 改用 `ik_analytical.py` + pitch 约定对齐 + gripper_depth 参数 |
+| `depth_camera.launch.py` | 去掉 remap（保留原生话题名） |
+| `visual_grasp.py` | IDLE 状态机 + 服务化控制 + 三栏可视化 + 黑帧跳过 |
+| `visual_grasp.launch.py` | 一站式启动 + TimerAction 延迟 + rqt 自动打开 |
+| `car1.urdf` | 相机光心标定（camera_depth_joint y 偏移） |
+| `arm_params.yaml` | gripper_depth/gripper_duration 参数 |
+
+```bash
+# 确保重新编译
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select \
+  car1_base_driver car1_servo_controller car1_arm_controller \
+  car1_peripherals car1_description car1_app --symlink-install
+source install/setup.bash
+```
 
 视觉抓取系统需要 5 个 launch 文件协同工作，每个文件负责系统的一部分功能：
 
@@ -2527,529 +2836,26 @@ ros2 run car1_app visual_grasp
 ```
 
 ---
-
-#### 5.6.3 启动顺序与依赖关系
-
-**推荐启动顺序**（5 个终端，逐个启动，中间留 2-3 秒）：
-
-```
-终端1: bringup.launch.py
-         ↓ (等待 init_finish)
-终端2: arm_controller.launch.py
-         ↓ (等待 arm_controller 服务就绪)
-终端3: depth_camera.launch.py
-         ↓ (等待相机话题发布)
-终端4: rsp_only.launch.py (或在终端5启动 visual_grasp.launch.py 时自动启动)
-         ↓ (等待 TF 树发布)
-终端5: visual_grasp (节点或 launch 文件)
-```
-
-**依赖关系**：
-- `arm_controller` 依赖 `bringup` 的 `/car1_base_driver/bus_servo/set_position` 服务
-- `robot_state_publisher` (rsp_only) 依赖 `bringup` 的 `/joint_states` 话题
-- `visual_grasp` 依赖：
-  - `depth_camera` 的相机话题
-  - `arm_controller` 的 `/arm_controller/pick` 服务
-  - `robot_state_publisher` 的 TF 树（`base_link` → `camera_depth_optical_frame`）
-
-**启动脚本示例**：
-```bash
-#!/bin/bash
-# 一键启动视觉抓取系统（示例）
-
-# 终端1: bringup
-gnome-terminal -- bash -c "source /home/iflytek/ros2_ws/install/setup.bash; \
-  ros2 launch car1_bringup bringup.launch.py; exec bash"
-
-sleep 5
-
-# 终端2: arm_controller
-gnome-terminal -- bash -c "source /home/iflytek/ros2_ws/install/setup.bash; \
-  ros2 launch car1_arm_controller arm_controller.launch.py; exec bash"
-
-sleep 3
-
-# 终端3: depth_camera
-gnome-terminal -- bash -c "source /home/iflytek/ros2_ws/install/setup.bash; \
-  ros2 launch car1_peripherals depth_camera.launch.py; exec bash"
-
-sleep 3
-
-# 终端4+5: visual_grasp.launch.py（包含 rsp_only + visual_grasp）
-gnome-terminal -- bash -c "source /home/iflytek/ros2_ws/install/setup.bash; \
-  ros2 launch car1_app visual_grasp.launch.py; exec bash"
-```
-
----
-
-#### 5.6.4 前置修改说明
-
-调试 Level 4 时修复了一连串底层 bug(详见 TODO.md)。**首次使用前必须重新编译并重启 bringup**:
-
-| 文件 | 改动 |
-|------|------|
-| `car1_servo_controller/.../joint_position_controller.py` | 角度量程 240°→270°,与 transform.py 一致;读取方向去掉限位钳位 |
-| `car1_servo_controller/.../controller_manager_node.py` | joint_states 改为主线程 timer 异步回读舵机实际位置(20Hz, round-robin) |
-| `car1_base_driver/.../board_sdk.py` | 修正 `_bus_servo_read` 响应字节布局(原只有 ID5 能读) |
-| `car1_servo_controller/config/servo_controller.yaml` | arm 关节限位放宽到 500-2500 硬件极限 |
-| `car1_arm_controller/.../arm_controller.py` | IK 改用 `ik_analytical.py`(含 elbow 分支+PHI补偿);pitch 约定对齐 |
-| `car1_peripherals/.../depth_camera.launch.py` | **去掉 remap 和自定义 node 名**(remap 会破坏相机推流) |
-| `car1_app/.../visual_grasp.py` | 订阅相机原生话题;跳过黑帧;深度采样改整轮廓 |
-
-```bash
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --packages-select car1_servo_controller car1_base_driver car1_arm_controller car1_peripherals car1_app
-source install/setup.bash
-```
-
-#### 5.6.5 启动步骤（5 个终端，逐个启动）
-
-每个终端都先 `cd ~/ros2_ws && source install/setup.bash`。
-
-```bash
-# 终端1: 底盘 + 舵机驱动(含 joint_states 回读)
-ros2 launch car1_bringup bringup.launch.py
-
-# 终端2: 机械臂控制器(提供 /arm_controller/pick)
-ros2 launch car1_arm_controller arm_controller.launch.py
-
-# 终端3: 深度相机(原生话题,绝不能 remap)
-ros2 launch car1_peripherals depth_camera.launch.py
-
-# 终端4: robot_state_publisher(发布 TF 树,visual_grasp 定位依赖它)
-ros2 launch car1_app rsp_only.launch.py
-
-# 终端5: 视觉抓取主节点
-ros2 run car1_app visual_grasp
-```
-
-桌上放红块在机械臂前方 15-25cm。
-
-> **重要**:必须按 1→2→3→4→5 顺序,中间留 2-3 秒。终端2 等终端1 的 init_finish;终端4 的 TF 依赖终端1 的 joint_states;终端5 等终端2/3/4 全部就绪。
->
-> **相机话题是原生路径**(无 remap):
-> ```
-> /ascamera_hp60c/camera_publisher/rgb0/image         # RGB
-> /ascamera_hp60c/camera_publisher/depth0/image_raw   # 深度
-> /ascamera_hp60c/camera_publisher/depth0/camera_info # 内参
-> /ascamera_hp60c/camera_publisher/depth0/points      # 点云
-> ```
-
-#### 5.6.6 状态机流程
-
-```
-INIT → MOVE_TO_OBSERVE → WAIT_STABLE(3s) → DETECT
-   → COMPUTE_TARGET → PICK → DONE / FAILED
-```
-
-**预期日志**：
-```
-[INFO] Camera intrinsics: fx=594.5, fy=594.8, cx=350.3, cy=237.5
-[INFO] State: INIT -> MOVE_TO_OBSERVE
-[INFO] Published observation pose: x=0.2, y=0.0, z=0.22, pitch=180.0°
-[INFO] State: MOVE_TO_OBSERVE -> WAIT_STABLE
-[INFO] Arm stabilized, starting detection...
-[INFO] State: WAIT_STABLE -> DETECT
-[INFO] Object detected at base_link: [0.20, 0.01, 0.00]
-[INFO] State: DETECT -> COMPUTE_TARGET
-[INFO] State: COMPUTE_TARGET -> PICK
-[INFO] Calling /arm_controller/pick...
-[INFO] Pick completed successfully
-```
-
-#### 5.6.7 可调参数
-
-在 `visual_grasp` 启动时通过 `--ros-args -p` 覆盖:
-
-| 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `observe_pose` | `[0.20, 0.0, 0.22, 3.14159]` | 观察姿态 [x, y, z, pitch(rad)]。pitch=π=夹爪朝下 |
-| `target_color_hsv_lower` | `[0, 100, 80]` | 红色 HSV 下界 |
-| `target_color_hsv_upper` | `[10, 255, 255]` | 红色 HSV 上界 |
-| `max_detection_attempts` | `5` | 检测重试次数 |
-| `verify_after_pick` | `false` | 抓取后是否回观察姿态二次验证 |
-
-```bash
-# 例: 改观察姿态 + 追蓝色
-ros2 run car1_app visual_grasp --ros-args \
-  -p observe_pose:='[0.18, 0.0, 0.24, 3.14159]' \
-  -p target_color_hsv_lower:='[100, 100, 80]' \
-  -p target_color_hsv_upper:='[130, 255, 255]'
-```
-
-#### 5.6.8 分层验证（逐环节，出问题好定位）
-
-**第 1 层：相机话题与内参**(注意原生话题路径)
-```bash
-ros2 topic list | grep ascamera
-ros2 topic hz /ascamera_hp60c/camera_publisher/rgb0/image     # 等≥10秒,应~11Hz
-ros2 topic echo /ascamera_hp60c/camera_publisher/depth0/camera_info --once   # k 数组有 fx/fy/cx/cy
-```
-
-> 相机驱动**按需推流**: 没订阅者时日志会打 `stop streaming`(正常),一旦有订阅(hz/visual_grasp)1~1.5 秒后自动 `start streaming`。所以 hz 要等够 10 秒,别立刻 Ctrl+C。
-
-**第 2 层：图像可视化**
-```bash
-# venv 里缺 PyQt5 时,先把系统 PyQt5 软链接进 venv(勿 pip 编译,会 OOM):
-#   ln -s /usr/lib/python3/dist-packages/PyQt5 ~/ros2_venv/lib/python3.10/site-packages/
-ros2 run rqt_image_view rqt_image_view
-# 选 /ascamera_hp60c/camera_publisher/rgb0/image,把红块放进视野
-```
-
-**第 3 层：TF 链路**
-```bash
-ros2 run tf2_ros tf2_echo base_link camera_depth_optical_frame
-# 应持续打印 Translation/Rotation,且随机械臂姿态变化
-```
-
-**第 4 层：joint_states 实际回读**
-```bash
-ros2 topic echo /joint_states --once
-# position 应反映实际舵机位置;与 interactive_ik_test.py --direct 读回 PWM 转角度对比应一致
-```
-
-**第 5 层：完整抓取**
-```bash
-ros2 run car1_app visual_grasp
-# 观察日志: 抬到观察姿态 → 检测 → 下压抓取 → 提升
-```
-
-#### 5.6.9 故障排查
-
-| 现象 | 检查命令 | 解决方向 |
-|------|---------|---------|
-| 相机话题无数据 | `ros2 topic hz /ascamera_hp60c/camera_publisher/rgb0/image`(等10秒) | 别用 remap 的话题;确认订阅触发推流 |
-| RGB 全黑 | 抓多帧看亮度 | 第1帧是黑的(自动曝光),visual_grasp 已自动跳过 |
-| 检测不到红色 | rqt 看 RGB | 调 HSV 阈值;确认红块在视野且光照足 |
-| **深度全 0 / "No valid depth"** | 见 5.6.10 | **观察姿态物理遮挡，当前已知卡点** |
-| TF 变换失败 | `ros2 run tf2_tools view_frames` | 终端4 的 rsp_only 没起来 |
-| pick 服务超时 | `ros2 service list \| grep pick` | 终端2 arm_controller 没启动 |
-| IK 无解 / limit violation | 看日志 | 物体超工作空间;换近点位置 |
-| 夹爪没夹住 | — | 调 arm_controller 的 `gripper_depth` 参数 |
-
-#### 5.6.10 ⚠️ 当前已知卡点：观察姿态物理遮挡深度相机
-
-**端到端抓取尚未通过**，卡在深度定位。已确认是**物理遮挡问题，非配置或代码 bug**。
-
-**问题描述**（2026-06-18 确认）：
-
-在观察姿态 `[0.2, 0.0, 0.22, π]` 时，机械臂/夹爪物理遮挡了深度相机（HP60C）的红外投影器视野，导致桌面物体位置的深度数据无法获取。
-
-**实验验证**：
-- 单独启动相机驱动（无机械臂）：深度数据正常，覆盖率 ~54%
-- 机械臂移动到观察姿态后：
-  - 图像上半部分（0-240 行）：54.4% 有效深度 → 能看到机械臂和背景
-  - **图像下半部分（240-480 行）：11.8% 有效深度 → 桌面被遮挡！**
-  - 红色物块检测成功（RGB 图像中心 ~(368, 279)，面积 ~5500px）
-  - 但红块所在像素区域深度值全为 0（空洞）
-
-**根本原因**：  
-相机安装在 `arm_link4`（eye-in-hand），观察姿态时机械臂下压，夹爪挡在深度传感器前方，遮挡了向前下方的视野。有效深度区域全部指向机器人后方（base_link 负 X 方向），无法覆盖前方桌面。
-
-**诊断命令**：
-```bash
-# 查看深度图分布（运行时）
-ros2 topic echo /ascamera_hp60c/camera_publisher/depth0/image_raw --once
-
-# 可视化深度图（rqt）
-ros2 run rqt_image_view rqt_image_view
-# 选择 /ascamera_hp60c/camera_publisher/depth0/image_raw
-# 观察有效深度区域（白色）是否覆盖物体位置
-```
-
-**待定解决方案**：
-
-1. **调整观察姿态（推荐）**：
-   - 增大 Z 高度（抬高机械臂）：`observe_pose: [0.20, 0.0, 0.28, π]`
-   - 或向后退一点：`observe_pose: [0.15, 0.0, 0.25, π]`
-   - 目标：让深度相机视野清空，能看到桌面
-
-2. **改用已知平面投影（备选）**：
-   - 物体与底座同高（z 已知）
-   - 用 RGB 像素 + 相机内参 + TF 反算光线与 z=0 平面交点
-   - **完全不依赖深度**，绕开遮挡问题
-   - 需要修改 `visual_grasp.py` 中的 `_detect_and_localize` 方法
-
-3. **换用 eye-to-hand 安装（长期方案）**：
-   - 将相机固定在机器人基座或外部支架
-   - 不随机械臂移动，视野稳定
-   - 需要手眼标定
-
-#### 5.6.11 验证要点
-
-- [x] 相机话题正常（RGB ~11Hz、深度图、camera_info 都有）
-- [x] TF 链 `base_link → camera_depth_optical_frame` 完整，随姿态更新
-- [x] joint_states 反映实际舵机位置
-- [x] 红色物体 HSV 检测成功
-- [x] 机械臂 IK 控制 + pitch=180° 夹爪垂直向下
-- [ ] **物体 3D 定位**（卡在观察姿态物理遮挡，见 5.6.10）
-- [ ] 完整抓取流程跑通
-- [ ] 不同位置物体均能抓取
-
-#### 5.6.12 下一步
-
-先解决 5.6.10 的深度遮挡问题（推荐方案：调整观察姿态高度或使用已知平面投影）。完整抓取通过后，可进入 Level 5（导航 + 视觉 + 抓取）。
-
----
-
-#### 5.6.13 实时可视化调试（2026-07-07 新增）
-
-visual_grasp 现在会把 **RGB / Depth / HSV Mask** 三栏并排 + 检测标注 + 坐标信息合成一张图，通过 ROS 话题 `/visual_grasp/visualization` 持续发布（~10Hz）。SSH 远程调试时通过 `rqt_image_view` 查看，比 OpenCV `imshow` 稳定得多（SSH -X 转发下 OpenCV 会黑屏，Qt/rqt 正常）。
-
-**启动可视化**：
-```bash
-# 终端 A：启动 visual_grasp（默认 enable_viz=True）
-ros2 launch car1_app visual_grasp.launch.py
-
-# 终端 B：打开可视化窗口
-ros2 run rqt_image_view rqt_image_view /visual_grasp/visualization
-```
-
-**画面布局**：
-
-```
-┌────────────────────────────────────────────────────────┐
-│ State: WAIT_CONFIRMATION | Centroid: (u,v) | Depth: Xmm │  ← 顶部信息栏
-├────────────┬────────────┬─────────────────────────────┤
-│ RGB        │ Depth      │ HSV Mask                    │
-│ + 检测轮廓 │ + 检测轮廓 │ + 匹配区域                  │  ← 三栏对齐
-│ + BBox     │ + BBox     │ + 十字质心                  │
-│ + 红十字   │ + 白十字   │ + 绿十字                    │
-│ + TARGET   │ + 深度mm值 │                             │
-└────────────┴────────────┴─────────────────────────────┘
-│ Camera: (x, y, z) m                                    │
-│ Base:   (x, y, z) m                                    │  ← 底部坐标栏
-│ Joints: [j1°, j2°, j3°, j4°, j5°]  |  TF age: 0.05s   │
-└────────────────────────────────────────────────────────┘
-```
-
-**每个信息的含义**：
-
-| 元素 | 含义 | 判断用途 |
-|------|------|---------|
-| `State` | 状态机当前状态（INIT/MOVE_TO_OBSERVE/…/WAIT_CONFIRMATION/PICK） | 定位卡在哪一步 |
-| `Centroid: (u, v) px` | 红块质心的**像素坐标** | 验证 HSV 检测是否命中 |
-| `Depth: Xmm` | 质心处的**深度值**（毫米） | 用尺子对比是否合理 |
-| **左栏 RGB** | 相机实时彩图 + 检测轮廓（绿色）+ Bounding Box（黄色）+ 红十字质心 | 目测检测框是否贴合红块 |
-| **中栏 Depth** | JET 色彩深度图 + 白色十字 + 深度值 | 与 RGB 十字位置**对比**判断 D2C 对齐 |
-| **右栏 HSV Mask** | HSV 阈值命中的白色区域 + 绿十字 | 判断 HSV 是否收得太宽（背景污染）或太窄（红块缺失） |
-| `Camera: (x, y, z) m` | 红块在**相机光学系**的坐标（x 右, y 下, z 前） | 反投影是否正确（红块在图像中央时 x/y 应 ≈ 0） |
-| `Base: (x, y, z) m` | 红块在**base_link** 的坐标（x 前, y 左, z 上） | **抓取用的核心坐标**，需要用尺子校验 |
-| `Joints: [j1°..j5°]` | 当前 5 个机械臂关节角（度） | 判断机械臂是否到达命令姿态 |
-| `TF age` | 用于坐标变换的 TF 数据的年龄（秒） | 越小越好，>0.5s 说明 joint_states 更新慢 |
-
-**逐层验证顺序**（出问题时按这个顺序排查）：
-
-1. **HSV** — 右栏 Mask 里红块是否白色连续区域？→ 不是就调 `target_color_hsv_lower/upper`
-2. **质心** — 左栏 RGB 红十字是否在红块中心？→ 不在就检查轮廓是否被污染
-3. **D2C 对齐** — RGB 红十字 vs Depth 白十字位置是否重合（±2px）？→ 偏差大就是相机 D2C 配准问题
-4. **深度** — 顶部 `Depth: Xmm` 是否与尺子实测接近？→ 差 >20mm 说明相机有系统偏差
-5. **相机坐标** — 底部 `Camera` 行是否符合视觉直觉？→ 红块在画面中间时 x/y 应接近 0
-6. **Base 坐标** — 底部 `Base` 行 z 是否接近桌面高度？→ z 明显偏大说明 TF 错了（机械臂姿态错 or URDF 错）
-
----
-
-#### 5.6.14 检测后暂停确认 + 服务触发继续
-
-visual_grasp 默认参数 `wait_for_confirmation: True`，检测成功后进入 `WAIT_CONFIRMATION` 状态**持续实时刷新**可视化，等待用户手动确认再抓取。
-
-> **注意**：因为 ROS launch 会重定向 stdin，键盘按 Enter 检测不到，所以用 **ROS 服务**触发。
-
-**三个控制服务**：
-
-```bash
-# 确认坐标正确，开始抓取
-ros2 service call /visual_grasp/confirm std_srvs/srv/Trigger
-
-# 跳过这次物体（进入 DONE 状态）
-ros2 service call /visual_grasp/skip std_srvs/srv/Trigger
-
-# 中止抓取（进入 FAILED 状态）
-ros2 service call /visual_grasp/abort std_srvs/srv/Trigger
-```
-
-**典型使用流程**：
-
-```bash
-# 终端 1：启动 visual_grasp
-ros2 launch car1_app visual_grasp.launch.py
-
-# 终端 2：打开可视化
-ros2 run rqt_image_view rqt_image_view /visual_grasp/visualization
-
-# 等待日志出现 "=== PAUSED FOR REVIEW ==="
-# 观察可视化底部的 Base 坐标是否合理
-
-# 终端 3：确认后触发抓取
-ros2 service call /visual_grasp/confirm std_srvs/srv/Trigger
-```
-
-**关闭确认模式**（一步到位自动抓取）：
-
-修改 `visual_grasp.launch.py`：
-```python
-'wait_for_confirmation': False   # 检测成功后直接抓取
-```
-
----
-
-#### 5.6.15 舵机按需读回架构（2026-07-07 修改）
-
-**旧问题**：`servo_controller` 5Hz round-robin 主动读舵机 PWM，但读响应容易和请求错位（响应包 `state.position[0]` 属于哪个 servo_id 没做校验），导致 `/joint_states` 报错误角度 → TF 变换错乱 → Base 坐标荒谬（z 常出现 0.5m 半空中）。
-
-**新架构**：
-1. **默认用命令值缓存**：`servo_controller_callback` / `joint_controller_callback` 收到命令时立即把命令 PWM 写入 `last_actual_positions`，`/joint_states` 5Hz 从这个缓存发布。**平时 joint_states 反映"命令的舵机位置"**，无串口开销。
-2. **按需刷新真实位置**：新服务 `/servo_controller/refresh_positions` 阻塞式读所有 6 个舵机的真实 PWM（含 ID 校验），返回 success/message。
-3. **超时机制**：单关节 `read_timeout=1.5s` 可配置，任一关节超时该关节保留旧缓存，服务整体返回 `success=False` + 罗列失败关节，业务方决定是否继续。
-4. **MultiThreadedExecutor + ReentrantCallbackGroup**：服务回调等 `get_state_client` future 时，另一个 executor 线程处理 get_state 响应，避免单线程死锁。
-
-**visual_grasp 的调用时机**：`_detect_and_localize` 在做 `lookup_transform` **之前**调 `_refresh_joints_sync()`，确保 TF 反映**做检测那一刻**的真实机械臂姿态（而非命令姿态）。这样即使 IK 有偏差导致机械臂物理位置和命令位置不一致，视觉抓取坐标仍然基于真实姿态计算，是准的。
-
-**手动调用刷新**：
-```bash
-ros2 service call /servo_controller/refresh_positions std_srvs/srv/Trigger
-
-# 成功返回：
-# success: True
-# message: 'refreshed: arm_joint1=1499, arm_joint2=1100, ...'
-
-# 部分失败：
-# success: False
-# message: 'failed: [arm_joint2(timeout)] refreshed: [arm_joint1=..., ...]'
-```
-
-**验证 joint_states 是否用真实值**（重要！）：
-```bash
-# 用手把机械臂稍微掰动一下（或让 arm_controller 命令它到某个位置）
-ros2 topic echo /joint_states --once
-
-# 对比直接读回底层：
-ros2 service call /car1_base_driver/bus_servo/get_state \
-  car1_base_driver_msgs/srv/GetBusServoState \
-  "{cmd: [{id: 0, get_position: 1}]}"
-
-# 两者应该 一致（如果 arm_controller 命令值已经写入缓存）
-# 如果不一致，说明缓存没同步 → 需要手动 refresh_positions
-```
-
-**⚠️ 串口冲突陷阱**（新踩过的坑）：`test_servo_direct.py` 和 bringup 都会打开 `/dev/ttyUSB0`。Linux 允许多进程同时打开 tty，但只有一个能读到完整数据，另一个 `board_sdk._recv_task` 会抛 `SerialException`，daemon 线程死掉。**症状**：`refresh_positions` 6 个关节全 timeout，但 base_driver 进程还活着。**排查**：`lsof /dev/ttyUSB0` 看有几个进程占用，超过 1 个就是这个坑，必须完全停 bringup 再跑 test 脚本。已在 `board_sdk._recv_task` 加了 try/except 兜底（异常后 sleep 0.1s 重试而非杀线程），但仍应避免共用串口。
-
----
-
-#### 5.6.16 URDF 相机原点标定（2026-07-07 处理经验）
-
-**发现方式**：观察姿态下（相机朝下看桌面），红块放到相机镜头**正下方**（人眼判断的正下方），可视化显示 `Camera: (0.019, 0, 0.24) m` 而非 `(0, 0, 0.24)`。说明 URDF 里的**深度相机光心位置**与物理光心有 ~19mm 偏差。
-
-**标定方法**（快速 offset 修正）：
-
-1. 让机械臂到观察姿态，把红块**用眼睛对准相机镜头正下方**放置
-2. 看 visual_grasp 报的 `Camera: (Δx, Δy, z)` 值
-3. Δx/Δy 就是当前 URDF 里光心位置的偏差
-4. 修改 `camera_depth_joint` 的 y 分量（因为该 joint 有 rpy 旋转，URDF 里的 y 对应物理左右方向）：
-
-**修改位置**：`simulations/car1_description/urdf/car1.urdf` 里的 `camera_depth_joint`
-
-```xml
-<joint name="camera_depth_joint" type="fixed">
-    <origin
-      xyz="-0.0002257 <NEW_Y> 0.02494901"       <!-- 只改中间 y -->
-      rpy="-1.57079706 -1.57079266 -1.56958489" />
-    <parent link="camera_mount_link" />
-    <child link="camera_depth_link" />
-</joint>
-```
-
-`NEW_Y = 0.00199994 - Δx`（Δx 是 visual_grasp 显示的相机 x 坐标，符号需要试）。方向不确定时：
-- 先试 `NEW_Y = 0.00199994 - 0.01944 = -0.01744006`（原值减 19.44mm）
-- 如果 Camera x 反向变大，说明改反了，改成 `NEW_Y = 0.00199994 + 0.01944 = 0.02143994`
-
-**编译 + 完整重启**（关键！）：
-
-```bash
-colcon build --packages-select car1_description --symlink-install
-source install/setup.bash
-
-# URDF 是 robot_state_publisher 启动时读一次，只重启 visual_grasp 不够，
-# 必须重启 bringup 里的 robot_state_publisher。最简单：全部重启。
-pkill -f 'ros2 launch'
-sleep 2
-
-# 按原顺序依次启动
-ros2 launch car1_bringup bringup.launch.py               # 终端1
-ros2 launch car1_arm_controller arm_controller.launch.py # 终端2
-ros2 launch car1_peripherals depth_camera.launch.py      # 终端3
-ros2 launch car1_app visual_grasp.launch.py              # 终端4
-```
-
-**验证**：
-```bash
-ros2 run tf2_ros tf2_echo camera_depth_link camera_depth_optical_frame
-# Translation 应该反映新的偏移
-```
-
-然后再把红块放到相机正下方，检查 `Camera: (x, y, z)` 中 x 是否接近 0。
-
----
-
-#### 5.6.17 抓取高度参数（gripper_depth / pre_grasp_height）
-
-**问题背景**：`tcp_link` 在 URDF 里的定义位置（`arm_link5` 下方 76.2mm）并不是夹爪的**物理指尖**，指尖比 tcp_link 还往下延伸 **33mm**。如果不补偿，arm_controller 会把 TCP 直接下压到 `Base.z`（红块表面高度），实际夹爪指尖会撞穿桌面。
-
-**修复**：在 `arm/car1_arm_controller/config/arm_params.yaml` 加参数：
-
-```yaml
-/**:
-  ros__parameters:
-    # ... 前面参数
-
-    # 抓取参数
-    # tcp_link 定义位置到夹爪最前端还差 33mm，抓取时 TCP 要停高 33mm，
-    # 让指尖到达检测到的红块表面位置（否则指尖会撞地面/桌面）
-    gripper_depth: -0.033      # TCP 高于目标 33mm（负值 = 抬高）
-    pre_grasp_height: 0.03     # 预抓取高度（目标上方 3cm）
-```
-
-**arm_controller 的抓取序列**（`gripper_depth = -0.033` 时）：
-
-```
-输入 Base.z = 0.013m（红块表面）
-
-1. TCP 移到 (x, y, z + pre_h) = (x, y, 0.043)   预抓取
-   → 指尖在 0.043 - 0.033 = 0.010m ≈ 红块上方（安全）
-
-2. 张开夹爪
-
-3. TCP 下降到 (x, y, z - gripper_depth) = (x, y, 0.013 - (-0.033)) = (x, y, 0.046)   抓取
-   → 指尖在 0.046 - 0.033 = 0.013m = 红块表面 ✓
-
-4. 闭合夹爪
-5. TCP 提起到 (x, y, 0.043)
-```
-
-**微调 gripper_depth**（第一次测试**先设保守值 -0.038**，多留 5mm 余量避免撞台）：
-
-| 现象 | 说明 | 调整 |
-|------|------|------|
-| 指尖撞桌面 | 停得太低 | `gripper_depth` 减小（更负），如 -0.038 → -0.043 |
-| 指尖悬在红块上方，夹不到 | 停得太高 | `gripper_depth` 增大（不那么负），如 -0.033 → -0.028 |
-| 指尖到位但夹到红块顶部滑走 | 夹到边缘 | 让指尖再下 `半个红块高度`，如红块 30mm 高就 -0.033 + 0.015 = -0.018 |
-
-**注意**：如果换了不同高度的物体（比如从 30mm 方块换成 50mm 方块），`gripper_depth` 需要重调，或者干脆在代码里让 `visual_grasp` 用**深度中位数扣除物体半高**的方式发布"物体中心 z"。
-
-**长期方案（推荐但未做）**：直接改 URDF 让 `tcp_link` 移到夹爪指尖位置（把 `tcp_joint.origin.xyz.z` 从 0.0762 改成 0.0762 + 0.033 = 0.1092），同时相应改 IK 的 `toolFromJ4.z`（从 0.150642 → 0.183642），然后 `gripper_depth` 可以回到 0。这样 TCP 定义和物理夹尖一致，所有代码都自然。
-
----
-
-#### 5.6.18 已知问题：IK 和物理姿态不一致
-
-**现象**：命令观察姿态 `(0.20, 0.0, 0.22, pitch=π)`，IK 解出 `q = (0°, +15°, +47°, +118°, 0°)`，对应 PWM ≈ `(1499, 1672, 2037, 2838, 1500)`。舵机执行到这个 PWM 后，机械臂**物理上**并没有到 `(0.20, 0, 0.22)`，末端偏斜、朝斜上方，导致相机看不到桌面、TF 变换出的 Base 坐标飞到 60cm 高。
-
-**根源**：`ik_analytical.py` + `config.py` 用的 DH 参数（`J1_origin`、`J2_offset`、`link1/link2/toolFromJ4`）与实际机械臂装配不完全匹配。因此 IK 计算的关节角**在 URDF 模型里**能到目标，但物理机械臂到不了。
-
-**当前 workaround**：`visual_grasp._detect_and_localize` 在 TF lookup **之前**主动调 `refresh_positions` 服务，让 `/joint_states` 反映真实关节角，然后 robot_state_publisher 基于真实角度算 TF。这样物体 Base 坐标是**基于机械臂物理实际姿态**算出来的，即使姿态不是命令的姿态，坐标本身依然准确 —— 因为坐标只需要"相机在哪 + 相机看到什么"就能得到。
-
-**长期修复**：需要精细标定 DH 参数（`config.py:RobotCalibration`），或用 AprilTag 手眼标定。
+#### 5.6.12 下一步与进阶
+
+完成基础视觉抓取后，可以：
+
+1. **调整抓取参数**：根据不同物体调整 `gripper_depth`、HSV 阈值
+2. **多物体抓取**：循环调用 `/visual_grasp/start`，实现批量抓取
+3. **集成导航**：结合 Level 4 导航，实现"导航到目标点 → 抓取 → 导航到放置点"
+4. **更换颜色**：修改 launch 文件中的 HSV 参数，追踪蓝色、绿色等物体
+5. **深度学习检测**：替换 HSV 检测为 YOLO/MobileNet，提升鲁棒性
+
+**故障排查优先级**（遇到问题时按顺序检查）：
+1. 可视化窗口（rqt）— 确认检测框、深度、坐标是否合理
+2. Base 坐标 — 用尺子实测验证 x/y/z
+3. gripper_duration — 夹爪不张开时增大到 2.0s
+4. gripper_depth — 撞桌面时减小（更负），夹不到时增大
+
+**相关章节**：
+- 1.7 交互式 IK 验证 — 验证 IK 准确性
+- 3.0 底盘校准 — 如需移动底盘配合抓取
+- 5.6.11 前置修改总结 — 确保代码是最新版本
 
 ---
 
