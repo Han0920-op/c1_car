@@ -2859,6 +2859,349 @@ ros2 run car1_app visual_grasp
 
 ---
 
+### 5.7 导航 + 视觉抓取 + 运输（全自主任务）
+
+> **目标**：机器人自主导航到抓取点 → 视觉识别红色方块 → 抓取 → 导航到放置点 → 放置 → 返回工作姿态
+> **所需时间**：60-90 分钟（含调试）
+> **硬件要求**：完整硬件（底盘 + 机械臂 + 深度相机 + 激光雷达）
+> **前置条件**：已完成 Level 4（自主导航）+ Level 5.6（视觉抓取）
+> **当前状态（2026-07-08）**：完整实现，与 visual_grasp 完全解耦（零侵入设计）
+
+#### 5.7.1 功能概述
+
+`navigation_grasp_transport` 是 Level 5 的全自主任务节点，实现完整的**"导航 → 抓取 → 运输 → 放置 → 返回"**闭环。
+
+**核心特性**：
+- **零侵入设计**：不修改 visual_grasp.py 和 arm_controller.py 核心逻辑，两个案例互不影响
+- **13 状态状态机**：完整覆盖任务全流程，每个阶段独立可调试
+- **旋转搜索**：导航到达后自动多角度搜索目标（应对 ±10cm 定位误差）
+- **多次检测取稳**：连续检测 5 次，用最后一次结果消除舵机稳定过程中的坐标漂移
+- **深度反投影**：与 visual_grasp 相同的定位算法（HSV + 深度 + TF）
+- **服务化触发**：ROS 服务调用启动任务，SSH 远程友好
+- **可配置放置**：放置点位置和姿态完全可配置
+
+#### 5.7.2 状态机流程
+
+```
+IDLE（待命）
+  ↓ 收到 /navigation_grasp_transport/start
+SET_INITIAL_POSE（发布初始位姿到 AMCL）
+  ↓
+WAIT_LOCALIZATION（等待 AMCL 收敛 3秒）
+  ↓
+NAV_TO_PICK（Nav2 导航到抓取点）
+  ↓ 到达
+MOVE_TO_OBSERVE（机械臂移到观察姿态 [0.20, 0.0, 0.22, π]）
+  ↓
+WAIT_ARM_STABLE（等待舵机完全稳定 5秒）
+  ↓
+ROTATE_SEARCH（旋转搜索红色方块，覆盖 ±45°）
+  ↓ 找到目标
+DETECT_AND_GRASP（连续检测5次取稳，发布 set_pick_target）
+  ↓
+CALL_PICK（调用 /arm_controller/pick 服务）
+  ↓
+WAIT_GRASP（等待抓取完成）
+  ↓ 抓取成功
+NAV_TO_PLACE（导航返回放置点）
+  ↓ 到达
+PLACE_OBJECT（多步操作：place → go_work → 关闭夹爪）
+  ↓
+DONE（任务完成，5秒后回 IDLE，可再次触发）
+```
+
+#### 5.7.3 一站式启动
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
+
+# 一键启动（默认地图 slam_map）
+ros2 launch car1_app navigation_grasp_transport.launch.py map:=slam_map
+```
+
+**启动内容**（自动分阶段启动）：
+```
+t=0s    navigation.launch.py（bringup + lidar + AMCL + Nav2）
+t=8s    arm_controller.launch.py（机械臂控制器）
+t=10s   depth_camera.launch.py（HP60C 相机）
+t=15s   navigation_grasp_transport 节点（IDLE 等待触发）
+```
+
+**启动成功标志**：
+```
+[navigation_grasp_transport-22] navigation_grasp_transport ready (IDLE)
+[navigation_grasp_transport-22]   initial_pose: [-0.059, -0.103, 0.020]
+[navigation_grasp_transport-22]   pick_pose:    [0.756, 0.872, 3.071]
+[navigation_grasp_transport-22]   place_pose:   [-0.059, -0.103, 0.020]
+[navigation_grasp_transport-22]   search enabled: True
+```
+
+#### 5.7.4 位置配置
+
+配置文件：`app/car1_app/config/navigation_grasp_transport.yaml`
+
+**如何测量并写入你的地图坐标**：
+
+```bash
+# Step 1: 启动导航（只启动导航栈）
+ros2 launch car1_navigation navigation.launch.py map:=slam_map
+
+# Step 2: 在 RViz 中用 2D Pose Estimate 校准初始位姿
+
+# Step 3: 用键盘遥控到目标位置
+ros2 launch car1_peripherals teleop_key.launch.py
+
+# Step 4: 到位后读取当前地图坐标
+ros2 run tf2_ros tf2_echo map base_footprint
+
+# 输出示例：
+# - Translation: [0.756, 0.872, 0.000]
+# - Rotation: in RPY (radian) [0.000, -0.000, 3.071]
+
+# Step 5: 将坐标写入配置文件
+# initial_pose: [x, y, yaw_rad]
+# pick_pose: [x, y, yaw_rad]
+# place_pose: [x, y, yaw_rad]
+```
+
+**关键配置项**：
+```yaml
+navigation_grasp_transport:
+  ros__parameters:
+    # 位姿配置（map 坐标系）[x_m, y_m, yaw_rad]
+    initial_pose: [-0.059, -0.103, 0.020]
+    pick_pose: [0.756, 0.872, 3.071]
+    place_pose: [-0.059, -0.103, 0.020]  # 可与起点相同
+
+    # 旋转搜索（应对定位误差）
+    enable_search: true
+    search_angles_deg: [0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0]
+    red_pixel_threshold: 1000
+
+    # 观察姿态（机械臂前伸俯视）
+    observe_pose: [0.20, 0.0, 0.22, 3.14159]
+    observe_settle_sec: 5.0  # 舵机稳定等待时间（关键！）
+
+    # 检测稳定性（消除舵机稳定过程漂移）
+    detection_repeat_count: 5           # 检测5次
+    detection_repeat_interval_sec: 0.3  # 间隔0.3秒
+
+    # 放置目标（base_link 坐标系，相对机器人）[x, y, z, pitch]
+    place_target_arm: [0.26, 0.0, 0.08, 3.14159]
+
+    # HSV 阈值（与 visual_grasp 一致）
+    target_color_hsv_lower: [0, 100, 80]
+    target_color_hsv_upper: [15, 255, 255]
+    target_color_hsv_lower2: [160, 100, 80]
+    target_color_hsv_upper2: [180, 255, 255]
+```
+
+#### 5.7.5 触发任务
+
+**基本操作**：
+
+```bash
+# 触发完整任务
+ros2 service call /navigation_grasp_transport/start std_srvs/srv/Trigger
+
+# 紧急停止
+ros2 service call /navigation_grasp_transport/stop std_srvs/srv/Trigger
+
+# 运行时保存当前位置为抓取点（调试用）
+ros2 service call /navigation_grasp_transport/set_pick_pose_from_current std_srvs/srv/Trigger
+```
+
+**监控状态**：
+
+```bash
+# 实时状态机状态
+ros2 topic echo /navigation_grasp_transport/status
+
+# 当前搜索角度
+ros2 topic echo /navigation_grasp_transport/current_search_angle
+
+# 错误原因（失败时）
+ros2 topic echo /navigation_grasp_transport/error_reason
+```
+
+#### 5.7.6 关键技术点
+
+##### 5.7.6.1 参考 visual_grasp 的定位算法
+
+采用 `visual_grasp.py` 验证过的**深度反投影法**（非平面投影）：
+
+```
+1. HSV 检测 → 最大轮廓 → 质心像素 (u, v)
+2. 深度采样：轮廓内中值（带 MAD 离群值剔除）
+3. 反投影到相机坐标：
+   x_cam = (u - cx) * z_cam / fx
+   y_cam = (v - cy) * z_cam / fy
+4. refresh_positions 强制读取舵机真实位置
+5. TF 变换：camera_depth_optical_frame → base_link
+6. 得到 (x_base, y_base, z_base) 抓取目标
+```
+
+##### 5.7.6.2 多次检测取稳（关键优化）
+
+**问题**：舵机移到观察姿态后，前 3-5 秒还在微调（j2/j3/j4 逐步稳定），此时检测的坐标会有 ~2cm 的 x 方向偏差。
+
+**解决**：
+- 等待时间从 3s 增加到 **5s**（与 visual_grasp 一致）
+- 连续检测 **5 次**（间隔 0.3s）
+- 使用**最后一次成功**的检测结果（此时舵机已完全稳定）
+
+**日志示例**：
+```
+Detect [1/5]: (0.243, -0.012, 0.045)  # 稍有偏差
+Detect [2/5]: (0.247, -0.010, 0.045)
+Detect [3/5]: (0.250, -0.010, 0.045)
+Detect [4/5]: (0.251, -0.010, 0.045)
+Detect [5/5]: (0.251, -0.010, 0.045)  # 最终稳定值 ← 使用
+FINAL target: (0.251, -0.010, 0.045)
+```
+
+##### 5.7.6.3 状态分离避免竞态
+
+**问题**：如果在同一个 tick 内发布 `set_pick_target` 后立即调用 `pick` 服务，arm_controller 的订阅回调可能还没跑到，导致 `pick` 使用**旧的 pick_target**（观察姿态坐标），机械臂在错误位置合拢夹爪。
+
+**解决**：新增 `CALL_PICK` 独立状态
+```
+DETECT_AND_GRASP: 发布 set_pick_target → 进入 CALL_PICK
+（间隔 100ms 让订阅回调处理）
+CALL_PICK: 调用 pick 服务
+```
+
+##### 5.7.6.4 放置阶段的完整夹爪管理
+
+**放置流程**：
+1. 发布 `set_pick_target = [0.26, 0.0, 0.08, π]`（base_link 坐标）
+2. 调用 `/arm_controller/place`（自动打开夹爪释放物体）
+3. 调用 `/arm_controller/go_work`（机械臂到工作姿态）
+4. 调用 `/arm_controller/set_gripper (data=False)`（关闭夹爪，准备下次抓取）
+5. → DONE
+
+##### 5.7.6.5 arm_controller 新增 go_work 服务
+
+**Work 姿态定义**（关节角度，弧度）：
+```
+[0.0, -0.9424, 1.6492, 0.8246, 0.0]
+```
+
+对应 PWM `[1500, 1100, 2200, 1850, 1500]`（与 `test_servo_direct.py` 和 `work_ready.yaml` 一致）。
+
+**为什么用 work 姿态而不是 home**：
+- **home**（零位）：所有关节 0°，机械臂完全竖直向上
+- **work**（工作准备）：机械臂前伸，重心低，导航时更稳定，也便于下次抓取
+
+#### 5.7.7 分层验证
+
+**第 1 层：Nav2 导航**
+```bash
+# 单独验证导航能到达抓取点
+ros2 launch car1_navigation navigation.launch.py map:=slam_map
+# RViz 手动设置目标点，验证能到达 pick_pose 坐标附近
+```
+
+**第 2 层：机械臂观察姿态**
+```bash
+# 单独验证机械臂能到观察姿态
+ros2 launch car1_arm_controller arm_controller.launch.py start_bringup:=true
+
+# 发布观察姿态
+ros2 topic pub /arm_controller/target_pose geometry_msgs/msg/PoseStamped \
+  "{header: {frame_id: 'base_link'}, pose: {position: {x: 0.20, y: 0.0, z: 0.22}, orientation: {y: 1.0, w: 0.0}}}" --once
+```
+
+**第 3 层：视觉抓取（不带导航）**
+```bash
+# 用 visual_grasp 验证抓取
+ros2 launch car1_app visual_grasp.launch.py
+ros2 service call /visual_grasp/start std_srvs/srv/Trigger
+```
+
+**第 4 层：完整流程**
+```bash
+# 一次完整任务
+ros2 launch car1_app navigation_grasp_transport.launch.py map:=slam_map
+ros2 service call /navigation_grasp_transport/start std_srvs/srv/Trigger
+```
+
+#### 5.7.8 验收标准
+
+**功能性**：
+- [ ] 初始位姿设置成功，AMCL 3秒内收敛
+- [ ] 导航到抓取点误差 <10cm
+- [ ] 旋转搜索能在 ±45° 范围内找到红色方块
+- [ ] 5次检测坐标稳定收敛（最后一次与前一次差 <5mm）
+- [ ] 抓取成功率 >70%（10次测试）
+- [ ] 放置动作完整：place → go_work → 夹爪关闭
+- [ ] 完整任务端到端成功率 >60%
+- [ ] 连续 5 次抓取无程序崩溃
+
+**性能**：
+- [ ] 单次完整任务耗时 <3 分钟
+- [ ] 状态机切换延迟 <0.5 秒
+
+#### 5.7.9 常见问题
+
+| 现象 | 原因 | 解决方案 |
+|------|------|---------|
+| 导航到达但没抓取 | 舵机未稳定就检测 | 增大 `observe_settle_sec` 到 5-7s |
+| x 方向偏差 2cm | 单次检测取到未稳定值 | 已通过多次检测取最后一次解决 |
+| 夹爪不合拢 | 竞态：pick 用了旧 target | 已通过 CALL_PICK 独立状态解决 |
+| 到位置但没夹到 | 抓取位置不准 | 检查 `[TF]` 日志的 base_link 坐标，用尺子实测验证 |
+| 放置时机械臂碰自身 | place_target_arm x 太近 | 增大 x（如从 0.20 → 0.26） |
+| 放置后一直循环 | 状态机分支条件缺失 | 已通过检查所有 futures 解决 |
+| Ray intersects behind | 平面投影法失败（已废弃） | 已切换到深度反投影 |
+| 搜索检测不到 | 旋转搜索范围太窄 | 扩大 `search_angles_deg` |
+| 抓取偏移大 | TF 不准 | 确保 `refresh_positions` 服务调用成功 |
+
+#### 5.7.10 架构说明
+
+**零侵入设计**：
+
+```
+路径 A（Level 5.6, 手动触发）：
+  visual_grasp.py [独立] → arm_controller pick
+
+路径 B（Level 5.7, 全自主）：
+  navigation_grasp_transport.py [独立]
+    → Nav2 goToPose
+    → arm_controller target_pose (观察姿态)
+    → 自实现 HSV 检测 + 深度反投影
+    → arm_controller set_pick_target + pick
+    → Nav2 goToPose (返回)
+    → arm_controller set_pick_target + place
+    → arm_controller go_work
+    → arm_controller set_gripper
+```
+
+**两条路径完全解耦**：
+- 都使用 arm_controller 的**同一套服务接口**
+- 都使用相同的检测算法
+- 但各自的状态机、参数、启动方式完全独立
+- Level 5.6 单独启动**不受 Level 5.7 影响**
+
+#### 5.7.11 相关文件
+
+| 文件 | 作用 |
+|------|------|
+| `app/car1_app/car1_app/navigation_grasp_transport.py` | 主节点 |
+| `app/car1_app/launch/navigation_grasp_transport.launch.py` | 一站式启动 |
+| `app/car1_app/config/navigation_grasp_transport.yaml` | 参数配置 |
+| `arm/car1_arm_controller/car1_arm_controller/arm_controller.py` | 新增 `go_work` 服务 |
+
+#### 5.7.12 下一步
+
+完成基础任务后，可以尝试：
+1. **多点巡逻抓取**：扩展 `pick_pose` 为列表，循环访问多个抓取点
+2. **多种颜色**：扩展 HSV 参数，识别不同颜色物体分类放置
+3. **多个放置区**：根据物体颜色/大小选择不同放置点
+4. **动态目标**：结合追踪算法，抓取移动中的物体
+5. **协作任务**：多机器人协作，一个抓取一个搬运
+
+---
 
 
 ## 常见问题

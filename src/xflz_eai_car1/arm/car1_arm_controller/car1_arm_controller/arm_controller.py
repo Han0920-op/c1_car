@@ -107,6 +107,9 @@ class ArmController(Node):
         self.home_srv = self.create_service(
             Trigger, '/arm_controller/go_home', self.home_callback,
             callback_group=self.cb_group)
+        self.work_srv = self.create_service(
+            Trigger, '/arm_controller/go_work', self.work_callback,
+            callback_group=self.cb_group)
         self.stop_srv = self.create_service(
             Trigger, '/arm_controller/emergency_stop', self.emergency_stop_callback,
             callback_group=self.cb_group)
@@ -220,6 +223,20 @@ class ArmController(Node):
         self._move_joints([0.0, 0.0, 0.0, 0.0, 0.0], self.default_duration)
         response.success = True
         response.message = 'home'
+        return response
+
+    def work_callback(self, request, response):
+        """Move arm to work-ready pose (arm extended forward, ready for observation/grasp).
+        Corresponds to servo PWM [1500, 1100, 2200, 1850, 1500] (see work_ready.yaml).
+        """
+        # Work pose: joints in radians, derived from PWM [1500,1100,2200,1850,1500]
+        # PWM_TO_RAD = 4.712/2000, so (pwm-1500)*PWM_TO_RAD
+        WORK_JOINTS_RAD = [0.0, -0.9424, 1.6492, 0.8246, 0.0]
+        self.get_logger().info('go_work: moving to work-ready pose')
+        self.stop_flag = False
+        self._move_stepwise(WORK_JOINTS_RAD, self.default_duration)
+        response.success = True
+        response.message = 'work'
         return response
 
     def emergency_stop_callback(self, request, response):
