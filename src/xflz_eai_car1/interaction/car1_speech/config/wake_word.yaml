@@ -1,0 +1,14 @@
+/**:
+  ros__parameters:
+    # Wake word to listen for
+    wake_word: "hello robot"  # or "小飞", "你好机器人"
+
+    # Detection sensitivity (0.0-1.0, higher = more sensitive)
+    sensitivity: 0.5
+
+    # Audio device index (-1 = default)
+    audio_device_index: -1
+
+    # Engine-specific parameters
+    engine: "porcupine"  # porcupine, snowboy, custom
+    model_path: ""       # Path to wake word model file

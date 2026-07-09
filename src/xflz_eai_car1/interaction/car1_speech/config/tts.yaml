@@ -1,0 +1,18 @@
+/**:
+  ros__parameters:
+    # TTS engine
+    engine: "iflytek"  # iflytek, baidu, google, edge-tts, pyttsx3
+
+    # Voice settings
+    voice: "xiaoyan"   # iFlytek voice name (xiaoyan, xiaofeng, etc.)
+    speed: 50          # 0-100
+    volume: 80         # 0-100
+    pitch: 50          # 0-100
+
+    # Cloud API credentials (iFlytek)
+    app_id: ""
+    api_key: ""
+    api_secret: ""
+
+    # Audio playback
+    audio_device_index: -1
