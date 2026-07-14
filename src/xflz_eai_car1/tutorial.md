@@ -21,6 +21,7 @@
     - [6.3 语音唤醒测试](#63-语音唤醒测试kws_testpy)
     - [6.4 本地大模型服务](#64-本地大模型服务llm_serverpy--llm_testpy)
     - [6.5 Function Calling 工具调用](#65-function-calling-工具调用)
+    - [6.6 语音合成测试](#66-语音合成测试tts_testpy)
 - [常见问题](#常见问题)
 
 ---
@@ -4258,6 +4259,210 @@ tools 模式已将输入精简到极致（无 system prompt，tools schema 仅 n
 **Q: 预填充太慢**
 
 参考 6.4.5 中关于预填充延迟的说明。工具定义越少、越短，等待越短。不需要的工具可以从 TOOLS 列表中注释掉。
+
+---
+
+### 6.6 语音合成测试（tts_test.py）
+
+> **目标**：使用 sherpa-onnx Matcha-TTS 实现中文语音合成，将文本转化为语音并播放  
+> **所需时间**：10 分钟  
+> **硬件要求**：ES8388 音频编解码器（板载喇叭）  
+> **前置条件**：sherpa-onnx 已安装，TTS 模型文件已就位
+
+#### 6.6.1 工具概述
+
+`tts_test.py` 位于 `interaction/car1_speech/tools/tts_test.py`，是一个**无 ROS2 依赖**的独立语音合成工具。它将输入的中文或中英混合文本合成为语音，通过 ES8388 喇叭播放。
+
+**合成引擎架构**：
+
+```
+输入文本 → Matcha-TTS (声学模型) → Vocos (声码器) → 16kHz float32 音频
+                                                          ↓
+                                                  gain 数字增益
+                                                          ↓
+                                             write_wav_stereo (立体声 WAV)
+                                                          ↓
+                                                   aplay → ES8388 喇叭
+```
+
+**核心组件**：
+
+| 组件 | 说明 |
+|------|------|
+| **Matcha-TTS** | 基于 Matcha 声学模型的中英双语 TTS，支持声调准确的普通话合成 |
+| **Vocos Vocoder** | 声码器，将梅尔频谱转换为 16kHz 单声道 float32 音频 |
+| **数字增益** | 可调倍数放大（tanh 软削波），补偿 TTS 输出偏低的音量 |
+| **立体声转换** | ES8388 I2S 硬连接立体声，工具自动将单声道复制到左右声道 |
+| **ALSA 播放** | 通过 aplay 播放标准 WAV，与 audio_test.py 使用相同的 mixer 设置 |
+
+**模型文件**：
+
+| 文件 | 路径 | 说明 |
+|------|------|------|
+| 声学模型 | `~/models/tts/model-steps-3.onnx` | Matcha-TTS 声学模型 |
+| 声码器 | `~/models/tts/vocos-16khz-univ.onnx` | Vocos 16kHz 声码器 |
+| 词典 | `~/models/tts/lexicon.txt` | 中文发音词典 |
+| 词表 | `~/models/tts/tokens.txt` | 音素标记文件 |
+| eSpeak | `~/models/tts/espeak-ng-data/` | 多语言发音数据 |
+| 规则 FST | `phone-zh.fst` / `date-zh.fst` / `number-zh.fst` | 中文正音规则 |
+
+#### 6.6.2 基本用法
+
+```bash
+cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_speech/tools
+
+# 默认文本合成并播放（gain=2.0, playback-volume=100%）
+python3 tts_test.py --text "你好，欢迎使用语音合成"
+
+# 调节语速
+python3 tts_test.py --text "现在时间是下午三点" --speed 1.2
+
+# 交互模式（逐行输入文字实时合成）
+python3 tts_test.py -i
+
+# 只保存 WAV 文件，不播放
+python3 tts_test.py --text "你好" -o hello.wav --no-play
+```
+
+启动后输出：
+
+```
+  Playback volume: 100% (0.0 dB)
+Loading TTS model...
+  Ready.
+
+Text:  你好，欢迎使用语音合成
+Speed: 1.0
+Audio:  4.26s  (16000 Hz, 68128 samples)
+Gen:    2.18s
+RTF:    0.512  (faster than real-time)
+Output: /tmp/tts_output.wav
+```
+
+**RTF (Real-Time Factor)**：生成耗时 / 音频时长。< 1.0 表示快于实时，0.5 表示只需一半时间。
+
+#### 6.6.3 音量调节
+
+TTS 匹配人声特性的输出波形幅度偏保守（RMS 约 -17 dBFS）。工具提供两个独立旋钮：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--gain` | `2.0` | **数字增益**。1.0=原始输出的音量。建议范围 1.0~4.0。越大越响，但也更容易削波失真 |
+| `--playback-volume` | `100` | **硬件播放音量**。与 audio_test.py 一致：100%=0dB，50%=-6dB。控制 ES8388 Output 1/2 + PCM 的 dB 增益 |
+
+```bash
+# 默认音量（gain=2.0, playback=100%）
+python3 tts_test.py --text "你好"
+
+# 更大声
+python3 tts_test.py --text "你好" --gain 3.0
+
+# 降低音量
+python3 tts_test.py --text "你好" --gain 1.0 --playback-volume 80
+```
+
+**Mixer 控制说明**：ES8388 的播放链路只有三个可调节的 mixer 控制项——`PCM`（数字域）、`Output 1/2`（模拟域输出电平）、`spk switch`（功放开关，aplay 运行时内核自动启用）。与 audio_test.py 使用完全相同的 dB 方式设置，没有再多的隐藏增益点。
+
+**TTS 音量与麦克风录音对比**：TTS 原始输出已经比板载麦克风录音回放响亮约 6dB。加上默认 gain=2.0 后，比录音回放响亮约 12dB。如果还觉得小，就是这块板子喇叭的物理极限了。
+
+#### 6.6.4 交互模式命令
+
+```bash
+python3 tts_test.py -i
+```
+
+| 输入 | 说明 |
+|------|------|
+| 任意文本 | 合成并播放 |
+| `vol=80` | 实时调节播放音量 |
+| `speed=1.2` | 调节语速 |
+| `quit` / `exit` / `q` | 退出 |
+| `Ctrl+C` | 退出 |
+
+#### 6.6.5 完整参数参考
+
+**模型与设备**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--acoustic-model` | `~/models/tts/model-steps-3.onnx` | 声学模型路径 |
+| `--vocoder` | `~/models/tts/vocos-16khz-univ.onnx` | 声码器路径 |
+| `--lexicon` | `~/models/tts/lexicon.txt` | 发音词典 |
+| `--tokens` | `~/models/tts/tokens.txt` | 音素词表 |
+| `--data-dir` | `~/models/tts/espeak-ng-data/` | eSpeak 数据目录 |
+| `--rule-fsts` | 三个 FST 文件 | 中文正音规则 |
+
+**输入与输出**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--text` / `-t` | 无 | 要合成的文本 |
+| `-i` / `--interactive` | 不传 | 交互模式 |
+| `--speed` | `1.0` | 语速，0.5~2.0 |
+| `--sid` | `0` | 说话人 ID |
+| `--output` / `-o` | `/tmp/tts_output.wav` | 输出 WAV 文件 |
+| `--no-play` | 不传 | 不播放，只保存文件 |
+
+**音量与增益**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--gain` | `2.0` | 数字增益倍数，1.0~4.0 |
+| `--playback-volume` | `100` | 播放音量 0-100%，100%=0dB |
+| `-D` / `--device` | `plughw:0,0` | ALSA 播放设备 |
+
+**性能**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--num-threads` | `4` | 推理线程数 |
+| `--max-num-sentences` | `1` | 每批最大句子数 |
+| `--debug` | 不传 | 启用调试输出 |
+
+#### 6.6.6 常见问题
+
+**Q: 播放速度异常（变速 / 快进）**
+
+ES8388 I2S 硬连接立体声，单声道 WAV 的 byte rate 是立体声的一半，导致时钟错配。工具已通过 `write_wav_stereo()` 将单声道复制到左右声道，写出标准立体声 WAV 后再播放。
+
+如果仍然异常，检查 mixer 状态并用 aplay 直接测试：
+
+```bash
+python3 audio_test.py --list-mixer | grep -E "PCM|Output"
+aplay -D plughw:0,0 /tmp/tts_output.wav
+```
+
+**Q: 声音太小**
+
+默认 gain=2.0，可以继续加大：
+
+```bash
+python3 tts_test.py --text "你好" --gain 3.0
+```
+
+如果 gain 超过 4.0 仍然偏小，是 ES8388 板载喇叭的物理功率限制。可以考虑外接有源音箱到耳机插孔。
+
+**Q: 声音失真 / 截幅**
+
+gain 过高导致削波失真。降低 gain：
+
+```bash
+python3 tts_test.py --text "你好" --gain 1.5
+```
+
+**Q: 报错 `Rule fst does not exist`**
+
+FST 文件缺失或路径不对：
+
+```bash
+ls ~/models/tts/phone-zh.fst ~/models/tts/date-zh.fst ~/models/tts/number-zh.fst
+```
+
+如果不存在，重新下载模型或去掉 `--rule-fsts` 参数（无正音规则的 TTS 仍然可以工作，但数字/时间朗读可能不标准）。
+
+**Q: 能否同时使用 TTS + ASR + KWS**
+
+可以。TTS（CPU 推理）与 ASR（RKNN 推理）、KWS（CPU 推理）均可同时运行，互不冲突。ASR/KWS 使用麦克风（录音链路），TTS 使用喇叭（播放链路）。
 
 ---
 
