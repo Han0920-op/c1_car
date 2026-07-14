@@ -16,6 +16,9 @@
   - [Level 4: 自主导航](#level-4-自主导航)
   - [Level 5: 智能应用](#level-5-智能应用)
   - [Level 6: 语音交互](#level-6-语音交互)
+    - [6.1 音频硬件测试](#61-音频硬件测试audio_testpy)
+    - [6.2 语音识别测试](#62-语音识别测试asr_testpy)
+    - [6.3 语音唤醒测试](#63-语音唤醒测试kws_testpy)
 - [常见问题](#常见问题)
 
 ---
@@ -3671,6 +3674,210 @@ python3 asr_test.py --vad-threshold 0.3
 python3 asr_test.py --vad-threshold 0.7 --vad-min-speech 0.5
 ```
 
+### 6.3 语音唤醒测试（kws_test.py）
+
+> **目标**：使用 sherpa-onnx KeywordSpotter 实现流式关键词唤醒（离线，无需重训即可自定义唤醒词）  
+> **所需时间**：10 分钟  
+> **硬件要求**：ES8388 音频编解码器（板载麦克风）  
+> **前置条件**：sherpa-onnx 已安装，KWS 模型文件已就位
+
+#### 6.3.1 工具概述
+
+`kws_test.py` 位于 `interaction/car1_speech/tools/kws_test.py`，是一个**无 ROS2 依赖**的独立关键词检测工具。它持续监听麦克风，检测到预配置的唤醒词时输出提示。
+
+**唤醒引擎架构**：
+
+```
+ALSA 麦克风 → KeywordSpotter (持续流式解码) → 检测到关键词 → 打印 [Wake] + 重置 stream
+```
+
+**核心组件**：
+
+| 组件 | 说明 |
+|------|------|
+| **KeywordSpotter** | sherpa-onnx 关键词检测器，使用 Zipformer transducer 模型 |
+| **CPU 推理** | KWS 模型为 ONNX 格式（INT8 量化），在 CPU 上运行，体积 ~3MB |
+| **ppinyin 建模** | 中文关键词使用拼音分词（声母+韵母+声调），支持自定义任意关键词 |
+| **ALSA 输入** | 直接从 `plughw:0,0` 读取麦克风音频 |
+| **持续监听** | 检测到关键词后自动重置 stream，立即开始下一次检测 |
+
+**模型文件**（默认路径）：
+
+| 文件 | 路径 | 格式 |
+|------|------|------|
+| tokens | `~/models/zipformer_kws/tokens.txt` | 文本（263 个 phoneme 标记） |
+| encoder | `~/models/zipformer_kws/encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx` | ONNX INT8 |
+| decoder | `~/models/zipformer_kws/decoder-epoch-13-avg-2-chunk-16-left-64.onnx` | ONNX |
+| joiner | `~/models/zipformer_kws/joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx` | ONNX INT8 |
+
+#### 6.3.2 唤醒词文件
+
+唤醒词配置在 `keywords.txt`（与 `kws_test.py` 同目录），使用 **ppinyin 拼音分词** 格式：
+
+```
+x iǎo f ēi t óng x ué @小飞同学
+n ǐ h ǎo x iǎo f ēi @你好小飞
+x iǎo f ēi x iǎo f ēi @小飞小飞
+```
+
+**格式说明**：
+- 用音标 token（空格分隔）：声母 + 韵母（带声调）
+- `@` 后面的中文是**注释**，仅用于终端显示，模型只看前面的 ppinyin 部分
+- 每行一个唤醒词
+- 自定义唤醒词：按同样格式加一行即可，**无需重新训练**
+
+**如何为新唤醒词生成 ppinyin 分词**（需安装 `pypinyin` 和 `sentencepiece`）：
+
+```bash
+# 安装依赖（一次性）
+pip3 install pypinyin sentencepiece
+
+# 用 sherpa-onnx 内置工具转换
+python3 -c "
+import sherpa_onnx
+texts = ['小飞同学', '你好小飞', '小飞小飞']
+result = sherpa_onnx.text2token(
+    texts,
+    tokens='/home/iflytek/models/zipformer_kws/tokens.txt',
+    tokens_type='phone+ppinyin',
+)
+for t, r in zip(texts, result):
+    print(' '.join(r) + f' @{t}')
+"
+```
+
+#### 6.3.3 基本用法
+
+```bash
+cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_speech/tools
+
+# 默认参数运行（默认唤醒词 + 录音满增益 + ALC）
+python3 kws_test.py
+
+# 使用自定义唤醒词文件
+python3 kws_test.py --keywords-file my_keywords.txt
+
+# 提高检测灵敏度（更容易触发，但可能有误报）
+python3 kws_test.py --keywords-threshold 0.15
+
+# 提高严格度（减少误报，但可能漏检）
+python3 kws_test.py --keywords-threshold 0.4
+
+# 关闭 ALC 自动增益
+python3 kws_test.py --no-mic-boost
+```
+
+检测到唤醒词时输出：
+
+```
+[Wake] 小飞同学
+```
+
+#### 6.3.4 完整参数参考
+
+**模型与设备**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--tokens` | `~/models/zipformer_kws/tokens.txt` | 词表文件 |
+| `--encoder` | `~/models/zipformer_kws/encoder-...-int8.onnx` | 编码器模型 (INT8) |
+| `--decoder` | `~/models/zipformer_kws/decoder-...onxx` | 解码器模型 |
+| `--joiner` | `~/models/zipformer_kws/joiner-...-int8.onnx` | 连接器模型 (INT8) |
+| `--keywords-file` | `keywords.txt` | 唤醒词文件（与 kws_test.py 同目录） |
+| `-D / --device` | `plughw:0,0` | ALSA PCM 录音设备 |
+| `--num-threads` | `4` | 计算线程数 |
+| `--sample-rate` | `16000` | 期望采样率 |
+
+**检测参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--keywords-threshold` | `0.25` | 检测灵敏度。**越低越灵敏**（更容易触发但误报多），**越高越严格**（不易误报但可能漏检）。推荐范围 0.15~0.4 |
+| `--keywords-score` | `1.0` | 每个 token 的额外加分（增大可提高置信度门槛） |
+| `--num-trailing-blanks` | `2` | 关键词后需跟随的空白帧数。如果多个唤醒词共享前缀（如都有"小飞"），适当增大可减少串扰 |
+| `--max-active-paths` | `4` | beam search 活跃路径数 |
+
+**录音增益参数**（默认启用，自动拉满）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--capture-volume` | `100` | 麦克风录音增益 0-100% |
+| `--no-mic-boost` | 不传 | 禁用 ALC 自动增益 + Mic 输入切换 |
+| `--card` | `0` | ALSA 声卡编号 |
+
+#### 6.3.5 常见问题
+
+**Q: 检测不到唤醒词**
+
+按顺序排查：
+
+1. **先验证麦克风工作正常**：
+   ```bash
+   python3 audio_test.py --mode record -d 5 -o test.wav
+   python3 audio_test.py --mode play test.wav
+   # 确认录音和播放都正常
+   ```
+
+2. **降低阈值提高灵敏度**：
+   ```bash
+   python3 kws_test.py --keywords-threshold 0.1
+   ```
+
+3. **发音清晰**：唤醒词模型对发音标准度敏感，中文带声调的 ppinyin 建模要求音调准确。如果阈值太低导致误报太多，保持阈值在 0.2~0.3 之间，确保发音清晰、声调准确。
+
+**Q: 误触发太多（环境噪声被误识别为唤醒词）**
+
+```bash
+# 提高检测阈值
+python3 kws_test.py --keywords-threshold 0.4
+
+# 同时增大 trailing blanks 防止部分匹配
+python3 kws_test.py --keywords-threshold 0.4 --num-trailing-blanks 4
+```
+
+**Q: 说"小飞小飞"却触发了"小飞同学"（或反过来）**
+
+多个唤醒词共享前缀（都含"小飞"）时可能串扰。增大 `--num-trailing-blanks`：
+
+```bash
+python3 kws_test.py --num-trailing-blanks 4
+```
+
+**Q: 如何添加新唤醒词**
+
+直接编辑 `keywords.txt`，按 ppinyin 格式加一行：
+
+```bash
+# 先用 text2token 转换获取 ppinyin 分词
+python3 -c "
+import sherpa_onnx
+print(sherpa_onnx.text2token(
+    ['打开灯'],
+    tokens='/home/iflytek/models/zipformer_kws/tokens.txt',
+    tokens_type='phone+ppinyin',
+)[0])
+"
+```
+
+将输出的 token 序列复制到 `keywords.txt`，末尾加 ` @中文标注` 即可。
+
+**Q: 为什么 KWS 用 CPU 而不是 RKNN**
+
+KWS 模型（Zipformer）是 ONNX 格式且已 INT8 量化，~3MB 大小在 ARM CPU 上运行效率极高（RTF < 0.1），不需要 NPU 加速。CPU 推理延迟低且不占用 NPU 资源，方便与 ASR 识别器（用 RKNN）同时运行。
+
+**Q: 能否与 ASR 同时运行**
+
+可以。KWS 和 ASR 是独立的 sherpa-onnx 实例，互不冲突：
+
+```bash
+# 终端 1：唤醒词检测（常驻后台）
+python3 kws_test.py
+
+# 终端 2：语音识别（唤醒后手动启动或由程序自动拉起）
+python3 asr_test.py
+```
+
+ALSA `plughw:0,0` 支持多个进程同时打开（dmix/dsnoop 混音），两个程序可共用同一麦克风。
 ---
 
 
