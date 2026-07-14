@@ -15,6 +15,7 @@
   - [Level 3: SLAM 建图](#level-3-slam-建图)
   - [Level 4: 自主导航](#level-4-自主导航)
   - [Level 5: 智能应用](#level-5-智能应用)
+  - [Level 6: 语音交互](#level-6-语音交互)
 - [常见问题](#常见问题)
 
 ---
@@ -29,6 +30,7 @@ xflz_robot_car1 是一个基于 ROS2 的移动机械臂平台，具备以下功�
 - **机械臂**：5 自由度机械臂 + 夹爪
 - **感知**：激光雷达 + 深度相机
 - **导航**：SLAM 建图 + 自主导航
+- **语音**：语音识别（ASR）+ 语音合成（TTS）
 - **应用**：巡线、追踪、手势控制、视觉抓取
 
 ### 硬件配置
@@ -40,6 +42,7 @@ xflz_robot_car1 是一个基于 ROS2 的移动机械臂平台，具备以下功�
 | 机械臂 | 5-DOF + 夹爪 | 总线舵机 |
 | 雷达 | 国科光芯 COIN-D6 | 串口 230400，0.01-16m |
 | 相机 | 安思疆 HP60C | USB，640×480@25fps |
+| 音频 | ES8388 编解码器 | I2S，板载麦克风+功放 |
 | IMU | BMI088 | 六轴姿态传感器 |
 
 ### 项目结构
@@ -61,6 +64,8 @@ xflz_robot_car1/
 │   └── car1_navigation/       # Nav2 导航
 ├── app/                       # Phase 5: 智能应用
 │   └── car1_app/              # 巡线、追踪、抓取等
+├── interaction/               # Phase 6: 语音交互
+│   └── car1_speech/           # ASR 语音识别 + TTS 语音合成
 ├── simulations/               # 仿真
 │   ├── car1_description/      # URDF 模型
 │   ├── car1_gazebo/           # Gazebo 仿真
@@ -3200,6 +3205,471 @@ ros2 service call /navigation_grasp_transport/start std_srvs/srv/Trigger
 3. **多个放置区**：根据物体颜色/大小选择不同放置点
 4. **动态目标**：结合追踪算法，抓取移动中的物体
 5. **协作任务**：多机器人协作，一个抓取一个搬运
+
+---
+
+## Level 6: 语音交互
+
+> **目标**：测试板载 ES8388 音频硬件，后续集成语音识别与语音合成  
+> **所需时间**：30-60 分钟  
+> **硬件要求**：ES8388 音频编解码器（板载）  
+> **前置条件**：alsa-utils 已安装
+
+### 6.0 硬件概述
+
+RK3576 板卡集成了 **ES8388** 音频编解码器，通过 I2S 接口与主控通信：
+
+| 项目 | 说明 |
+|------|------|
+| 芯片 | ES8388 (rockchip-es8388) |
+| ALSA 声卡 | `hw:0,0` |
+| 麦克风 | 板载单路模拟麦克风（左声道） |
+| 输出 | 板载喇叭 + 耳机插孔 |
+| 采样格式 | S16_LE, 8000-48000 Hz |
+| 驱动 | ALSA 内核驱动 + amixer 混音控制 |
+
+**声卡信息查看**：
+
+```bash
+# 查看录音设备
+arecord -l
+
+# 查看播放设备
+aplay -l
+
+# 查看混音控制器
+amixer -c 0 scontrols
+```
+
+典型输出中 `card 0: rockchipes8388` 即为板载 ES8388。
+
+### 6.1 音频硬件测试（audio_test.py）
+
+> **目标**：验证 ES8388 录音和播放链路是否正常工作  
+> **所需时间**：5 分钟  
+> **硬件要求**：ES8388 音频编解码器
+
+#### 6.1.1 工具概述
+
+`audio_test.py` 位于 `interaction/car1_speech/tools/audio_test.py`，是一个**无 ROS2 依赖**的独立 ALSA 测试工具，提供三种模式：
+
+| 模式 | 说明 | 使用场景 |
+|------|------|---------|
+| **loopback** | 录音+播放同时进行（arecord \| aplay 管道） | 快速验证全链路 |
+| **record** | 只录音，保存为 WAV 文件 | 检查麦克风信号质量 |
+| **play** | 只播放 WAV 文件 | 检查喇叭/耳机输出 |
+
+**默认参数**（匹配 ES8388 硬件）：
+
+```
+设备:     hw:0,0
+采样率:   16000 Hz
+格式:     S16_LE
+声道:     2 (立体声，板载麦克风仅左声道有信号)
+mixer:    不修改（保持系统当前状态）
+```
+
+#### 6.1.2 基本用法
+
+```bash
+cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_speech/tools
+
+# 1. 边录边播（loopback）— 验证全链路
+python3 audio_test.py -d 5
+
+# 2. 只录音 — 检查麦克风
+python3 audio_test.py --mode record -d 5 -o rec.wav
+
+# 3. 只播放 — 检查喇叭/耳机
+python3 audio_test.py --mode play rec.wav
+
+# 4. 查看设备列表
+python3 audio_test.py -l
+
+# 5. 查看混音控制器状态
+python3 audio_test.py --list-mixer
+```
+
+#### 6.1.3 Loopback 模式（录音+播放）
+
+```bash
+# 无限录音+播放（Ctrl+C 停止）
+python3 audio_test.py
+
+# 限时 5 秒
+python3 audio_test.py -d 5
+
+# 同时保存录音文件
+python3 audio_test.py -d 5 --playback-volume 100 -o test.wav
+```
+
+#### 6.1.4 录音模式
+
+```bash
+# 默认参数录音 5 秒（16000 Hz, 立体声, S16_LE）
+python3 audio_test.py --mode record -d 5 -o rec.wav
+
+# 调整录音增益为 50% (-6dB)
+python3 audio_test.py --mode record -d 5 --capture-volume 50 -o rec.wav
+
+# 录音增益拉满（0dB = 最大信号）
+python3 audio_test.py --mode record -d 5 --capture-volume 100 -o rec.wav
+
+# 单声道录音（板载麦克风只有左声道）
+python3 audio_test.py --mode record -d 5 -c 1 -o rec_mono.wav
+```
+
+#### 6.1.5 播放模式
+
+```bash
+# 播放 WAV 文件（默认音量）
+python3 audio_test.py --mode play rec.wav
+
+# 指定播放音量 50% (-6dB)
+python3 audio_test.py --mode play --playback-volume 50 rec.wav
+
+# 播放音量拉满
+python3 audio_test.py --mode play --playback-volume 100 rec.wav
+```
+
+#### 6.1.6 混音器音量控制
+
+`--playback-volume` 和 `--capture-volume` 参数通过 **dB 值**控制混音器：
+
+| 百分比 | dB 值 | 音量感受 |
+|--------|-------|----------|
+| 100% | 0 dB | 最大（不衰减） |
+| 50% | -6 dB | 一半电压 |
+| 25% | -12 dB | 四分之一 |
+| 10% | -20 dB | 很轻 |
+
+**为什么用 dB 而不是原始百分比**：ES8388 的某些混音控制器（如 PCM、Capture Digital）是非线性刻度 —
+`amixer sset PCM 50%` 直接设为 50% raw 值会得到 -48 dB（近乎静音），而非直觉中的"一半音量"。
+工具内部使用 `20 × log₁₀(pct/100)` 换算为 dB 后通过 `amixer sset <ctl> -- -6.0dB` 设置，
+确保 50% = -6dB（真正的一半电压）。
+
+**影响的混音控制器**：
+
+| 参数 | 控制对象 | 说明 |
+|------|---------|------|
+| `--playback-volume` | 播放：Output 1, Output 2, PCM | Output 1/2 为模拟音量，PCM 为数字音量 |
+| `--capture-volume` | 录音：Left Channel, Right Channel, Capture Digital | Left/Right Channel 为前放（0~+24dB），Capture Digital 为数字增益 |
+
+**录音路径特殊处理**：Left/Right Channel（前放）始终固定在最大值 +24dB（最佳信噪比），
+只用 Capture Digital 实现音量衰减。这样 `--capture-volume 50` 时前放保持 +24dB，
+Capture Digital 设 -6dB，信号既不会被前放压死，又能获得准确的 50% 衰减。
+
+```bash
+# 播放 50% + 录音 50%
+python3 audio_test.py --playback-volume 50 --capture-volume 50 -d 5 -o test.wav
+
+# 播放 80% + 录音 100%（调试推荐）
+python3 audio_test.py --playback-volume 80 --capture-volume 100 -d 5 -o test.wav
+
+# 不传参数则不改动 mixer，使用系统当前状态
+python3 audio_test.py
+```
+
+#### 6.1.7 高级参数
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `--rec-device` | 独立的录音 PCM 设备 | `--rec-device plughw:0,0` |
+| `--playback-device` | 独立的播放 PCM 设备 | `--playback-device plughw:0,0` |
+| `-r / --rate` | 采样率 (Hz) | `-r 48000` |
+| `-c / --channels` | 声道数 | `-c 1` (单声道) |
+| `-f / --format` | 采样格式 | `-f S32_LE` |
+| `--period-size` | ALSA period 大小（帧），越小延迟越低 | `--period-size 512` |
+| `--buffer-size` | ALSA buffer 大小（帧），越大越稳定 | `--buffer-size 2048` |
+| `--card` | 声卡编号（用于 mixer 控制） | `--card 0` |
+| `-q / --quiet` | 静默模式 | |
+
+```bash
+# 低延迟 loopback
+python3 audio_test.py -d 5 --period-size 512 --buffer-size 2048
+
+# 独立录/放设备
+python3 audio_test.py -d 5 --rec-device hw:0,0 --playback-device plughw:0,0
+
+# 48kHz 录音
+python3 audio_test.py --mode record -r 48000 -d 5 -o rec_48k.wav
+```
+
+#### 6.1.8 常见问题
+
+**Q: 录音文件一个声道有声音、另一个声道没声音**
+
+这是**硬件正常现象**。ES8388 板子只接了一路模拟麦克风（左声道），右声道没有物理信号输入。
+右声道只会录到极低电平的底噪（峰值 ≈ 0.1%，RMS ≈ 6）。
+
+**解决方案**：
+- 使用 `-c 1` 参数（单声道录音），WAV 文件尺寸减半且无冗余静音通道
+- 或在应用层取左声道数据，忽略右声道
+
+**验证方法**：
+```bash
+# 检查录音文件左右声道信号
+python3 audio_test.py --mode record -d 3 -c 2 -o stereo.wav
+python3 -c "
+import struct
+with open('stereo.wav', 'rb') as f:
+    f.read(44)
+    data = f.read()
+    l_peak = r_peak = 0
+    for i in range(0, len(data), 4):
+        l_peak = max(l_peak, abs(struct.unpack_from('<h', data, i)[0]))
+        r_peak = max(r_peak, abs(struct.unpack_from('<h', data, i+2)[0]))
+    print(f'Left peak:  {l_peak:5d} ({100*l_peak/32768:.1f}%)')
+    print(f'Right peak: {r_peak:5d} ({100*r_peak/32768:.1f}%)')
+    print(f'Right silent: {r_peak < 20}')
+"
+# 预期：Left peak ~500-7000 (1-20%)，Right peak ~15-30 (<0.1%)
+```
+
+**Q: 播放音量太小**
+
+播放链路涉及多个混音控制器，逐一排查：
+
+```bash
+# 查看当前混音状态
+python3 audio_test.py --list-mixer
+
+# 拉满播放音量
+python3 audio_test.py --playback-volume 100 --mode play test.wav
+
+# 或手动设置
+amixer -c 0 sset "Output 1" -- 0dB
+amixer -c 0 sset "Output 2" -- 0dB
+amixer -c 0 sset "PCM" -- 0dB
+```
+
+**Q: 录音音量太小 / 信号微弱**
+
+录音链路的增益由 Left/Right Channel（前放 0~+24dB）决定，检查是否被意外拉低：
+
+```bash
+# 查看前放增益
+amixer -c 0 sget "Left Channel"
+# 显示 [0%] [0.00dB] = 前放被压死，几乎无信号
+# 显示 [100%] [24.00dB] = 最大增益
+
+# 恢复工厂默认
+amixer -c 0 sset "Left Channel" -- 24.0dB
+amixer -c 0 sset "Right Channel" -- 24.0dB
+amixer -c 0 sset "Capture Digital" -- 0dB
+```
+
+**Q: 播放听起来像"快进"**
+
+可能是单声道录音文件在立体声模式下播放时 I2S 时钟不匹配。
+ES8388 驱动在单声道模式下时钟配置可能异常，建议**始终使用默认立体声模式**（`-c 2`）。
+
+**Q: 喇叭/耳机没声音，但 aplay 正常退出**
+
+检查功放开关：
+
+```bash
+# 查看开关状态
+amixer -c 0 sget "spk switch"    # 喇叭功放
+amixer -c 0 sget "hp switch"     # 耳机功放
+
+# 如果显示 [off]，手动开启
+amixer -c 0 sset "spk switch" on
+amixer -c 0 sset "hp switch" on
+```
+
+### 6.2 语音识别测试（asr_test.py）
+
+> **目标**：使用 sherpa-onnx + Silero VAD + RKNN 实现流式语音识别  
+> **所需时间**：15 分钟  
+> **硬件要求**：ES8388 音频编解码器（板载麦克风）  
+> **前置条件**：sherpa-onnx 已安装，模型文件已就位
+
+#### 6.2.1 工具概述
+
+`asr_test.py` 位于 `interaction/car1_speech/tools/asr_test.py`，是一个**无 ROS2 依赖**的独立流式语音识别测试工具。
+
+**识别引擎架构**：
+
+```
+ALSA 麦克风 → VoiceActivityDetector (Silero VAD) → [语音段] → OnlineRecognizer (Zipformer + RKNN) → 终端输出
+                                  ↗ 预语音缓冲区 (0.5s) 补回头部
+```
+
+**核心组件**：
+
+| 组件 | 说明 |
+|------|------|
+| **OnlineRecognizer** | sherpa-onnx 流式识别器，使用 Zipformer transducer 模型 |
+| **Silero VAD** | 语音活动检测，精确切分语音段（替代基于静音时长的规则端点检测） |
+| **RKNN Provider** | NPU 加速推理（仅 ASR 模型；VAD 模型为 ONNX 格式，固定 CPU 运行） |
+| **ALSA 输入** | 直接从 `plughw:0,0` 读取麦克风音频 |
+| **预语音缓冲** | CircularBuffer（~0.5s），VAD 检测到语音起点后回补，避免丢失首个字 |
+
+**模型文件**（默认路径）：
+
+| 文件 | 路径 | 格式 |
+|------|------|------|
+| tokens | `~/models/zipformer/tokens.txt` | 文本 |
+| encoder | `~/models/zipformer/encoder.rknn` | RKNN (NPU) |
+| decoder | `~/models/zipformer/decoder.rknn` | RKNN (NPU) |
+| joiner | `~/models/zipformer/joiner.rknn` | RKNN (NPU) |
+| Silero VAD | `~/models/vad/silero_vad.onnx` | ONNX (CPU，~600KB) |
+
+#### 6.2.2 基本用法
+
+```bash
+cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_speech/tools
+
+# 默认参数运行（capture=100%, ALC 自动增益, RKNN 推理）
+python3 asr_test.py
+
+# CPU 模式（无 NPU 时使用）
+python3 asr_test.py --provider cpu
+
+# 关闭 ALC 自动增益
+python3 asr_test.py --no-mic-boost
+
+# 降低录音增益（如果环境噪声大）
+python3 asr_test.py --capture-volume 60
+```
+
+启动后语音识别进入流式模式：
+- `[部分识别结果]` — 实时刷新，显示当前已识别内容
+- `[Final] 完整识别结果` — 语音段结束后输出最终文本
+- `Ctrl+C` — 退出
+
+#### 6.2.3 完整参数参考
+
+**模型与设备**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--tokens` | `~/models/zipformer/tokens.txt` | 词表文件 |
+| `--encoder` | `~/models/zipformer/encoder.rknn` | 编码器模型 (RKNN) |
+| `--decoder` | `~/models/zipformer/decoder.rknn` | 解码器模型 (RKNN) |
+| `--joiner` | `~/models/zipformer/joiner.rknn` | 连接器模型 (RKNN) |
+| `--vad-model` | `~/models/vad/silero_vad.onnx` | VAD 模型 (ONNX) |
+| `-D / --device` | `plughw:0,0` | ALSA PCM 录音设备 |
+| `--provider` | `rknn` | ONNX 推理后端 (cpu / rknn) |
+| `--num-threads` | `4` | 计算线程数 |
+| `--sample-rate` | `16000` | 期望采样率 |
+
+**解码参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--decoding-method` | `greedy_search` | 解码方式 (greedy_search / modified_beam_search) |
+| `--max-active-paths` | `4` | beam search 活跃路径数 |
+| `--blank-penalty` | `0.5` | blank 符号惩罚值。越高保留越多边缘帧，减少首个/末个字丢失；设 0 相当于不惩罚 |
+
+**VAD 参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--vad-threshold` | `0.5` | 语音概率阈值（0.3 更敏感，0.7 更严格） |
+| `--vad-min-silence` | `0.5` | 判定语音结束的静音时长（秒） |
+| `--vad-min-speech` | `0.25` | 最短语音持续时长（秒），低于此值的触发被忽略 |
+| `--vad-max-speech` | `20.0` | 最长语音持续时长（秒），超过则强制截断 |
+
+**录音增益参数**（默认启用，自动拉满）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--capture-volume` | `100` | 麦克风录音增益 0-100%（100%=0dB 无衰减，preamp 24dB） |
+| `--no-mic-boost` | 不传 | 禁用 ALC 自动增益 + Mic 输入切换 |
+| `--card` | `0` | ALSA 声卡编号 |
+
+**其他**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--pre-speech-buffer` | `0.5` | VAD 触发前的音频缓冲时间（秒） |
+| `--chunk-size` | `4000` | 每次从 ALSA 读取的采样点（~250ms@16kHz） |
+| `--debug` | 不传 | 启用调试输出 |
+
+#### 6.2.4 常见问题
+
+**Q: 开着 ALSA 设备启动了 ALC 输入还是小于正常值**
+
+这通常是 ALSA 设备实际采样率与期望不一致导致驱动内部过采样（如 44100→16000 重采样时信号被压缩）。
+检查启动日志中 `actual sample rate` 的值：
+
+```bash
+python3 asr_test.py 2>&1 | head -20
+# 查找 expected sample rate 和 actual sample rate
+```
+
+如果 actual 不是 16000，确认跑的是 RK3576 板载 ES8388 驱动，并检查 `~/.asoundrc` 是否意外配置了 dmix/dsnoop。
+
+**Q: 声音小识别不到**
+
+默认已经拉满录音增益（capture-volume=100 + ALC 开启）。如果仍偏小：
+
+```bash
+# 确认混音器状态
+python3 audio_test.py --list-mixer
+
+# 手动检查录音链路
+amixer -c 0 sget "Left Channel"    # 应为 [100%] [24.00dB]
+amixer -c 0 sget "Right Channel"   # 应为 [100%] [24.00dB]
+amixer -c 0 sget "Capture Digital" # 应接近 0dB
+
+# 确认 ALC 已开启
+amixer -c 0 sget "ALC Capture Function"  # 应为 Stereo
+
+# 确认输入切到 Mic
+amixer -c 0 sget "Left Line Mux"   # 应为 MicL
+amixer -c 0 sget "Right Line Mux"  # 应为 MicR
+```
+
+**Q: 第一个字总是被丢掉**
+
+预语音缓冲区（0.5s）默认已处理此问题。如果仍偶尔丢失，可适当增大：
+
+```bash
+python3 asr_test.py --pre-speech-buffer 0.8
+```
+
+同时可以尝试调整 `--blank-penalty`（默认 0.5），设为 1.0 让模型更倾向于保留边缘音频帧：
+
+```bash
+python3 asr_test.py --blank-penalty 1.0
+```
+
+**Q: 短语音被重复输出多次**
+
+以前的裸端点检测（rule1/rule2/rule3）对中文短音节不敏感，短词可能被反复解码。
+现在已改用 Silero VAD 精确分段，每条语音段结束后只输出一次 [Final] 结果。
+
+**Q: RKNN 模型加载失败**
+
+```
+E RKNN: parseRKNN: invalid RKNN_MAGIC!
+```
+
+ASR 模型（encoder/decoder/joiner）必须是 `.rknn` 格式才能用 `--provider rknn`。
+VAD 模型（silero_vad）是 ONNX 格式，工具内部已固定用 CPU 加载，无需配置。
+
+如果 ASR 模型也不是 RKNN 格式（如从官方下载的 ONNX），改 `--provider cpu` 即可：
+
+```bash
+python3 asr_test.py --provider cpu
+```
+
+**Q: VAD 太灵敏 / 太迟钝**
+
+- 太灵敏（环境噪声被误识别为语音）：降低 `--vad-threshold` 到 0.7
+- 太迟钝（正常说话不被检测）：提高 `--vad-threshold` 到 0.3
+- 停顿较长时被切句：增大 `--vad-min-silence` 到 1.0
+
+```bash
+# 安静环境，提高灵敏度
+python3 asr_test.py --vad-threshold 0.3
+
+# 嘈杂环境，降低误触发
+python3 asr_test.py --vad-threshold 0.7 --vad-min-speech 0.5
+```
 
 ---
 
