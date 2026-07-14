@@ -20,6 +20,7 @@
     - [6.2 语音识别测试](#62-语音识别测试asr_testpy)
     - [6.3 语音唤醒测试](#63-语音唤醒测试kws_testpy)
     - [6.4 本地大模型服务](#64-本地大模型服务llm_serverpy--llm_testpy)
+    - [6.5 Function Calling 工具调用](#65-function-calling-工具调用)
 - [常见问题](#常见问题)
 
 ---
@@ -4126,6 +4127,137 @@ python3 llm_test.py
 - `config/skills.yaml`：技能定义
 
 ROS2 集成的前提是 RKLLM server 已在后台运行。
+
+**Q: 什么是预填充延迟？**
+
+tools 模式下用户输入后停顿几秒才出结果，这是 **Transformer 预填充 (prefill)** 引起的。预填充阶段模型需要一次算完所有输入（工具定义 + 对话历史 + 用户问题），这个阶段**没有任何输出**。RK3576 上 0.8B 模型的预填充约需 4-6 秒，首 token 出来后的生成速度为 8-12 tokens/s。
+
+这已经是 W4A16 量化 + RK3576 NPU 的硬件上限，代码层面已无可优化空间。如需更低延迟，考虑使用更小的模型（0.5B/0.3B）。
+
+---
+
+### 6.5 Function Calling 工具调用
+
+> **目标**：让本地大模型自动调用预定义函数来回答问题（获取时间、查系统状态、计算器等）  
+> **所需时间**：5 分钟  
+> **前置条件**：RKLLM server 已在后台运行
+
+#### 6.5.1 工作原理
+
+Function calling 让模型在遇到它无法直接回答的问题时，输出一个结构化调用指令 `<tool_call>`，由客户端执行对应函数后返回结果。
+
+```
+用户: "现在几点"        → 模型: <tool_call>{"name":"get_current_time"}</tool_call>
+                                 ↓
+                        客户端: 执行 get_current_time() → {"datetime":"2026-07-14 18:30:00",...}
+                                 ↓
+                        直接返回 JSON 给用户
+```
+
+**关键文件**：
+
+| 文件 | 说明 |
+|------|------|
+| `tools_config.py` | 工具定义（TOOLS schema + FUNCTION_MAP 实现 + 解析器） |
+| `llm_test.py` | 客户端，`--mode tools` 进入 function calling 模式 |
+
+#### 6.5.2 使用方式
+
+```bash
+cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_llm/tools
+
+# 先确保 server 在运行
+python3 llm_server.py
+
+# 另一个终端，进入 function calling 模式
+python3 llm_test.py --mode tools
+```
+
+```
+You > 现在几点
+AI  > {
+  "datetime": "2026-07-14 18:30:00",
+  "date": "2026-07-14",
+  "time": "18:30:00",
+  "weekday": "Tuesday"
+}
+
+You > 3.14 * 2 + 100
+AI  > {
+  "expression": "3.14 * 2 + 100",
+  "result": 106.28
+}
+```
+
+输入 `tools` 查看可用工具列表，`clear` 清除对话，`quit` 退出。
+
+#### 6.5.3 预置工具
+
+| 工具 | 函数名 | 说明 |
+|------|--------|------|
+| 获取时间 | `get_current_time` | 返回当前日期、时间、星期 |
+| 系统信息 | `get_system_info` | 主机名、运行时间、CPU 温度 |
+| 计算器 | `calculator` | 安全计算数学表达式 |
+| 电池状态 | `get_battery_status` | 电压、电量百分比 |
+
+#### 6.5.4 添加自定义工具
+
+只需在 `tools_config.py` 中做三件事：
+
+**Step 1：实现函数**
+
+```python
+def get_weather(city: str):
+    # 实际项目中可调用天气 API
+    return {"city": city, "temperature": 25, "weather": "晴"}
+```
+
+**Step 2：注册到 FUNCTION_MAP**
+
+```python
+FUNCTION_MAP = {
+    ...
+    "get_weather": get_weather,   # 新增
+}
+```
+
+**Step 3：添加到 TOOLS schema**
+
+```python
+TOOLS = [
+    ...
+    {"type": "function", "function": {"name": "get_weather", "description": "天气查询"}},
+]
+```
+
+**描述文本尽量简短**（1-2 个词），因为每条工具描述都会增加预填充阶段的输入 token，延长等待时间。
+
+#### 6.5.5 性能说明
+
+| 指标 | 数值 |
+|------|------|
+| 预填充延迟 | ~5-6 秒（硬件限制） |
+| 首 token 后生成速度 | 8-12 tokens/s |
+| 工具调用总耗时 | ~6 秒（单轮，含预填充 + 生成） |
+
+tools 模式已将输入精简到极致（无 system prompt，tools schema 仅 name + 1 词描述，max_tokens=128），单轮调用无二轮推理。剩余延迟均为 RK3576 NPU 的硬件预填充吞吐量上限。
+
+#### 6.5.6 常见问题
+
+**Q: 模型不调用工具，直接凭空回答**
+
+小模型（0.8B）的 function calling 能力有限，某些问法可能不被识别为工具调用。试试换一下表述：
+
+- `几点了` → `现在几点` / `获取当前时间`
+- `电池` → `查看电池状态` / `读取电量`
+
+**Q: 模型输出了格式错误**
+
+小模型偶尔会输出不规范的 `<tool_call>` 标签，parse 失败时 `llm_test.py` 会直接把原始文本打印出来。重新问一次通常能正常。
+
+**Q: 预填充太慢**
+
+参考 6.4.5 中关于预填充延迟的说明。工具定义越少、越短，等待越短。不需要的工具可以从 TOOLS 列表中注释掉。
 
 ---
 
