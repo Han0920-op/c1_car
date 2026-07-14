@@ -19,6 +19,7 @@
     - [6.1 音频硬件测试](#61-音频硬件测试audio_testpy)
     - [6.2 语音识别测试](#62-语音识别测试asr_testpy)
     - [6.3 语音唤醒测试](#63-语音唤醒测试kws_testpy)
+    - [6.4 本地大模型服务](#64-本地大模型服务llm_serverpy--llm_testpy)
 - [常见问题](#常见问题)
 
 ---
@@ -3878,6 +3879,254 @@ python3 asr_test.py
 ```
 
 ALSA `plughw:0,0` 支持多个进程同时打开（dmix/dsnoop 混音），两个程序可共用同一麦克风。
+
+---
+
+### 6.4 本地大模型服务（llm_server.py + llm_test.py）
+
+> **目标**：在 RK3576 上部署 Qwen3.5-0.8B 大模型，通过 OpenAI 兼容 API 提供本地推理服务  
+> **所需时间**：10 分钟  
+> **硬件要求**：RK3576 板卡，RKLLM 运行时已安装  
+> **前置条件**：librkllmrt.so 已安装到 `/usr/lib/`，RKLLM 模型已转换
+
+#### 6.4.1 工具概述
+
+`llm_server.py` 和 `llm_test.py` 位于 `interaction/car1_llm/tools/`，是**无 ROS2 依赖**的独立工具，实现客户端-服务端架构的本地大模型对话。
+
+**服务架构**：
+
+```
+┌────────────────────────────────┐     HTTP (OpenAI API)
+│  llm_server.py (服务端)         │ ◄─────────────────────  llm_test.py (客户端)
+│                                │                         (交互式对话)
+│  RKLLM Runtime (NPU 推理)      │     /v1/chat/completions
+│  Qwen3.5-0.8B  W4A16 量化     │     SSE 流式输出
+│  Flask HTTP Server :8080       │
+└────────────────────────────────┘
+```
+
+**核心组件**：
+
+| 组件 | 说明 |
+|------|------|
+| **RKLLM Runtime** | Rockchip NPU 大模型推理引擎（librkllmrt.so） |
+| **Qwen3.5-0.8B** | 通义千问 0.8B 参数模型，W4A16 量化（~500MB），专为端侧优化 |
+| **Flask Server** | 轻量 HTTP 服务，OpenAI 兼容 `/v1/chat/completions` 接口 |
+| **流式输出 (SSE)** | 逐 token 实时返回，体验接近云端大模型 |
+| **频率锁定** | 可选的 NPU/CPU/GPU/DDR 频率锁定，提升推理性能 |
+
+**模型文件**：
+
+| 文件 | 路径 | 说明 |
+|------|------|------|
+| RKLLM 模型 | `~/models/rkllm/Qwen3.5-0.8B_w4a16_g128_rk3576.rkllm` | W4A16 量化文本模型 |
+| 视觉编码器 | `~/models/rkllm/Qwen3.5-0.8B_vision_rk3576.rknn` | 视觉编码模型（暂未启用） |
+
+#### 6.4.2 基本用法
+
+**启动服务端**：
+
+```bash
+cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_llm/tools
+
+# 普通启动（不做频率锁定，可直接运行）
+python3 llm_server.py
+
+# 启动 + 锁定 NPU/CPU/GPU/DDR 到最高频率（会提示输入 sudo 密码）
+python3 llm_server.py --fix-freq
+
+# 使用自定义模型
+python3 llm_server.py --model /path/to/custom.rkllm --platform rk3576
+```
+
+服务端启动成功后：
+
+```
+============================================================
+RKLLM Server
+============================================================
+  Model:    Qwen3.5-0.8B_w4a16_g128_rk3576
+  Platform: rk3576
+  Fix freq: no (use --fix-freq to lock clocks)
+  API:      http://0.0.0.0:8080/v1/chat/completions
+============================================================
+ * Running on http://127.0.0.1:8080
+ * Running on http://10.1.134.82:8080
+```
+
+**启动客户端**（另开终端）：
+
+```bash
+cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_llm/tools
+
+# 交互式对话（流式输出，逐 token 实时显示）
+python3 llm_test.py
+
+# 连接远程服务器
+python3 llm_test.py --server http://192.168.1.100:8080
+
+# 单次提问（非交互模式）
+python3 llm_test.py --prompt "你好，介绍一下自己"
+
+# 非流式（等完整回复后一次性输出）
+python3 llm_test.py --no-stream
+```
+
+**客户端交互说明**：
+
+```
+You > 你是谁？
+AI  > 我是通义千问，由阿里云开发的大型语言模型...
+
+You > 什么是麦克纳姆轮？
+AI  > 麦克纳姆轮是一种全向轮...
+
+You > clear                      # 清除对话历史
+You > quit                       # 退出（也可用 exit / q / Ctrl+C）
+```
+
+#### 6.4.3 频率锁定（可选）
+
+`--fix-freq` 参数会在启动前禁用 CPU 深度睡眠并将 NPU/CPU/GPU/DDR 锁定到最高频率，提升推理性能。
+
+| 时钟域 | 锁定频率 | 说明 |
+|--------|---------|------|
+| NPU | 950 MHz | 最高推理吞吐 |
+| CPU (A55) | 2.0 GHz | 后处理加速 |
+| CPU (A72) | 2.2 GHz | 后处理加速 |
+| GPU | 900 MHz | 避免访存瓶颈 |
+| DDR | 1.85 GHz | 避免访存瓶颈 |
+
+> **注意**：频率锁定通过写入 `/sys/` 伪文件系统实现，需要 root 权限。`llm_server.py` 内部用 `sudo` 仅执行频率锁定这一步，server 进程本身以普通用户运行。频率设置在重启后自动恢复默认值，不会永久修改硬件。
+
+```bash
+# 带频率锁定的启动（会提示输入 sudo 密码）
+python3 llm_server.py --fix-freq
+```
+
+频率锁定脚本保存在同目录的 `fix_freq_rk3576.sh`，可单独运行：
+
+```bash
+sudo bash fix_freq_rk3576.sh
+```
+
+#### 6.4.4 完整参数参考
+
+**服务端（llm_server.py）**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--model` | `~/models/rkllm/Qwen3.5-0.8B_w4a16_g128_rk3576.rkllm` | RKLLM 模型路径 |
+| `--platform` | `rk3576` | 目标平台 (rk3588 / rk3576 / rv1126b / rk3562) |
+| `--fix-freq` | 不传 | 锁定 NPU/CPU/GPU/DDR 到最高频率 |
+| `--lora-model` | 不传 | 可选的 LoRA 适配器路径 |
+| `--prompt-cache` | 不传 | 可选的 prompt cache 文件路径 |
+
+**客户端（llm_test.py）**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--server` | `http://127.0.0.1:8080` | RKLLM 服务器地址 |
+| `--prompt` | 不传 | 单次提问（非交互模式） |
+| `--no-stream` | 不传 | 关闭流式输出，等完整回复 |
+| `--temperature` | `0.8` | 采样温度（越高越随机，0.5 更确定） |
+| `--top-p` | `0.9` | Nucleus 采样阈值 |
+| `--max-tokens` | `4096` | 最大生成 token 数 |
+| `--repeat-penalty` | `1.1` | 重复惩罚（>1.0 减少重复） |
+| `--enable-thinking` | 不传 | 启用深度思考模式（Qwen3 特性） |
+| `--timeout` | `120` | HTTP 请求超时秒数 |
+
+#### 6.4.5 常见问题
+
+**Q: 提示 `ModuleNotFoundError: No module named 'flask'`**
+
+Flask 需要安装到 ros2_venv 中：
+
+```bash
+pip3 install flask
+```
+
+确认安装成功：
+
+```bash
+python3 -c "from flask import Flask; print('Flask OK')"
+```
+
+**Q: `Permission denied` 写入 `/sys/` 失败**
+
+这些报错来自 `flask_server.py` 内部第二次调用 fix_freq 脚本，假 sudo 没有 root 权限。**不影响功能**——真正的频率锁定已在 server 启动前完成（`--fix-freq` 时）或不需要（不加 `--fix-freq` 时）。
+
+如果这些报错干扰阅读，用不带 `--fix-freq` 的方式启动即可：
+
+```bash
+python3 llm_server.py
+```
+
+**Q: rkllm init 失败**
+
+```
+E rknn: rknn_init, load model failed!
+```
+
+模型文件路径错误或模型与平台不匹配：
+
+```bash
+# 确认模型文件存在
+ls -lh ~/models/rkllm/
+
+# 确认 librkllmrt.so 在 /usr/lib/ 下
+ls -l /usr/lib/librkllmrt.so
+```
+
+**Q: 推理速度慢**
+
+- 使用 `--fix-freq` 锁定频率：`python3 llm_server.py --fix-freq`
+- 模型加载需要 ~20 秒，后续推理逐 token 流式输出
+- W4A16 量化模型在 RK3576 上典型推理速度：~8-12 tokens/s
+
+**Q: 返回内容重复**
+
+调大 `--repeat-penalty` 减少重复：
+
+```bash
+python3 llm_test.py --repeat-penalty 1.3
+```
+
+或降低 `--temperature` 让输出更确定：
+
+```bash
+python3 llm_test.py --temperature 0.5
+```
+
+**Q: 能否与 KWS / ASR 同时运行**
+
+可以。三者是独立的进程，互不冲突：
+
+```bash
+# 终端 1：唤醒词检测（常驻后台）
+python3 kws_test.py
+
+# 终端 2：RKLLM 大模型服务
+python3 llm_server.py
+
+# 终端 3：语音识别（按需启动）
+# python3 asr_test.py
+
+# 终端 4：LLM 客户端（按需启动）
+python3 llm_test.py
+```
+
+**Q: 能否作为 ROS2 节点使用**
+
+`car1_llm` 包中已包含 ROS2 集成：
+- `car1_llm/chat_node.py`：ROS2 大模型对话节点
+- `car1_llm/skill_executor.py`：技能执行器
+- `launch/llm.launch.py`：启动文件
+- `config/llm.yaml`：LLM 配置
+- `config/skills.yaml`：技能定义
+
+ROS2 集成的前提是 RKLLM server 已在后台运行。
+
 ---
 
 
