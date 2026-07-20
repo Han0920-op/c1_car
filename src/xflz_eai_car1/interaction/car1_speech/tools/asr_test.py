@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 """
-ASR streaming test using sherpa-onnx with ALSA microphone + Silero VAD + RKNN.
+ASR streaming test using sherpa-onnx with ALSA microphone + RKNN.
 
-The VAD (Voice Activity Detector) precisely segments speech from silence,
-solving two common problems:
-  1. Audio at beginning/end being lost (deletion)
-  2. Repeated output on short utterances
+Uses sherpa-onnx built-in endpoint detection (same as RK3588 version).
+This preserves the recognizer's streaming context across the entire session,
+which is critical for Zipformer accuracy.
 
 Mimics the behavior of:
   sherpa-onnx-alsa --tokens=~/models/zipformer/tokens.txt \\
                    --encoder=~/models/zipformer/encoder.rknn \\
                    --decoder=~/models/zipformer/decoder.rknn \\
                    --joiner=~/models/zipformer/joiner.rknn \\
-                   --provider=rknn --num-threads=-4 \\
+                   --provider=rknn --num-threads=1 \\
                    --decoding-method=greedy_search plughw:0,0
 
 Usage:
   python3 asr_test.py                                       # default params
   python3 asr_test.py --provider cpu                        # CPU fallback
-  python3 asr_test.py                                       # default (capture=100%, ALC on)
   python3 asr_test.py --no-mic-boost                        # disable ALC
   python3 asr_test.py --capture-volume 60                   # lower mic volume
 """
 
 import argparse
-import collections
 import math
 import signal
 import subprocess
@@ -124,8 +121,6 @@ Examples:
                         default="/home/iflytek/models/zipformer/decoder.rknn")
     parser.add_argument("--joiner",
                         default="/home/iflytek/models/zipformer/joiner.rknn")
-    parser.add_argument("--vad-model",
-                        default="/home/iflytek/models/vad/silero_vad.onnx")
 
     # ---- Device ----
     parser.add_argument("-D", "--device", default="plughw:0,0",
@@ -135,31 +130,31 @@ Examples:
     parser.add_argument("--provider", default="rknn",
                         choices=["cpu", "rknn"],
                         help="ONNX execution provider (default: rknn)")
-    parser.add_argument("--num-threads", type=int, default=4)
+    parser.add_argument("--num-threads", type=int, default=1,
+                        help="For RKNN, this is NPU core mask (default: 1 = auto)")
     parser.add_argument("--sample-rate", type=int, default=16000)
 
     # ---- Decoding ----
     parser.add_argument("--decoding-method", default="greedy_search",
                         choices=["greedy_search", "modified_beam_search"])
-    parser.add_argument("--max-active-paths", type=int, default=4)
-    parser.add_argument("--blank-penalty", type=float, default=0.5,
-                        help="Penalty on blank symbol (higher = fewer deletions). "
-                             "0.3-0.5 helps avoid losing beginning/end of speech. (default: 0.5)")
+    parser.add_argument("--blank-penalty", type=float, default=0.0,
+                        help="Penalty on blank symbol (default: 0.0, same as RK3588)")
 
-    # ---- VAD ----
-    parser.add_argument("--vad-threshold", type=float, default=0.5,
-                        help="VAD speech probability threshold (default: 0.5)")
-    parser.add_argument("--vad-min-silence", type=float, default=0.5,
-                        help="VAD min silence to end speech segment, seconds (default: 0.5)")
-    parser.add_argument("--vad-min-speech", type=float, default=0.25,
-                        help="VAD min speech duration, seconds (default: 0.25)")
-    parser.add_argument("--vad-max-speech", type=float, default=20.0,
-                        help="VAD max speech duration before forced cutoff, seconds (default: 20.0)")
+    # ---- Endpoint detection (built-in, replaces external VAD) ----
+    parser.add_argument("--rule1-min-trailing-silence", type=float, default=2.4,
+                        help="Rule 1: min trailing silence for endpoint (default: 2.4s)")
+    parser.add_argument("--rule2-min-trailing-silence", type=float, default=1.2,
+                        help="Rule 2: min trailing silence after non-empty result (default: 1.2s)")
+    parser.add_argument("--rule3-min-utterance-length", type=float, default=300.0,
+                        help="Rule 3: min utterance length to trigger endpoint (default: 300s = effectively disabled)")
 
     # ---- Feature extraction ----
     parser.add_argument("--feature-dim", type=int, default=80)
-    parser.add_argument("--low-freq", type=float, default=20.0)
-    parser.add_argument("--high-freq", type=float, default=-400.0)
+
+    # ---- Hotwords ----
+    parser.add_argument("--hotwords-file", type=str, default="",
+                        help="Path to hotwords file for biasing")
+    parser.add_argument("--hotwords-score", type=float, default=1.5)
 
     # ---- Capture volume & mic boost ----
     parser.add_argument("--card", type=int, default=0)
@@ -170,15 +165,6 @@ Examples:
 
     # ---- Debug ----
     parser.add_argument("--debug", action="store_true")
-
-    # ---- Pre-speech buffer ----
-    parser.add_argument("--pre-speech-buffer", type=float, default=0.5,
-                        help="Seconds of audio to buffer before VAD triggers. "
-                             "Prevents losing the first word. (default: 0.5)")
-
-    # ---- Read chunk ----
-    parser.add_argument("--chunk-size", type=int, default=4000,
-                        help="Samples per ALSA read (default: 4000, ~250ms @ 16kHz)")
 
     args = parser.parse_args()
 
@@ -195,39 +181,9 @@ Examples:
         print("  Mic boost: disabled")
 
     # -----------------------------------------------------------------------
-    # Build VAD
+    # Build recognizer (with built-in endpoint detection, matches RK3588 config)
     # -----------------------------------------------------------------------
-    print("Initializing VAD...")
-    silero_vad_config = sherpa_onnx.SileroVadModelConfig(
-        model=args.vad_model,
-        threshold=args.vad_threshold,
-        min_silence_duration=args.vad_min_silence,
-        min_speech_duration=args.vad_min_speech,
-        max_speech_duration=args.vad_max_speech,
-    )
-    # VAD always runs on CPU — the Silero VAD model is ONNX format (not RKNN),
-    # is tiny (~600 KB), and runs faster on CPU than the overhead of NPU dispatch.
-    vad_config = sherpa_onnx.VadModelConfig(
-        silero_vad=silero_vad_config,
-        sample_rate=args.sample_rate,
-        num_threads=args.num_threads,
-        provider="cpu",
-        debug=args.debug,
-    )
-    vad = sherpa_onnx.VoiceActivityDetector(
-        config=vad_config,
-        buffer_size_in_seconds=args.vad_max_speech + 5,
-    )
-    print(f"  model:    {args.vad_model}")
-    print(f"  threshold:  {args.vad_threshold}")
-    print(f"  min_silence: {args.vad_min_silence}s")
-    print(f"  min_speech:  {args.vad_min_speech}s")
-    print(f"  max_speech:  {args.vad_max_speech}s")
-
-    # -----------------------------------------------------------------------
-    # Build recognizer
-    # -----------------------------------------------------------------------
-    print("\nInitializing recognizer...")
+    print("Initializing recognizer...")
     print(f"  tokens:   {args.tokens}")
     print(f"  encoder:  {args.encoder}")
     print(f"  decoder:  {args.decoder}")
@@ -236,22 +192,26 @@ Examples:
     print(f"  threads:  {args.num_threads}")
     print(f"  method:   {args.decoding_method}")
     print(f"  blank_penalty: {args.blank_penalty}")
+    print(f"  rule1 silence: {args.rule1_min_trailing_silence}s")
+    print(f"  rule2 silence: {args.rule2_min_trailing_silence}s")
 
     recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
         tokens=args.tokens,
         encoder=args.encoder,
         decoder=args.decoder,
         joiner=args.joiner,
-        provider=args.provider,
         num_threads=args.num_threads,
         sample_rate=args.sample_rate,
         feature_dim=args.feature_dim,
-        low_freq=args.low_freq,
-        high_freq=args.high_freq,
+        enable_endpoint_detection=True,
+        rule1_min_trailing_silence=args.rule1_min_trailing_silence,
+        rule2_min_trailing_silence=args.rule2_min_trailing_silence,
+        rule3_min_utterance_length=args.rule3_min_utterance_length,
         decoding_method=args.decoding_method,
-        max_active_paths=args.max_active_paths,
+        provider=args.provider,
+        hotwords_file=args.hotwords_file,
+        hotwords_score=args.hotwords_score,
         blank_penalty=args.blank_penalty,
-        debug=args.debug,
     )
 
     # -----------------------------------------------------------------------
@@ -263,34 +223,24 @@ Examples:
     expected_rate = alsa.expected_sample_rate
     print(f"  expected sample rate: {expected_rate}")
     print(f"  actual sample rate:   {actual_rate}")
-    sample_rate = actual_rate if actual_rate > 0 else args.sample_rate
+    # sherpa_onnx.Alsa internally resamples to 16kHz — always feed the
+    # recognizer at the model's rate, regardless of hardware capture rate.
+    sample_rate = args.sample_rate
 
     # -----------------------------------------------------------------------
-    # Streaming recognition loop (VAD-driven)
+    # Streaming recognition loop
     #
-    # Architecture:
-    #   ALSA → VAD → [speech segment] → Recognizer → final text
-    #                                    ↘ streaming decode → partial text
+    # Architecture (same as RK3588 offline_stt.py):
+    #   ALSA → Recognizer (streaming decode + built-in endpoint detection)
+    #        → is_endpoint() → reset stream, keep going
     #
-    # VAD handles speech/non-speech segmentation precisely, avoiding:
-    #   - Lost audio at utterance boundaries
-    #   - False endpoints from silence-based heuristics
+    # A SINGLE stream is used across the whole session (only reset on endpoint,
+    # not recreated).  This preserves the recognizer's temporal context, which
+    # is critical for Zipformer accuracy.
     # -----------------------------------------------------------------------
-    # -----------------------------------------------------------------------
-    # Pre-speech buffer — a rolling window of recent audio samples.
-    #
-    # VAD needs ~0.3-0.5s to confirm speech has started. By the time
-    # is_speech_detected() returns True, those first frames have already been
-    # consumed.  We keep the last N samples so we can prepend them to the
-    # recognizer when speech begins.  Using deque with maxlen instead of
-    # sherpa_onnx.CircularBuffer to avoid overflow warnings on long silence.
-    pre_speech_samples = int(args.pre_speech_buffer * args.sample_rate)
-    pre_num_chunks = max(1, pre_speech_samples // args.chunk_size)
-    pre_buf = collections.deque(maxlen=pre_num_chunks)
-
-    print(f"  pre-speech buffer: {args.pre_speech_buffer}s "
-          f"({pre_num_chunks} chunks × {args.chunk_size} samples)")
-    print(f"\nListening... (Ctrl+C to stop)\n")
+    samples_per_read = int(0.1 * sample_rate)  # 100 ms per read (same as RK3588)
+    print(f"\nsamples per read: {samples_per_read} (~100ms)")
+    print(f"\nStarted! Please speak (Ctrl+C to stop)\n")
 
     running = True
 
@@ -302,77 +252,47 @@ Examples:
     signal.signal(signal.SIGINT, on_sigint)
 
     stream = recognizer.create_stream()
-    in_speech = False
-    last_partial = ""
+    last_result = ""
+    segment_id = 0
 
     try:
         while running:
-            samples = alsa.read(args.chunk_size)
+            samples = alsa.read(samples_per_read)  # blocking read
             if not samples:
                 continue
 
-            # Always keep a rolling window of recent audio (VAD needs it too)
-            vad.accept_waveform(samples)
-            pre_buf.append(samples)
+            stream.accept_waveform(sample_rate, samples)
+            while recognizer.is_ready(stream):
+                recognizer.decode_stream(stream)
 
-            if vad.is_speech_detected():
-                if not in_speech:
-                    # Speech just started — replay buffered chunks so the
-                    # recognizer doesn't miss the first word
-                    in_speech = True
-                    stream = recognizer.create_stream()
-                    for chunk in pre_buf:
-                        stream.accept_waveform(sample_rate, chunk)
-                        while recognizer.is_ready(stream):
-                            recognizer.decode_stream(stream)
+            is_endpoint = recognizer.is_endpoint(stream)
+            result = recognizer.get_result(stream)
 
-                # Feed current chunk for real-time partial decode
-                stream.accept_waveform(sample_rate, samples)
-                while recognizer.is_ready(stream):
-                    recognizer.decode_stream(stream)
-                partial = recognizer.get_result_all(stream)
-                partial_text = partial.text.strip() if partial.text else ""
-                if partial_text and partial_text != last_partial:
-                    pad = max(0, len(last_partial) - len(partial_text))
-                    print(f"\r[{partial_text}]{' ' * pad}", end="", flush=True)
-                    last_partial = partial_text
+            # Live partial update — overwrite current line
+            if result and (last_result != result):
+                last_result = result
+                print(f"\r{segment_id}:{result}", end="", flush=True)
 
-            elif in_speech:
-                # Speech segment ended
-                in_speech = False
-                pre_buf.clear()
-
-                stream.input_finished()
-                while recognizer.is_ready(stream):
-                    recognizer.decode_stream(stream)
-
-                result = recognizer.get_result_all(stream)
-                result_text = result.text.strip() if result.text else ""
-
-                if result_text:
-                    print(f"\r{' ' * (max(0, len(last_partial)) + 4)}", end="", flush=True)
-                    print(f"\r[Final] {result_text}")
-                last_partial = ""
-
-            # Drain completed VAD segments
-            while not vad.empty():
-                vad.pop()
+            if is_endpoint:
+                # Always emit a newline on endpoint so the next segment
+                # starts on a fresh line. If no text was produced this
+                # segment, still print a marker so we can see endpoint
+                # firing in the logs.
+                final = result if result else last_result
+                if final:
+                    print(f"\r{segment_id}:{final}", flush=True)
+                    segment_id += 1
+                else:
+                    print(f"\r[endpoint, no text]", flush=True)
+                last_result = ""
+                recognizer.reset(stream)
 
     except KeyboardInterrupt:
         pass
 
-    # -----------------------------------------------------------------------
-    # Cleanup — flush any remaining speech
-    # -----------------------------------------------------------------------
-    if in_speech:
-        stream.input_finished()
-        while recognizer.is_ready(stream):
-            recognizer.decode_stream(stream)
-        result = recognizer.get_result_all(stream)
-        result_text = result.text.strip() if result.text else ""
-        if result_text:
-            print(f"\r[Final] {result_text}")
-
+    if last_result:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
     print("Done.")
 
 

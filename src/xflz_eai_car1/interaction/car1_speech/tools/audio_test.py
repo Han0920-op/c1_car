@@ -13,116 +13,115 @@ Default parameters match ES8388 on RK3576:
   Device:  hw:0,0
   Rate:    16000 Hz
   Format:  S16_LE
-  Channels: 2 (stereo — use -c 1 for mono if needed)
+  Channels: 1 (mono, board mic is single-channel — use -c 2 for stereo if needed)
 
 Mixer volume is NOT changed unless you pass --playback-volume / --capture-volume.
-Volume is set via dB values (20*log10), so 50% = -6dB, 25% = -12dB, etc.
-Use --list-mixer to inspect current mixer state.
+Gains are applied through audio_mixer.py (hardware-safe caps for 4Ω 3W speaker
+and close-talk board mic):
+  --capture-volume  0-100  → mic PGA 0..+18dB (50% neutral, digital fixed 0dB)
+  --playback-volume 0-100  → Output 1/2 capped at -12dB (100%→-12dB, 67%→-15dB)
+Use --list-mixer to inspect current mixer state, or --voice-preset for the
+recommended ASR+TTS defaults.
 
 Tuning tips:
-  --playback-volume 50 --capture-volume 50       # half volume (-6dB)
-  --playback-volume 100 --capture-volume 100     # max (0dB)
-  --capture-volume 38                            # capture ≈ +9dB (19*log10)
+  --voice-preset                                 # recommended: mic +12dB / spk -15dB (1.1W)
+  --playback-volume 100 --capture-volume 50      # spk max-safe (-12dB, 2.2W), mic neutral
+  --capture-volume 100                           # mic PGA +18dB (still safe)
   --list-mixer                                   # inspect all mixer controls
+  --check-speaker-safety                         # verify speaker power (requires amp gain measurement)
 
 Usage:
-  python3 audio_test.py                              # loopback (no save)
-  python3 audio_test.py -o rec.wav                   # loopback + save
-  python3 audio_test.py --mode record -o rec.wav     # record only
-  python3 audio_test.py --mode play test.wav         # play only
-  python3 audio_test.py -l                           # list PCM devices
-  python3 audio_test.py --list-mixer                 # list mixer controls
-  python3 audio_test.py --playback-volume 100        # loopback with max volume
+  # Recording (ASR-optimized)
+  python3 audio_test.py --voice-preset --mode record -o rec.wav -d 5 --analyze
+  python3 audio_test.py --capture-volume 100 --mode record -o rec.wav
+
+  # Playback (max volume by default in play mode)
+  python3 audio_test.py --mode play test.wav                     # auto: -12dB (2.15W)
+  python3 audio_test.py --play-preset --mode play test.wav       # explicit max
+  python3 audio_test.py --playback-volume 50 --mode play test.wav
+
+  # Loopback
+  python3 audio_test.py                                          # no mixer change
+  python3 audio_test.py -o rec.wav                               # loopback + save
+
+  # Device info
+  python3 audio_test.py -l                                       # list PCM devices
+  python3 audio_test.py --list-mixer                             # list mixer controls
+
+  # Quality analysis
+  python3 audio_test.py --mode record -o test.wav --analyze                 # analyze recording
+  python3 audio_test.py --playback-volume 100 --check-speaker-safety        # check speaker safety
+  python3 audio_analyzer.py test.wav                                         # analyze existing WAV
+  python3 audio_analyzer.py --check-speaker -12.0                            # check speaker power
+  python3 audio_analyzer.py --measure-noise                                  # measure noise floor
 """
 
 import argparse
-import math
 import os
-import re
 import signal
 import subprocess
 import sys
+
+from audio_mixer import (
+    AudioMixer,
+    capture_volume_pct_to_db,
+    playback_volume_pct_to_db,
+)
+from audio_analyzer import (
+    analyze_recording,
+    check_speaker_safety,
+    print_recording_analysis,
+)
 
 
 # ---------------------------------------------------------------------------
 # Mixer helpers
 # ---------------------------------------------------------------------------
 
-def run_amixer(card, args, check=True):
-    """Run amixer on the given card, return stdout lines."""
-    cmd = ["amixer", "-c", str(card)] + args
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if check and p.returncode != 0:
-        print(f"amixer error: {p.stderr.strip()}")
-        sys.exit(1)
-    return p.stdout.splitlines()
-
-
-def pct_to_db(pct):
-    """Convert volume percentage to dB: 100% → 0dB, 50% → -6dB, 25% → -12dB."""
-    if pct >= 100:
-        return 0.0
-    if pct <= 0:
-        return -96.0
-    return 20.0 * math.log10(pct / 100.0)
-
-
-def set_mixer_volume(card, controls, pct):
-    """Set mixer controls using dB values computed from percentage."""
-    db_val = pct_to_db(pct)
-    for ctl in controls:
-        subprocess.run(
-            ["amixer", "-c", str(card), "sset", ctl, "--", f"{db_val:.1f}dB"],
-            capture_output=True, check=False)
-
-
 def apply_playback_volume(card, pct):
-    """Set Output 1/2 and PCM to the given percentage volume."""
-    db_val = pct_to_db(pct)
-    for ctl in ["Output 1", "Output 2", "PCM"]:
-        subprocess.run(
-            ["amixer", "-c", str(card), "sset", ctl, "--", f"{db_val:.1f}dB"],
-            capture_output=True, check=False)
+    """Map 0-100% to Output 1/2 dB, with 0% being hardware mute.
+
+    - 0%:      Mute speaker (hardware-level silence)
+    - 1-100%:  Speaker Output -30..-12dB (capped at 2.15W for 4Ω 3W speaker)
+    - PCM is always held at 0dB to preserve dynamic range
+    """
+    mixer = AudioMixer(card=card)
+    if pct <= 0:
+        mixer.mute_speaker()
+        return -96.0  # Effectively muted
+    mixer.unmute_speaker()
+    db_val = playback_volume_pct_to_db(pct)
+    mixer.set_pcm_db(0.0)
+    mixer.set_speaker_output_db(db_val)
+    return db_val
 
 
 def apply_capture_volume(card, pct):
+    """Map 0-100% to mic gain, with 0% being true mute.
+
+    - 0%:        Mute mic (Left/Right Channel muted, hardware-level silence)
+    - 1-49%:     PGA 0dB, digital cut -30..0dB (attenuation, hurts SNR)
+    - 50%:       Neutral (PGA 0dB, digital 0dB)
+    - 51-100%:   PGA boost 0..+24dB (analog gain, best SNR)
     """
-    Set capture volume from percentage.
-
-    Capture path: Left/Right Channel (preamp, 0..+24dB) + Capture Digital (-96..0dB).
-    Preamp stays at max (+24dB) for best SNR; Capture Digital handles attenuation.
-    """
-    # Preamp at max (24dB) — best signal-to-noise ratio
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Left Channel", "--", "24.0dB"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Right Channel", "--", "24.0dB"],
-        capture_output=True, check=False)
-
-    # Digital attenuation: 100% → 0dB, 50% → -6dB, 25% → -12dB
-    db_val = pct_to_db(pct)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Capture Digital", "--", f"{db_val:.1f}dB"],
-        capture_output=True, check=False)
-
-
-def get_mixer_volume(card, control):
-    """Get current volume as integer percentage (first number found)."""
-    lines = run_amixer(card, ["sget", control])
-    for line in lines:
-        m = re.search(r'\[(\d+)%\]', line)
-        if m:
-            return int(m.group(1))
-    return None
+    mixer = AudioMixer(card=card)
+    if pct <= 0:
+        mixer.mute_mic()
+        return 0.0, 0.0  # Return neutral dB (actual state is muted)
+    mixer.unmute_mic()
+    preamp_db, digital_db = capture_volume_pct_to_db(pct)
+    mixer.set_mic_preamp_db(preamp_db)
+    mixer.set_capture_digital_db(digital_db)
+    return preamp_db, digital_db
 
 
 def list_mixer_controls(card):
     """Print all mixer controls and their current values."""
-    lines = run_amixer(card, ["scontents"])
+    result = subprocess.run(
+        ["amixer", "-c", str(card), "scontents"],
+        capture_output=True, text=True, check=False)
     print(f"Mixer controls for card {card}:\n")
-    for line in lines:
-        print(line)
+    print(result.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -308,18 +307,121 @@ def record_only(args):
         sys.exit(1)
 
 
+def _prepare_playback_wav(src_path, gain=1.0):
+    """Prepare a WAV file for ES8388 playback: mono→stereo + optional digital gain.
+
+    ES8388 I2S is hard-wired for stereo, so mono WAVs play at 2x speed on raw
+    hw:X,Y. We duplicate the mono channel into L/R.
+
+    Digital gain compensates for low-amplitude source material (e.g., recordings
+    made at moderate PGA gain). Uses tanh soft-clipping to prevent hard clipping
+    at high gain values.
+
+    Returns (temp_path, was_modified). Caller must delete temp_path if
+    was_modified is True.
+    """
+    import struct
+    import tempfile
+    import wave
+
+    with wave.open(src_path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        frame_rate = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw_bytes = wf.readframes(n_frames)
+
+    needs_stereo_conv = (n_channels == 1)
+    needs_gain = (gain != 1.0)
+
+    if not needs_stereo_conv and not needs_gain:
+        return src_path, False
+
+    # Only support 16-bit PCM for gain processing (most common case)
+    if needs_gain and sample_width != 2:
+        needs_gain = False  # Silently skip gain for non-16-bit
+
+    if needs_gain:
+        # Try numpy path first (fast), fall back to pure Python
+        try:
+            import numpy as np
+            samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
+            samples = samples / 32768.0  # Normalize to [-1, 1]
+            samples = samples * gain
+            samples = np.tanh(samples)   # Soft clip
+            samples = (samples * 32767).astype(np.int16)
+            processed_bytes = samples.tobytes()
+        except ImportError:
+            # Pure Python fallback
+            import math
+            n_samples = len(raw_bytes) // 2
+            fmt = f"<{n_samples}h"
+            samples = list(struct.unpack(fmt, raw_bytes))
+            samples = [max(-32767, min(32767, int(math.tanh(s / 32768.0 * gain) * 32767)))
+                       for s in samples]
+            processed_bytes = struct.pack(fmt, *samples)
+    else:
+        processed_bytes = raw_bytes
+
+    # Interleave mono → stereo if needed
+    if needs_stereo_conv:
+        step = sample_width
+        stereo_bytes = bytearray(len(processed_bytes) * 2)
+        for i in range(0, len(processed_bytes), step):
+            sample = processed_bytes[i:i + step]
+            j = i * 2
+            stereo_bytes[j:j + step] = sample
+            stereo_bytes[j + step:j + step * 2] = sample
+        final_bytes = bytes(stereo_bytes)
+        final_channels = 2
+    else:
+        final_bytes = processed_bytes
+        final_channels = n_channels
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="audio_test_playback_")
+    os.close(tmp_fd)
+    with wave.open(tmp_path, "wb") as wf:
+        wf.setnchannels(final_channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(frame_rate)
+        wf.writeframes(final_bytes)
+    return tmp_path, True
+
+
 def play_only(args):
-    """Play a WAV file."""
+    """Play a WAV file with optional digital gain and mono→stereo conversion.
+
+    ES8388 I2S is hard-wired for stereo. Mono WAV files played to hw:X,Y sound
+    sped-up (2x) because the byte clock is stereo. Also applies --gain digital
+    boost for low-amplitude recordings (with soft-clipping to prevent distortion).
+    """
     if not os.path.exists(args.file):
         print(f"Error: File not found: {args.file}")
         sys.exit(1)
 
     play_dev = args.playback_device or args.device
+    play_file = args.file
+    tmp_file = None
+
+    try:
+        play_file, was_modified = _prepare_playback_wav(args.file, gain=args.gain)
+        if was_modified:
+            tmp_file = play_file
+            if not args.quiet:
+                notes = []
+                if args.gain != 1.0:
+                    notes.append(f"gain={args.gain}x (soft-clipped)")
+                notes.append("mono→stereo")
+                print(f"[note] preprocessed: {', '.join(notes)}")
+    except Exception as e:
+        if not args.quiet:
+            print(f"[warn] preprocessing failed ({e}), playing as-is")
+
     cmd = ["aplay"]
     if args.quiet:
         cmd.append("-q")
     cmd.extend(["-D", play_dev])
-    cmd.append(args.file)
+    cmd.append(play_file)
 
     if not args.quiet:
         print(f"Playing: {args.file}")
@@ -332,7 +434,12 @@ def play_only(args):
         print("\nPlayback stopped by user.")
         proc.terminate()
         proc.wait()
+        if tmp_file and os.path.exists(tmp_file):
+            os.unlink(tmp_file)
         return
+
+    if tmp_file and os.path.exists(tmp_file):
+        os.unlink(tmp_file)
 
     if proc.returncode != 0:
         print(f"Playback failed (exit code {proc.returncode})")
@@ -351,14 +458,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 audio_test.py                              # loopback (no save)
-  python3 audio_test.py --playback-volume 100        # loopback, max volume
-  python3 audio_test.py --capture-volume 38          # loopback, +9dB capture
-  python3 audio_test.py -o rec.wav                   # loopback + save
-  python3 audio_test.py --mode record -o rec.wav     # record only
-  python3 audio_test.py --mode play test.wav         # play only
-  python3 audio_test.py -l                           # list PCM devices
-  python3 audio_test.py --list-mixer                 # list mixer controls
+  python3 audio_test.py                                     # loopback (no save)
+  python3 audio_test.py --voice-preset                      # recommended ASR+TTS gains
+  python3 audio_test.py --voice-preset --mode record -o rec.wav
+  python3 audio_test.py --playback-volume 100               # speaker max-safe (-12dB, 2.2W)
+  python3 audio_test.py --capture-volume 50                 # mic neutral (PGA 0dB)
+  python3 audio_test.py --capture-volume 83                 # mic PGA ≈ +12dB
+  python3 audio_test.py -o rec.wav                          # loopback + save
+  python3 audio_test.py --mode record -o rec.wav            # record only
+  python3 audio_test.py --mode record -o rec.wav --analyze  # record + analyze
+  python3 audio_test.py --mode play test.wav                # play only
+  python3 audio_test.py -l                                  # list PCM devices
+  python3 audio_test.py --list-mixer                        # list mixer controls
         """,
     )
 
@@ -382,8 +493,8 @@ Examples:
                         help="Sample rate in Hz (default: 16000)")
     parser.add_argument("-f", "--format", default="S16_LE",
                         help="Sample format (default: S16_LE)")
-    parser.add_argument("-c", "--channels", type=int, default=2,
-                        help="Number of channels (default: 2, stereo)")
+    parser.add_argument("-c", "--channels", type=int, default=1,
+                        help="Number of channels (default: 1, mono board mic)")
 
     # ---- Duration ----
     parser.add_argument("-d", "--duration", type=int, default=0,
@@ -405,15 +516,30 @@ Examples:
 
     # ---- Mixer volume ----
     parser.add_argument("--playback-volume", type=int, default=None,
-                        help="Set playback volume 0-100%% (amixer: Output 1, Output 2, PCM)")
+                        help="Playback 0-100%% → Output 1/2 (capped at -12dB, PCM held at 0dB)")
     parser.add_argument("--capture-volume", type=int, default=None,
-                        help="Set capture volume 0-100%% (amixer: Left Channel, Right Channel, Capture Digital)")
+                        help="Capture 0-100%% → mic PGA 0..+24dB (50%% neutral, digital held at 0dB)")
+    parser.add_argument("--voice-preset", action="store_true",
+                        help="Apply ASR defaults (mic +18dB=88%%, ALC off, speaker -15dB=67%%)")
+    parser.add_argument("--play-preset", action="store_true",
+                        help="Apply playback defaults (speaker -12dB=100%%, max safe 2.15W)")
+
+    # ---- Digital gain (play mode) ----
+    parser.add_argument("--gain", type=float, default=2.0,
+                        help="Digital gain multiplier for playback (default: 2.0, "
+                             "range 0.5-4.0, uses tanh soft-clipping)")
 
     # ---- Listing ----
     parser.add_argument("-l", "--list", action="store_true",
                         help="List PCM devices and exit")
     parser.add_argument("--list-mixer", action="store_true",
                         help="List mixer controls for --card and exit")
+
+    # ---- Analysis ----
+    parser.add_argument("--analyze", action="store_true",
+                        help="Analyze recording quality after recording (requires numpy)")
+    parser.add_argument("--check-speaker-safety", action="store_true",
+                        help="Check speaker power safety when setting playback volume")
 
     # ---- Misc ----
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -430,19 +556,33 @@ Examples:
         return
 
     # ---- Apply mixer volume (only when explicitly requested) ----
+    if args.voice_preset:
+        AudioMixer(card=args.card).apply_voice_preset()
+        if not args.quiet:
+            print("[mixer] voice preset: ALC off, mic +18dB (88%), speaker -3dB (ASR-friendly)")
+
+    if args.play_preset:
+        db_val = apply_playback_volume(args.card, 100)  # Max: +4.5dB (ES8388 hardware limit)
+        if not args.quiet:
+            print(f"[mixer] play preset: speaker {db_val:+.1f}dB "
+                  f"(100%, ES8388 hardware max, use with --gain 2.0)")
+
     if args.playback_volume is not None:
         pct = max(0, min(100, args.playback_volume))
-        db_val = pct_to_db(pct)
+        db_val = apply_playback_volume(args.card, pct)
         if not args.quiet:
-            print(f"[mixer] playback {pct}%  →  {db_val:.1f} dB")
-        apply_playback_volume(args.card, pct)
+            print(f"[mixer] playback {pct}%  →  Output {db_val:.1f} dB (PCM 0dB)")
+        if args.check_speaker_safety:
+            check_speaker_safety(db_val)
 
     if args.capture_volume is not None:
         pct = max(0, min(100, args.capture_volume))
-        db_val = pct_to_db(pct)
+        preamp_db, digital_db = apply_capture_volume(args.card, pct)
         if not args.quiet:
-            print(f"[mixer] capture {pct}%  →  {db_val:.1f} dB  (preamp +24dB + digital {db_val:.1f}dB)")
-        apply_capture_volume(args.card, pct)
+            if pct == 0:
+                print(f"[mixer] capture 0%  →  MIC MUTED")
+            else:
+                print(f"[mixer] capture {pct}%  →  PGA {preamp_db:.1f}dB, digital {digital_db:.1f}dB")
 
     # ---- Run selected mode ----
     if args.mode == "play":
@@ -450,13 +590,42 @@ Examples:
             parser.print_help()
             print("\nError: Please specify a WAV file to play.")
             sys.exit(1)
+        # Auto-apply hardware max playback volume if no explicit volume was set
+        if (args.playback_volume is None and not args.voice_preset
+                and not args.play_preset):
+            db_val = apply_playback_volume(args.card, 100)
+            if not args.quiet:
+                print(f"[mixer] play mode default: speaker {db_val:+.1f}dB "
+                      f"(100%, ES8388 hardware max) — use --playback-volume to override")
         play_only(args)
     elif args.mode == "record":
         if not args.output:
             args.output = "record.wav"
         record_only(args)
+        # Analyze recording if requested
+        if args.analyze and os.path.exists(args.output):
+            if not args.quiet:
+                print("\nAnalyzing recording...")
+            try:
+                result = analyze_recording(args.output)
+                print_recording_analysis(result)
+            except ImportError:
+                print("Warning: numpy not available, skipping analysis")
+            except Exception as e:
+                print(f"Warning: analysis failed: {e}")
     elif args.mode == "loopback":
         loopback_mode(args)
+        # Analyze recording if requested and saved
+        if args.analyze and args.output and os.path.exists(args.output):
+            if not args.quiet:
+                print("\nAnalyzing recording...")
+            try:
+                result = analyze_recording(args.output)
+                print_recording_analysis(result)
+            except ImportError:
+                print("Warning: numpy not available, skipping analysis")
+            except Exception as e:
+                print(f"Warning: analysis failed: {e}")
 
 
 if __name__ == "__main__":
