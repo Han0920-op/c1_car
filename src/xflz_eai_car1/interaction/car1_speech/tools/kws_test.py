@@ -14,76 +14,59 @@ Model: sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20
 Wake words (configurable via --keywords-file):
   小飞同学, 你好小飞, 小飞小飞
 
+Recording defaults (consistent with audio_test.py):
+  - Mic PGA: +18dB (--capture-volume 88, optimized for 30-50cm)
+  - ALC: OFF (avoids noise floor pumping during silence)
+  - Use --voice-preset for quick setup with recommended gains
+
 Usage:
-  python3 kws_test.py                                        # default params
+  python3 kws_test.py                                        # optimized defaults
+  python3 kws_test.py --voice-preset                         # explicit ASR preset
   python3 kws_test.py --keywords-file my_keywords.txt        # custom keywords
   python3 kws_test.py --keywords-threshold 0.3               # more sensitive
-  python3 kws_test.py --no-mic-boost                         # disable ALC
+  python3 kws_test.py --capture-volume 100                   # max mic gain (+24dB)
+  python3 kws_test.py --enable-alc                           # enable ALC (not recommended)
 """
 
 import argparse
-import math
 import signal
-import subprocess
 import sys
 
 import sherpa_onnx
 
+# Import AudioMixer for consistent gain control with audio_test.py
+from audio_mixer import AudioMixer, capture_volume_pct_to_db
+
 
 # ---------------------------------------------------------------------------
-# Mixer helpers (ES8388 / RK3576) — same logic validated in audio_test.py
+# Mixer helpers (consistent with audio_test.py)
 # ---------------------------------------------------------------------------
-
-def pct_to_db(pct):
-    if pct >= 100:
-        return 0.0
-    if pct <= 0:
-        return -96.0
-    return 20.0 * math.log10(pct / 100.0)
-
 
 def apply_capture_volume(card, pct):
-    # Preamp at max (24dB) for best signal-to-noise ratio
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Left Channel", "--", "24.0dB"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Right Channel", "--", "24.0dB"],
-        capture_output=True, check=False)
-    db_val = pct_to_db(pct)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Capture Digital", "--", f"{db_val:.1f}dB"],
-        capture_output=True, check=False)
-    print(f"  Capture volume: {pct}% ({db_val:.1f} dB) + preamp 24 dB")
+    """Apply mic capture volume using AudioMixer (same as audio_test.py).
+
+    - 0%:        Mute mic
+    - 1-49%:     PGA 0dB, digital cut -30..0dB (attenuation, hurts SNR)
+    - 50%:       Neutral (PGA 0dB, digital 0dB)
+    - 51-100%:   PGA boost 0..+24dB (analog gain, best SNR)
+    """
+    mixer = AudioMixer(card=card)
+    if pct <= 0:
+        mixer.mute_mic()
+        print("  Capture volume: MUTED")
+        return
+    mixer.unmute_mic()
+    preamp_db, digital_db = capture_volume_pct_to_db(pct)
+    mixer.set_mic_preamp_db(preamp_db)
+    mixer.set_capture_digital_db(digital_db)
+    print(f"  Capture volume: {pct}% → PGA {preamp_db:+.1f}dB, digital {digital_db:+.1f}dB")
 
 
-def enable_alc(card):
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Function", "Stereo"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Target", "12"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Max PGA", "7"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Attack Time", "5"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Decay Time", "0"],
-        capture_output=True, check=False)
-    print("  ALC: enabled (Stereo, target=12, max_pga=7)")
-
-
-def switch_input_to_mic(card):
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Left Line Mux", "MicL"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Right Line Mux", "MicR"],
-        capture_output=True, check=False)
-    print("  Input mux: MicL / MicR")
+def apply_voice_preset(card):
+    """Apply optimized ASR defaults (same as audio_test.py --voice-preset)."""
+    mixer = AudioMixer(card=card)
+    mixer.apply_voice_preset()
+    print("  Voice preset: mic +18dB (88%), ALC off, speaker -3dB")
 
 
 # ---------------------------------------------------------------------------
@@ -96,10 +79,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 kws_test.py
+  python3 kws_test.py                                # optimized defaults (mic +18dB)
+  python3 kws_test.py --voice-preset                 # explicit ASR preset
   python3 kws_test.py --keywords-file my_keywords.txt
-  python3 kws_test.py --keywords-threshold 0.3
-  python3 kws_test.py --no-mic-boost
+  python3 kws_test.py --keywords-threshold 0.15      # more sensitive (more false positives)
+  python3 kws_test.py --keywords-threshold 0.4       # stricter (fewer false positives)
+  python3 kws_test.py --capture-volume 100           # max mic gain (+24dB PGA)
+  python3 kws_test.py --enable-alc                   # enable ALC (not recommended)
         """,
     )
 
@@ -137,10 +123,12 @@ Examples:
 
     # ---- Capture volume & mic boost ----
     parser.add_argument("--card", type=int, default=0)
-    parser.add_argument("--capture-volume", type=int, default=100,
-                        help="Set mic capture volume 0-100%% (default: 100)")
-    parser.add_argument("--no-mic-boost", action="store_true",
-                        help="Disable ALC (automatic level control) + Mic input switching")
+    parser.add_argument("--capture-volume", type=int, default=88,
+                        help="Mic capture volume 0-100%% (default: 88, optimized for 30-50cm)")
+    parser.add_argument("--voice-preset", action="store_true",
+                        help="Apply ASR-optimized defaults (mic +18dB, ALC off) — same as audio_test.py")
+    parser.add_argument("--enable-alc", action="store_true",
+                        help="Enable ALC (automatic level control) — NOT recommended, raises noise floor")
 
     # ---- Read chunk ----
     parser.add_argument("--chunk-size", type=int, default=4000,
@@ -152,16 +140,26 @@ Examples:
     args = parser.parse_args()
 
     # -----------------------------------------------------------------------
-    # Audio mixer setup
+    # Audio mixer setup (consistent with audio_test.py best practices)
     # -----------------------------------------------------------------------
     print("Audio mixer setup...")
-    pct = max(0, min(100, args.capture_volume))
-    apply_capture_volume(args.card, pct)
-    if not args.no_mic_boost:
-        enable_alc(args.card)
-        switch_input_to_mic(args.card)
+
+    if args.voice_preset:
+        # Use optimized ASR preset (mic +18dB, ALC off)
+        apply_voice_preset(args.card)
     else:
-        print("  Mic boost: disabled")
+        # Manual capture volume
+        pct = max(0, min(100, args.capture_volume))
+        apply_capture_volume(args.card, pct)
+
+        # ALC off by default (user must explicitly enable with --enable-alc)
+        mixer = AudioMixer(card=args.card)
+        if args.enable_alc:
+            mixer.set_alc(True)
+            print("  ALC: enabled (--enable-alc specified)")
+        else:
+            mixer.set_alc(False)
+            print("  ALC: off (recommended for stable SNR)")
 
     # -----------------------------------------------------------------------
     # Build keyword spotter

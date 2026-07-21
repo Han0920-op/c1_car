@@ -3251,9 +3251,9 @@ amixer -c 0 scontrols
 
 ### 6.1 音频硬件测试（audio_test.py）
 
-> **目标**：验证 ES8388 录音和播放链路是否正常工作  
-> **所需时间**：5 分钟  
-> **硬件要求**：ES8388 音频编解码器
+> **目标**：验证 ES8388 录音和播放链路是否正常工作，并调优增益  
+> **所需时间**：5-15 分钟  
+> **硬件要求**：ES8388 音频编解码器（板载麦克风 + 4Ω 3W 扬声器）
 
 #### 6.1.1 工具概述
 
@@ -3265,15 +3265,51 @@ amixer -c 0 scontrols
 | **record** | 只录音，保存为 WAV 文件 | 检查麦克风信号质量 |
 | **play** | 只播放 WAV 文件 | 检查喇叭/耳机输出 |
 
-**默认参数**（匹配 ES8388 硬件）：
+**默认参数**（已针对 ES8388 + 板载硬件优化）：
 
 ```
-设备:     hw:0,0
-采样率:   16000 Hz
-格式:     S16_LE
-声道:     2 (立体声，板载麦克风仅左声道有信号)
-mixer:    不修改（保持系统当前状态）
+设备:       hw:0,0
+采样率:     16000 Hz（ASR 标准）
+格式:       S16_LE
+声道:       1 (单声道，板载麦克风只有左声道，用 -c 2 强制立体声)
+mixer:      不修改（除非传入 --voice-preset / --capture-volume / --playback-volume）
 ```
+
+**两个推荐预设**（实测优化）：
+
+| 预设 | 场景 | 麦克风 | 扬声器 | 数字增益 |
+|------|------|--------|--------|---------|
+| `--voice-preset` | ASR 语音识别 | +18dB (88%) | -3dB（中等音量） | `--gain 2.0` |
+| `--play-preset` / play 模式默认 | 纯播放（TTS/提示音） | 不变 | +4.5dB（硬件极限） | `--gain 2.0` |
+
+**关键硬件参数**（RK3576 + ES8388 + NS4150B）：
+- ES8388 Output 硬件范围：**-30dB ~ +4.5dB**（上限不可超越）
+- NS4150B 功放：BTL D-class，约 **12dB 电压增益**（用户 Rin=20K 反推）
+- 实测最响不破音：**`--gain 2.0` + `--playback-volume 100`**（Output=+4.5dB）
+- ALC 关闭：避免静音时自动拉高 PGA 增益造成噪声底噪抬升
+
+**录音增益映射表**（板载 MIC2 差分麦克风）：
+
+| `--capture-volume` | PGA gain | 适用场景 |
+|-------------------|----------|----------|
+| 50% | 0dB | 中性（无增益） |
+| 67% | +8dB | 近距离（10-20cm） |
+| 75% | +12dB | 正常距离（20-30cm） |
+| **88%** | **+18dB** | **推荐默认（30-50cm）** |
+| 100% | +24dB | 远距离或低灵敏度麦克风 |
+
+**播放音量映射表**（ES8388 → NS4150B → 4Ω 3W 扬声器）：
+
+| `--playback-volume` | Output dB | 相对响度 | 场景 |
+|---------------------|-----------|---------|------|
+| 0 | 硬件静音 | — | 完全静默 |
+| 25 | -18dB | 很小 | 安静提示 |
+| 50 | -12dB | 小 | 夜间使用 |
+| 67 | -6dB | 中等 | 室内正常 |
+| 88 | -1dB | 较响 | 环境嘈杂 |
+| **100** | **+4.5dB** | **最响** | **default / --play-preset** |
+
+⚠️ **注意**：Output +4.5dB 是 ES8388 硬件极限，超过 `--gain 2.5` 会出现明显破音（NS4150B 饱和）。默认 `--gain 2.0` 是实测下最响的不破音组合。
 
 #### 6.1.2 基本用法
 
@@ -3325,18 +3361,210 @@ python3 audio_test.py --mode record -d 5 --capture-volume 100 -o rec.wav
 python3 audio_test.py --mode record -d 5 -c 1 -o rec_mono.wav
 ```
 
-#### 6.1.5 播放模式
+#### 6.1.5 播放模式（详细教程）
+
+##### 硬件链路
+
+RK3576 板卡的音频播放链路：
+
+```
+WAV 文件
+  │
+  │ [1] --gain 数字增益（软件，tanh 软削波）
+  ↓
+ES8388 DAC (I2S)
+  │
+  │ [2] --playback-volume → Output 1/2 (硬件模拟, -30dB ~ +4.5dB)
+  ↓
+NS4150B 功放 (BTL D-class, ~12dB 增益, Rin=20K)
+  │
+  │ 差分输出到 SPK_P/SPK_N
+  ↓
+板载扬声器 (4Ω 3W)
+```
+
+**关键硬件事实**：
+- **ES8388 Output 硬件极限**：+4.5dB（不可超越）
+- **NS4150B 功放**：BTL 差分输出，约 12dB 电压增益（Rin=20K 反推）
+- **实测最响不破音组合**：`--gain 2.0` + `--playback-volume 100`（Output=+4.5dB）
+- **超过 2.5x 数字增益** 在 Output=+4.5dB 时会出现明显破音
+
+##### 快速开始
 
 ```bash
-# 播放 WAV 文件（默认音量）
-python3 audio_test.py --mode play rec.wav
+cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_speech/tools
 
-# 指定播放音量 50% (-6dB)
-python3 audio_test.py --mode play --playback-volume 50 rec.wav
+# 最常用：默认播放（数字增益 2.0x + 硬件音量 100%）—— 最响不破音
+python3 audio_test.py --mode play test.wav
 
-# 播放音量拉满
-python3 audio_test.py --mode play --playback-volume 100 rec.wav
+# 显式声明使用最响播放预设（等同于上面的默认行为）
+python3 audio_test.py --play-preset --mode play test.wav
 ```
+
+**默认行为**：`--mode play` 时如果没有指定 `--playback-volume`，会自动把 Output 拉到硬件极限 +4.5dB，加上 `--gain` 默认 2.0，就是**实测下最响的不破音组合**。
+
+##### 完整参数
+
+| 参数 | 默认值 | 范围 | 说明 |
+|------|-------|------|------|
+| `--gain` | `2.0` | 0.5-4.0 | 数字增益倍数（软件层，tanh 软削波） |
+| `--playback-volume` | 自动（100）| 0-100 | 硬件音量百分比 → Output 1/2 dB |
+| `--play-preset` | — | 开关 | 应用最响预设（Output=+4.5dB） |
+| `--playback-device` | `hw:0,0` | ALSA 设备 | 播放设备（默认自动 mono→stereo） |
+
+##### 音量控制的三个层次（可叠加）
+
+**1. 数字增益 `--gain`（软件层）**
+
+在软件里对 WAV 波形做数字放大，配合 tanh 软削波防止硬失真：
+
+```bash
+# 原始不放大
+python3 audio_test.py --gain 1.0 --mode play test.wav
+
+# 默认 2.0x（+6dB）—— 推荐
+python3 audio_test.py --gain 2.0 --mode play test.wav
+
+# 更响一些（可能破音，看信号本身电平）
+python3 audio_test.py --gain 3.0 --mode play test.wav
+
+# 最大 4.0x（+12dB）—— 结合 Output=+4.5dB 会明显破音
+python3 audio_test.py --gain 4.0 --mode play test.wav
+```
+
+**2. 硬件音量 `--playback-volume`（模拟层）**
+
+控制 ES8388 Output 1/2 的模拟输出电平（-30dB 到 +4.5dB）：
+
+| `--playback-volume` | Output dB | 相对响度 | 用途 |
+|---------------------|-----------|---------|------|
+| 0 | 硬件静音 | — | 完全静默 |
+| 25 | -18dB | 很小 | 安静提示 |
+| 50 | -12dB | 小 | 夜间使用 |
+| 67 | -6dB | 中等 | 室内正常 |
+| 88 | -1dB | 较响 | 环境嘈杂 |
+| **100** | **+4.5dB** | **最响** | **默认推荐** |
+
+```bash
+# 硬件静音
+python3 audio_test.py --playback-volume 0 --mode play test.wav
+
+# 中等音量
+python3 audio_test.py --playback-volume 50 --mode play test.wav
+
+# 最响（等同默认）
+python3 audio_test.py --playback-volume 100 --mode play test.wav
+```
+
+**3. 单声道 → 立体声转换（自动）**
+
+ES8388 的 I2S 硬件配置固定为立体声。播放单声道 WAV 时如果直接送 `hw:0,0`，硬件按立体声时钟读单声道数据，会出现 **2 倍速播放**。
+
+解决方案：`audio_test.py` 自动检测单声道 WAV，把 mono 复制到 L/R 后写临时立体声 WAV 再播放，用户无需干预。
+
+##### 常见使用案例
+
+**案例 1：播放 TTS 合成的语音**
+
+TTS 输出通常电平适中，用默认参数即可：
+
+```bash
+python3 audio_test.py --mode play tts_output.wav
+```
+
+**案例 2：播放录音回放（低电平）**
+
+自己录的语音峰值往往只有 -6 到 -12dB FS，需要数字增益补偿：
+
+```bash
+# 默认 gain=2.0 通常够用
+python3 audio_test.py --mode play recording.wav
+
+# 如果录音特别小，用 gain=3.0
+python3 audio_test.py --gain 3.0 --mode play recording.wav
+```
+
+**案例 3：夜间安静播放**
+
+```bash
+python3 audio_test.py --playback-volume 30 --gain 1.0 --mode play notification.wav
+```
+
+**案例 4：紧急提示音（最响）**
+
+```bash
+python3 audio_test.py --play-preset --gain 2.0 --mode play alert.wav
+```
+
+**案例 5：完全原始播放（调试用）**
+
+```bash
+python3 audio_test.py --gain 1.0 --playback-volume 100 --mode play test.wav
+```
+
+**案例 6：批量播放脚本**
+
+```bash
+# 播放多个 WAV 文件（同一音量设置）
+for f in *.wav; do
+    python3 audio_test.py --mode play "$f"
+done
+```
+
+##### 音量调优决策树
+
+```
+播放时觉得声音小？
+  │
+  ├─ 是低电平录音回放？
+  │    → 提高 --gain（试 2.5, 3.0）
+  │      注意：>2.5 在 --playback-volume=100 时可能破音
+  │
+  ├─ 是 TTS 合成结果？
+  │    → 默认参数应该够响
+  │      如果小，试 --gain 2.5
+  │
+  └─ 已经 gain=2.0 + volume=100 还是小？
+       → 这就是硬件极限了
+         受 NS4150B (~12dB 增益) 和扬声器 (4Ω 3W) 的物理限制
+
+播放时声音破音？
+  │
+  ├─ gain > 2.5 且 volume=100
+  │    → 降 gain 到 2.0（保持最响不破音）
+  │
+  ├─ gain=2.0 但录音本身接近满幅
+  │    → 用 gain=1.0（原始播放）
+  │
+  └─ 依然破音
+       → 检查录音源本身是否失真
+         检查扬声器是否松动/损坏
+```
+
+##### 输出电平参考
+
+在**默认参数** `--gain 2.0 --playback-volume 100`（Output=+4.5dB）下：
+
+| 源信号峰值 | 播放感受 | 备注 |
+|-----------|---------|------|
+| -3 dB FS（大声说话录音） | 响，无破音 | 理想情况 |
+| -6 dB FS（正常说话录音） | 响，无破音 | 推荐目标 |
+| -12 dB FS（小声说话录音） | 中等 | 可以加 --gain 2.5 |
+| -20 dB FS（很小录音） | 偏小 | 应重新录音，不建议靠数字增益补偿 |
+
+##### 硬件保护说明
+
+- ES8388 Output 最大 **+4.5dB**（硬件极限，不可超越）
+- NS4150B BTL 输出峰值受 5V 电源限制（约 8-9Vpp 差分）
+- 4Ω 3W 扬声器在当前硬件配置下不会被烧坏（NS4150B 会在饱和前 clipping）
+- **破音是硬件饱和的自然保护**，不会立即损坏扬声器，但长期使用会加速老化
+
+##### 与录音 `--voice-preset` 的区别
+
+| 预设 | 场景 | 播放响度 | 原因 |
+|------|------|---------|------|
+| `--voice-preset` | ASR 语音识别 | 中等（Output=-3dB） | 避免播放太响串扰麦克风 |
+| `--play-preset` / play 模式默认 | 纯播放（TTS/提示音） | 最响（Output=+4.5dB） | 用户需要清晰听到内容 |
 
 #### 6.1.6 混音器音量控制
 
@@ -3465,10 +3693,29 @@ amixer -c 0 sset "Right Channel" -- 24.0dB
 amixer -c 0 sset "Capture Digital" -- 0dB
 ```
 
-**Q: 播放听起来像"快进"**
+**Q: 播放单声道 WAV 时听起来像"快进"（2 倍速）**
 
-可能是单声道录音文件在立体声模式下播放时 I2S 时钟不匹配。
-ES8388 驱动在单声道模式下时钟配置可能异常，建议**始终使用默认立体声模式**（`-c 2`）。
+**原因**：ES8388 的 I2S 硬件配置固定为立体声（每帧 2 slot）。直接用 `hw:0,0` 播放单声道 WAV 时，硬件以立体声速率读取单声道数据，导致听起来变速。
+
+**解决方案**：`audio_test.py` 会自动将 `hw:X,Y` 升级为 `plughw:X,Y`，通过 ALSA 插件处理声道转换。用户无需干预：
+
+```bash
+# 默认（推荐）：自动使用 plughw:0,0，兼容任何 WAV
+python3 audio_test.py --mode play mono.wav
+
+# 如果需要绕过自动升级（使用原始 hw 设备）
+python3 audio_test.py --playback-device hw:0,0 --mode play stereo_only.wav
+```
+
+**手动播放的解决方式**（如果用 aplay 直接播放）：
+
+```bash
+# 错误：单声道 WAV 会加速
+aplay -D hw:0,0 mono.wav
+
+# 正确：用 plughw 让 ALSA 处理声道转换
+aplay -D plughw:0,0 mono.wav
+```
 
 **Q: 喇叭/耳机没声音，但 aplay 正常退出**
 
@@ -3483,6 +3730,82 @@ amixer -c 0 sget "hp switch"     # 耳机功放
 amixer -c 0 sset "spk switch" on
 amixer -c 0 sset "hp switch" on
 ```
+
+#### 6.1.9 音频调优与质量分析
+
+以上是基础测试。如需深入调优录音/播放增益、验证音质、检查扬声器功率安全，请参考：
+
+**📘 完整音频调优指南**：`interaction/car1_speech/tools/AUDIO_TUNING_GUIDE.md`
+
+该指南包含：
+- **录音增益调优流程**：如何找到适合你环境的最佳 PGA 增益（默认 88% = +21dB）
+- **播放音量调优**：如何在响度和扬声器安全之间平衡（默认 67% = -15dB = 1.08W）
+- **音频质量分析**：使用 `audio_analyzer.py` 自动检测削峰、噪声底噪、信号强度
+- **扬声器功率安全检查**：验证输出功率是否在 3W 扬声器的安全范围内
+- **降噪策略**：为什么必须关闭 ALC，如何优化 SNR
+- **故障排查**：常见问题的完整诊断流程
+
+**快速调优命令**：
+
+```bash
+# 推荐默认配置（适合大多数场景）
+python3 audio_test.py --voice-preset --mode record -o test.wav -d 5 --analyze
+# = mic +21dB (88%), speaker -15dB (67%), ALC off, 单声道
+
+# 分析已有录音质量
+python3 audio_analyzer.py test.wav
+
+# 检查扬声器功率安全
+python3 audio_analyzer.py --check-speaker -15.0  # 67% 音量（推荐）
+python3 audio_analyzer.py --check-speaker -12.0  # 100% 音量（最大安全）
+
+# 测量环境噪声底噪
+python3 audio_analyzer.py --measure-noise
+```
+
+**增益快速参考**：
+
+| 场景 | 录音增益 | 播放音量 | 命令 |
+|------|---------|----------|------|
+| **日常 ASR（推荐）** | 88% (+18dB) | 67% (-15dB, 1.08W) | `--voice-preset` |
+| **纯播放（TTS/音乐）** | 不变 | 100% (-12dB, 2.15W) | `--play-preset` |
+| 安静环境/远距离 ASR | 100% (+24dB) | 67% | `--capture-volume 100` |
+| 嘈杂环境/近距离 ASR | 75% (+12dB) | 67% | `--capture-volume 75` |
+| 自定义播放音量 | 不变 | 任意 0-100% | `--playback-volume 50` |
+| 静音播放 | 不变 | 0% (硬件静音) | `--playback-volume 0` |
+
+**两个预设的区别**：
+
+| 预设 | 录音增益 | 播放音量 | 适用场景 |
+|------|---------|----------|----------|
+| `--voice-preset` | +18dB (88%) | -15dB (67%, 1.08W) | ASR 语音识别，播放较柔和避免与麦克风串扰 |
+| `--play-preset` | 不变 | -12dB (100%, 2.15W) | 纯播放场景（TTS、音乐、提示音），最大安全音量 |
+
+**播放模式默认行为**：`--mode play` 时，如果没指定 `--playback-volume` 且没有其他预设，会**自动应用 100% 最大安全音量**（-12dB, 2.15W）。这样普通 `python3 audio_test.py --mode play test.wav` 就能获得最响的可用音量。
+
+**播放模式音量控制的三个层次**（可叠加）：
+
+1. **数字增益** `--gain`（默认 2.0）：在软件层放大信号幅度，用于低电平录音回放。使用 tanh 软削波防止失真
+2. **硬件音量** `--playback-volume`（默认 100% = -12dB）：控制 ES8388 的 Output 1/2 输出电平
+3. **单声道→立体声转换**（自动）：单声道 WAV 会自动复制到左右声道，避免 ES8388 I2S 立体声时钟错配导致的 2 倍速播放
+
+```bash
+# 默认（数字增益 2.0x + 硬件音量 100%）
+python3 audio_test.py --mode play test.wav
+
+# 声音太小 → 加大数字增益
+python3 audio_test.py --gain 3.0 --mode play test.wav
+
+# 声音失真 → 降低数字增益
+python3 audio_test.py --gain 1.5 --mode play test.wav
+
+# 播放原始信号（无处理）
+python3 audio_test.py --gain 1.0 --mode play test.wav
+```
+
+**为什么用数字增益而不是继续提高硬件音量**：4Ω 3W 扬声器的硬件功率上限是 -12dB（2.15W）。再往上会超过 3W，长期使用会损坏扬声器。数字增益在软件层放大信号幅度，配合软削波，既能提升响度又保护硬件。
+
+---
 
 ### 6.2 语音识别测试（asr_test.py）
 
@@ -3676,6 +3999,178 @@ python3 asr_test.py --vad-threshold 0.3
 # 嘈杂环境，降低误触发
 python3 asr_test.py --vad-threshold 0.7 --vad-min-speech 0.5
 ```
+
+#### 6.2.5 使用官方 sherpa-onnx 命令行工具
+
+除了上述 Python 脚本，sherpa-onnx 还提供了官方命令行工具，可以直接使用。
+
+##### 6.2.5.1 基于 ALSA 的实时识别（推荐）
+
+**sherpa-onnx-alsa**：直接从麦克风实时识别
+
+```bash
+# RKNN NPU 加速模式（.rknn 模型）
+sherpa-onnx-alsa \
+  --tokens=/home/iflytek/models/zipformer/tokens.txt \
+  --encoder=/home/iflytek/models/zipformer/encoder.rknn \
+  --decoder=/home/iflytek/models/zipformer/decoder.rknn \
+  --joiner=/home/iflytek/models/zipformer/joiner.rknn \
+  --num-threads=1 \
+  --provider=rknn \
+  --sample-rate=16000 \
+  --decoding-method=greedy_search \
+  plughw:0,0
+
+# CPU 模式（.onnx 模型）
+sherpa-onnx-alsa \
+  --tokens=/home/iflytek/models/zipformer/tokens.txt \
+  --encoder=/home/iflytek/models/zipformer/encoder.onnx \
+  --decoder=/home/iflytek/models/zipformer/decoder.onnx \
+  --joiner=/home/iflytek/models/zipformer/joiner.onnx \
+  --num-threads=4 \
+  --provider=cpu \
+  --sample-rate=16000 \
+  --decoding-method=greedy_search \
+  plughw:0,0
+```
+
+**参数说明**：
+
+| 参数 | 说明 |
+|------|------|
+| `--tokens` | 词表文件路径 |
+| `--encoder/decoder/joiner` | 模型文件路径（.rknn 或 .onnx） |
+| `--provider` | 推理后端（rknn / cpu） |
+| `--num-threads` | RKNN 模式用 1，CPU 模式用 4 |
+| `--sample-rate` | 采样率（通常 16000） |
+| `--decoding-method` | 解码方法（greedy_search / modified_beam_search） |
+| `plughw:0,0` | ALSA 设备名（最后一个位置参数，无 `--device` 前缀） |
+
+**使用说明**：
+- 启动后对着麦克风说话
+- 实时显示部分识别结果
+- 检测到端点后输出最终结果
+- `Ctrl+C` 退出
+
+##### 6.2.5.2 基于音频文件的离线识别
+
+**sherpa-onnx**：识别已录制的 WAV 文件
+
+```bash
+# RKNN 模式（推荐参数）
+sherpa-onnx \
+  --tokens=/home/iflytek/models/zipformer/tokens.txt \
+  --encoder=/home/iflytek/models/zipformer/encoder.rknn \
+  --decoder=/home/iflytek/models/zipformer/decoder.rknn \
+  --joiner=/home/iflytek/models/zipformer/joiner.rknn \
+  --num-threads=2 \
+  --provider=rknn \
+  --device=1 \
+  --decoding-method=modified_beam_search \
+  --max-active-paths=4 \
+  --temperature_scale=1.0 \
+  test.wav
+
+# CPU 模式
+sherpa-onnx \
+  --tokens=/home/iflytek/models/zipformer/tokens.txt \
+  --encoder=/home/iflytek/models/zipformer/encoder.onnx \
+  --decoder=/home/iflytek/models/zipformer/decoder.onnx \
+  --joiner=/home/iflytek/models/zipformer/joiner.onnx \
+  --num-threads=4 \
+  --provider=cpu \
+  --decoding-method=modified_beam_search \
+  --max-active-paths=4 \
+  test.wav
+```
+
+**参数说明**：
+
+| 参数 | 说明 |
+|------|------|
+| `--num-threads` | RKNN 模式推荐 2，CPU 模式推荐 4 |
+| `--device` | RKNN 设备 ID（1=自动选择 NPU 核心） |
+| `--decoding-method` | modified_beam_search 比 greedy_search 准确度更高 |
+| `--max-active-paths` | beam search 保留的路径数，越大越准确但越慢 |
+| `--temperature_scale` | 温度缩放，1.0 为默认值 |
+
+**准备测试音频**：
+
+```bash
+# 先录制一段测试音频（5 秒）
+arecord -D plughw:0,0 -r 16000 -c 1 -f S16_LE -d 5 test.wav
+
+# 播放确认录音质量
+aplay -D plughw:0,0 test.wav
+
+# 使用 sherpa-onnx 识别
+sherpa-onnx \
+  --tokens=/home/iflytek/models/zipformer/tokens.txt \
+  --encoder=/home/iflytek/models/zipformer/encoder.rknn \
+  --decoder=/home/iflytek/models/zipformer/decoder.rknn \
+  --joiner=/home/iflytek/models/zipformer/joiner.rknn \
+  --num-threads=2 \
+  --provider=rknn \
+  --device=1 \
+  --decoding-method=modified_beam_search \
+  --max-active-paths=4 \
+  --temperature_scale=1.0 \
+  test.wav
+```
+
+##### 6.2.5.3 检查工具是否安装
+
+```bash
+# 检查 sherpa-onnx-alsa
+which sherpa-onnx-alsa
+
+# 检查 sherpa-onnx-offline  
+which sherpa-onnx-offline
+
+# 如果没有，检查 Python 包中的命令行工具
+python3 -c "import sherpa_onnx; print(sherpa_onnx.__file__)"
+```
+
+如果只安装了 Python 包，命令行工具可能在：
+```bash
+~/.local/bin/sherpa-onnx-alsa
+# 或
+/usr/local/bin/sherpa-onnx-alsa
+```
+
+##### 6.2.5.4 常见问题
+
+**Q: 提示 `sherpa-onnx-alsa: command not found`**
+
+sherpa-onnx 有两种安装方式：
+1. **Python 包**：`pip install sherpa-onnx`（只有 Python API，无命令行工具）
+2. **预编译二进制**：从 GitHub Release 下载（包含命令行工具）
+
+如果只安装了 Python 包，可以：
+- 使用 `asr_test.py` 脚本（功能相同）
+- 或下载预编译版本：https://github.com/k2-fsa/sherpa-onnx/releases
+
+**Q: ALSA 设备名错误**
+
+如果 `plughw:0,0` 不工作，尝试：
+```bash
+# 查看可用设备
+arecord -l
+
+# 尝试其他设备名
+sherpa-onnx-alsa ... hw:0,0
+sherpa-onnx-alsa ... default
+```
+
+**Q: 识别结果是乱码或英文**
+
+确认模型是否支持中文：
+```bash
+# 查看 tokens 文件是否包含中文字符
+grep -P '[\p{Han}]' /home/iflytek/models/zipformer/tokens.txt | head -20
+```
+
+如果没有中文字符，说明模型是纯英文模型，需要下载中文 ASR 模型。
 
 ### 6.3 语音唤醒测试（kws_test.py）
 

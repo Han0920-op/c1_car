@@ -21,7 +21,6 @@ prompted for sudo password. The server itself runs as the current user.
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,23 +30,17 @@ import tempfile
 # fix_freq: lock NPU/CPU/GPU/DDR to max frequency (requires root)
 # ---------------------------------------------------------------------------
 
-def run_fix_freq(platform, tools_dir):
-    """Copy fix_freq script to tools_dir and run with sudo."""
+def run_fix_freq(platform, tools_dir, server_dir):
+    """Run the bundled fix_freq script with sudo."""
 
-    src = f"/home/iflytek/rknn-llm-release-v1.3.0/scripts/fix_freq_{platform}.sh"
-    dst = os.path.join(tools_dir, f"fix_freq_{platform}.sh")
+    fix_freq_script = os.path.join(server_dir, f"fix_freq_{platform}.sh")
 
-    if not os.path.exists(src):
-        print(f"Warning: fix_freq script not found at {src}, skipping.")
+    if not os.path.exists(fix_freq_script):
+        print(f"Warning: fix_freq script not found at {fix_freq_script}, skipping.")
         return False
 
-    # Keep a copy in tools/ for reference
-    if not os.path.exists(dst):
-        shutil.copy2(src, dst)
-    os.chmod(dst, 0o755)
-
     print("Locking clocks to max frequency (requires sudo)...")
-    result = subprocess.run(["sudo", "bash", dst])
+    result = subprocess.run(["sudo", "bash", fix_freq_script])
     if result.returncode != 0:
         print("Warning: fix_freq failed (exit code: %d)." % result.returncode)
         print("  Continuing without frequency tuning — performance may be lower.")
@@ -89,8 +82,10 @@ Examples:
         print(f"Error: model file not found: {args.model}")
         sys.exit(1)
 
-    # Locate the official flask_server.py (absolute path — expanduser fails under sudo)
-    server_dir = "/home/iflytek/rknn-llm-release-v1.3.0/examples/rkllm_server_demo/rkllm_server"
+    # --- Locate the bundled llm_server directory (relative to this script) ---------
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    server_dir = os.path.join(tools_dir, "..", "llm_server")
+    server_dir = os.path.abspath(server_dir)
     server_script = os.path.join(server_dir, "flask_server.py")
 
     if not os.path.exists(server_script):
@@ -112,33 +107,22 @@ Examples:
             sys.exit(1)
 
     # --- fix_freq: run with real sudo if requested, else provide no-op ------------
-    tools_dir = "/home/iflytek/ros2_ws/src/xflz_eai_car1/interaction/car1_llm/tools"
     fix_freq_script = os.path.join(server_dir, f"fix_freq_{args.platform}.sh")
 
     if args.fix_freq:
-        # Real frequency tuning — copy the official script and run with sudo
-        run_fix_freq(args.platform, tools_dir)
-        # After real fix_freq, the script exists. flask_server.py will still
-        # call "sudo bash fix_freq_rk3576.sh" — but we intercept that below.
+        run_fix_freq(args.platform, tools_dir, server_dir)
     else:
-        # No frequency tuning — provide a no-op so flask_server.py doesn't crash
         if not os.path.exists(fix_freq_script):
             with open(fix_freq_script, "w") as f:
                 f.write("#!/bin/bash\n# no-op — run with --fix-freq to lock clocks\n")
             os.chmod(fix_freq_script, 0o755)
 
     # --- Intercept the hardcoded "sudo bash fix_freq_*.sh" in flask_server.py -----
-    # flask_server.py unconditionally runs: sudo bash fix_freq_<platform>.sh
-    # We create a fake "sudo" that just executes the command directly (no real sudo).
-    # Combined with the no-op fix_freq script, this makes the server startable
-    # without root.  When --fix-freq was used, the real script already ran above,
-    # so re-running it via fake sudo as a no-op is harmless.
     fake_sudo_dir = tempfile.mkdtemp(prefix="llm_server_")
     fake_sudo = os.path.join(fake_sudo_dir, "sudo")
     with open(fake_sudo, "w") as f:
         f.write("#!/bin/bash\n")
-        f.write("# Fake sudo — silently exits. fix_freq was already applied above\n")
-        f.write("# (the real one via --fix-freq) or is a no-op.\n")
+        f.write("# Fake sudo — flaks_server.py hardcodes sudo; we provide a no-op.\n")
         f.write("exit 0\n")
     os.chmod(fake_sudo, 0o755)
 

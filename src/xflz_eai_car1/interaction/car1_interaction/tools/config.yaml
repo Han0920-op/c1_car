@@ -1,0 +1,74 @@
+# ============================================================================
+# 实时语音交互系统配置文件
+# ============================================================================
+
+# --- 音频设备 ---
+audio:
+  capture_device: "plughw:0,0"   # 录音 ALSA 设备
+  playback_device: "plughw:0,0"  # 播放 ALSA 设备
+  sample_rate: 16000             # 采样率 (Hz)
+  chunk_size: 4000               # 每帧采样数 (~250ms @16kHz)
+  capture_volume: 100            # 麦克风音量 0-100%
+  playback_volume: 100           # 扬声器音量 0-100%
+  mic_boost: true                # 启用 ALC + Mic 输入切换
+
+# --- 前端 VAD (IDLE / ACTIVE_LISTENING 状态的语音门控) ---
+vad:
+  model: "/home/iflytek/models/vad/silero_vad.onnx"
+  threshold: 0.5                 # 语音概率阈值 (提高阈值降低误触发)
+  min_silence_duration: 0.5      # 静音判定时长 (s)
+  min_speech_duration: 0.25      # 语音确认最短时长 (s，提高到0.25避免噪音误触发)
+  max_speech_duration: 20.0      # 单段语音最大时长 (s)
+  pre_buffer_duration: 1.0       # VAD 触发前保留的音频缓冲 (s)
+
+# --- 唤醒词检测 ---
+kws:
+  model_dir: "/home/iflytek/models/zipformer_kws"
+  keywords_file: "keywords.txt"  # 相对于本脚本目录
+  threshold: 0.25                # 检测灵敏度 (越低越灵敏)
+  keywords_score: 1.0
+  provider: "cpu"
+
+# --- 语音识别 ---
+asr:
+  model_dir: "/home/iflytek/models/zipformer"
+  provider: "rknn"               # rknn 或 cpu
+  blank_penalty: 0.5             # blank 符号惩罚
+  endpoint_silence: 1.5          # 后端端点静音时长 (s，延长到1.5s避免说话中间停顿被误判为结束)
+
+# --- 大语言模型 ---
+llm:
+  server_url: "http://127.0.0.1:8080"
+  temperature: 0.8
+  top_p: 0.9
+  max_tokens: 4096
+  repeat_penalty: 1.1
+  timeout: 120
+  system_prompt: "你是小飞，一个智能语音助手。请用简洁口语化的中文回答问题，每次回答控制在2-3句话。重要：必须用中文回答。"
+
+# --- LLM 服务进程 (内嵌启动，无需手动运行 llm_server.py) ---
+llm_server:
+  auto_start: true              # 是否自动启动 LLM 服务 (false = 手动启动外部服务)
+  model: "/home/iflytek/models/rkllm/Qwen3.5-0.8B_w4a16_g128_rk3576.rkllm"
+  platform: "rk3576"
+  fix_freq: false               # 是否锁定 NPU/CPU/GPU 频率 (需要 sudo)
+  lib_path: "/usr/lib/librkllmrt.so"       # RKLLM 运行时库路径
+  venv_python: "/home/iflytek/ros2_venv/bin/python3"
+
+# --- 语音合成 ---
+tts:
+  model_dir: "/home/iflytek/models/tts"
+  speed: 1.0
+  gain: 2.0
+  sid: 0
+  num_threads: 4
+
+# --- 交互参数 ---
+interaction:
+  active_timeout: 10.0           # 免唤醒窗口超时 (s)
+  resource_dir: "resource"       # 提示音目录 (相对于本脚本目录)
+
+# --- 调试 ---
+debug:
+  show_vad_status: false
+  show_kws_score: false
