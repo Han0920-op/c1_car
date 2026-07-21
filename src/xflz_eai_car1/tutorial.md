@@ -3809,7 +3809,7 @@ python3 audio_test.py --gain 1.0 --mode play test.wav
 
 ### 6.2 语音识别测试（asr_test.py）
 
-> **目标**：使用 sherpa-onnx + Silero VAD + RKNN 实现流式语音识别  
+> **目标**：使用 sherpa-onnx + RKNN + 内置端点检测实现流式语音识别  
 > **所需时间**：15 分钟  
 > **硬件要求**：ES8388 音频编解码器（板载麦克风）  
 > **前置条件**：sherpa-onnx 已安装，模型文件已就位
@@ -3821,8 +3821,15 @@ python3 audio_test.py --gain 1.0 --mode play test.wav
 **识别引擎架构**：
 
 ```
-ALSA 麦克风 → VoiceActivityDetector (Silero VAD) → [语音段] → OnlineRecognizer (Zipformer + RKNN) → 终端输出
-                                  ↗ 预语音缓冲区 (0.5s) 补回头部
+ALSA 麦克风 (plughw:0,0)
+  ↓
+ES8388 Mixer (ALC + Noise Gate 自动增益)
+  ↓
+OnlineRecognizer (Zipformer + RKNN NPU)
+  ↓
+内置端点检测 (rule1/rule2/rule3)
+  ↓
+终端输出 (segment_id:识别文本)
 ```
 
 **核心组件**：
@@ -3830,10 +3837,11 @@ ALSA 麦克风 → VoiceActivityDetector (Silero VAD) → [语音段] → Online
 | 组件 | 说明 |
 |------|------|
 | **OnlineRecognizer** | sherpa-onnx 流式识别器，使用 Zipformer transducer 模型 |
-| **Silero VAD** | 语音活动检测，精确切分语音段（替代基于静音时长的规则端点检测） |
-| **RKNN Provider** | NPU 加速推理（仅 ASR 模型；VAD 模型为 ONNX 格式，固定 CPU 运行） |
-| **ALSA 输入** | 直接从 `plughw:0,0` 读取麦克风音频 |
-| **预语音缓冲** | CircularBuffer（~0.5s），VAD 检测到语音起点后回补，避免丢失首个字 |
+| **内置端点检测** | 基于静音时长的规则检测（rule1/rule2/rule3），判断句子边界 |
+| **RKNN Provider** | RK3576 NPU 加速推理（encoder/decoder/joiner 均为 .rknn 格式） |
+| **ALSA 输入** | 直接从 `plughw:0,0` 读取 16kHz 单声道音频 |
+| **ALC + Noise Gate** | ES8388 硬件自动增益控制，动态适应距离/音量变化，静音时关闭 ADC 避免底噪 |
+| **AudioMixer** | 统一管理 ES8388 mixer 设置（与 audio_test.py / kws_test.py 一致） |
 
 **模型文件**（默认路径）：
 
@@ -3843,29 +3851,29 @@ ALSA 麦克风 → VoiceActivityDetector (Silero VAD) → [语音段] → Online
 | encoder | `~/models/zipformer/encoder.rknn` | RKNN (NPU) |
 | decoder | `~/models/zipformer/decoder.rknn` | RKNN (NPU) |
 | joiner | `~/models/zipformer/joiner.rknn` | RKNN (NPU) |
-| Silero VAD | `~/models/vad/silero_vad.onnx` | ONNX (CPU，~600KB) |
 
 #### 6.2.2 基本用法
 
 ```bash
 cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_speech/tools
 
-# 默认参数运行（capture=100%, ALC 自动增益, RKNN 推理）
+# 默认参数运行（ALC 自动增益 + RKNN 推理）— 推荐
 python3 asr_test.py
 
-# CPU 模式（无 NPU 时使用）
-python3 asr_test.py --provider cpu
-
-# 关闭 ALC 自动增益
-python3 asr_test.py --no-mic-boost
+# 关闭 ALC（使用固定 PGA 增益）
+python3 asr_test.py --disable-alc
 
 # 降低录音增益（如果环境噪声大）
-python3 asr_test.py --capture-volume 60
+python3 asr_test.py --capture-volume 88
+
+# 使用热词（需要 modified_beam_search）
+python3 asr_test.py --decoding-method modified_beam_search --hotwords-file hotwords.txt
 ```
 
 启动后语音识别进入流式模式：
-- `[部分识别结果]` — 实时刷新，显示当前已识别内容
-- `[Final] 完整识别结果` — 语音段结束后输出最终文本
+- `0:部分识别结果` — 实时刷新当前行，显示正在识别的内容
+- 识别到句子结束后换行，开始新的 segment
+- `[endpoint, no text]` — 端点触发但无文字（通常是环境噪声，偶尔出现正常）
 - `Ctrl+C` — 退出
 
 #### 6.2.3 完整参数参考
@@ -3878,127 +3886,172 @@ python3 asr_test.py --capture-volume 60
 | `--encoder` | `~/models/zipformer/encoder.rknn` | 编码器模型 (RKNN) |
 | `--decoder` | `~/models/zipformer/decoder.rknn` | 解码器模型 (RKNN) |
 | `--joiner` | `~/models/zipformer/joiner.rknn` | 连接器模型 (RKNN) |
-| `--vad-model` | `~/models/vad/silero_vad.onnx` | VAD 模型 (ONNX) |
 | `-D / --device` | `plughw:0,0` | ALSA PCM 录音设备 |
-| `--provider` | `rknn` | ONNX 推理后端 (cpu / rknn) |
-| `--num-threads` | `4` | 计算线程数 |
+| `--provider` | `rknn` | 推理后端 (rknn / cpu)。注意：.rknn 模型无法用 cpu 运行 |
+| `--num-threads` | `1` | RKNN 为 NPU 核心 mask，CPU 模式建议设 4 |
 | `--sample-rate` | `16000` | 期望采样率 |
 
 **解码参数**：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--decoding-method` | `greedy_search` | 解码方式 (greedy_search / modified_beam_search) |
-| `--max-active-paths` | `4` | beam search 活跃路径数 |
-| `--blank-penalty` | `0.5` | blank 符号惩罚值。越高保留越多边缘帧，减少首个/末个字丢失；设 0 相当于不惩罚 |
+| `--decoding-method` | `greedy_search` | 解码方式。使用热词时需改为 `modified_beam_search` |
+| `--blank-penalty` | `0.25` | blank 符号惩罚。越低减少重复字，越高减少丢字。推荐 0.2-0.3 |
+| `--hotwords-file` | `""`（禁用） | 热词文件路径（需 modified_beam_search） |
+| `--hotwords-score` | `2.0` | 热词加分值（越高越倾向热词） |
 
-**VAD 参数**：
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--vad-threshold` | `0.5` | 语音概率阈值（0.3 更敏感，0.7 更严格） |
-| `--vad-min-silence` | `0.5` | 判定语音结束的静音时长（秒） |
-| `--vad-min-speech` | `0.25` | 最短语音持续时长（秒），低于此值的触发被忽略 |
-| `--vad-max-speech` | `20.0` | 最长语音持续时长（秒），超过则强制截断 |
-
-**录音增益参数**（默认启用，自动拉满）：
+**端点检测参数**：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--capture-volume` | `100` | 麦克风录音增益 0-100%（100%=0dB 无衰减，preamp 24dB） |
-| `--no-mic-boost` | 不传 | 禁用 ALC 自动增益 + Mic 输入切换 |
+| `--rule1-min-trailing-silence` | `4.5` | 从头开始的最小静音时长触发端点（秒）。增大减少噪声误触发 |
+| `--rule2-min-trailing-silence` | `1.5` | 识别出文字后的最小静音触发端点（秒）。增大防止句尾丢字 |
+| `--rule3-min-utterance-length` | `300.0` | 最短语音长度触发端点（秒）。设很大=禁用此规则 |
+
+**录音增益参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--capture-volume` | `95` | 麦克风 PGA 增益 0-100%（95% ≈ +22dB） |
+| `--enable-alc` | `True`（默认启用） | 启用 ALC 自动增益 + Noise Gate |
+| `--disable-alc` | 不传 | 关闭 ALC，使用固定 PGA 增益 |
+| `--voice-preset` | 不传 | 应用 ASR 预设（mic +18dB, ALC off, 与 audio_test.py 一致） |
 | `--card` | `0` | ALSA 声卡编号 |
 
 **其他**：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--pre-speech-buffer` | `0.5` | VAD 触发前的音频缓冲时间（秒） |
-| `--chunk-size` | `4000` | 每次从 ALSA 读取的采样点（~250ms@16kHz） |
+| `--feature-dim` | `80` | 模型特征维度 |
 | `--debug` | 不传 | 启用调试输出 |
 
 #### 6.2.4 常见问题
 
-**Q: 开着 ALSA 设备启动了 ALC 输入还是小于正常值**
+**Q: 频繁出现 `[endpoint, no text]`**
 
-这通常是 ALSA 设备实际采样率与期望不一致导致驱动内部过采样（如 44100→16000 重采样时信号被压缩）。
-检查启动日志中 `actual sample rate` 的值：
+这是 VAD 误触发（环境噪声被误判为语音）。按优先级排查：
 
-```bash
-python3 asr_test.py 2>&1 | head -20
-# 查找 expected sample rate 和 actual sample rate
-```
+1. **降低增益**：
+   ```bash
+   python3 asr_test.py --capture-volume 88
+   ```
 
-如果 actual 不是 16000，确认跑的是 RK3576 板载 ES8388 驱动，并检查 `~/.asoundrc` 是否意外配置了 dmix/dsnoop。
+2. **增加 rule1**（让系统等更久才判定为端点）：
+   ```bash
+   python3 asr_test.py --rule1-min-trailing-silence 5.5
+   ```
 
-**Q: 声音小识别不到**
+3. **检查环境噪声**（关闭风扇/空调后是否减少）
 
-默认已经拉满录音增益（capture-volume=100 + ALC 开启）。如果仍偏小：
+正常水平：静音 30 秒内出现 ≤3 次属于可接受范围。
 
-```bash
-# 确认混音器状态
-python3 audio_test.py --list-mixer
+**Q: 句尾丢字（如"请把东西搬运到停放点"只识别出"请把东西搬运"）**
 
-# 手动检查录音链路
-amixer -c 0 sget "Left Channel"    # 应为 [100%] [24.00dB]
-amixer -c 0 sget "Right Channel"   # 应为 [100%] [24.00dB]
-amixer -c 0 sget "Capture Digital" # 应接近 0dB
-
-# 确认 ALC 已开启
-amixer -c 0 sget "ALC Capture Function"  # 应为 Stereo
-
-# 确认输入切到 Mic
-amixer -c 0 sget "Left Line Mux"   # 应为 MicL
-amixer -c 0 sget "Right Line Mux"  # 应为 MicR
-```
-
-**Q: 第一个字总是被丢掉**
-
-预语音缓冲区（0.5s）默认已处理此问题。如果仍偶尔丢失，可适当增大：
+增大 rule2，给句尾更多识别时间：
 
 ```bash
-python3 asr_test.py --pre-speech-buffer 0.8
+python3 asr_test.py --rule2-min-trailing-silence 2.0
 ```
 
-同时可以尝试调整 `--blank-penalty`（默认 0.5），设为 1.0 让模型更倾向于保留边缘音频帧：
+**Q: 识别结果重复字（如"小飞同学同学"）**
+
+降低 blank_penalty：
 
 ```bash
-python3 asr_test.py --blank-penalty 1.0
+# 从默认 0.25 降到 0.2
+python3 asr_test.py --blank-penalty 0.2
 ```
 
-**Q: 短语音被重复输出多次**
+blank_penalty 越高越容易重复，越低越容易丢字。推荐范围 0.2-0.3。
 
-以前的裸端点检测（rule1/rule2/rule3）对中文短音节不敏感，短词可能被反复解码。
-现在已改用 Silero VAD 精确分段，每条语音段结束后只输出一次 [Final] 结果。
+**Q: "小飞"被识别成"小飞机"或"VIVO"**
+
+使用热词功能纠偏（需要 modified_beam_search）：
+
+```bash
+# 创建热词文件 hotwords.txt：
+# 小 飞
+# 小 飞 同 学
+# 你 好 小 飞
+
+python3 asr_test.py --decoding-method modified_beam_search \
+                    --hotwords-file hotwords.txt --hotwords-score 2.5
+```
+
+注意：modified_beam_search 会增加 partial results 的更新频率（屏幕闪烁更多）。
+
+**Q: 需要离麦克风很近才能识别**
+
+这是单麦克风系统的物理限制。有效距离约 30-60cm。改善方法：
+
+1. **启用 ALC**（默认已启用）：自动补偿距离变化
+   ```bash
+   python3 asr_test.py  # ALC 默认开启
+   ```
+
+2. **提高增益**（会增加误触发）：
+   ```bash
+   python3 asr_test.py --capture-volume 100
+   ```
+
+3. **降低增益**（减少误触发但距离更短）：
+   ```bash
+   python3 asr_test.py --capture-volume 88
+   ```
+
+**Q: 识别效果时好时差**
+
+通常是距离/音量不一致导致。ALC（默认开启）能自动调节增益适应变化。如果效果仍不稳定：
+
+- 确保说话时面对麦克风，距离 30-50cm
+- 环境噪声尽量降低
+- 如果 ALC 导致问题，可关闭回到固定增益：
+  ```bash
+  python3 asr_test.py --disable-alc --capture-volume 95
+  ```
 
 **Q: RKNN 模型加载失败**
 
 ```
-E RKNN: parseRKNN: invalid RKNN_MAGIC!
+RuntimeError: Load model from decoder.rknn failed: Protobuf parsing failed.
 ```
 
-ASR 模型（encoder/decoder/joiner）必须是 `.rknn` 格式才能用 `--provider rknn`。
-VAD 模型（silero_vad）是 ONNX 格式，工具内部已固定用 CPU 加载，无需配置。
+.rknn 模型**只能用 `--provider rknn`**，不能用 `--provider cpu`。CPU 模式需要 .onnx 格式的模型文件。
 
-如果 ASR 模型也不是 RKNN 格式（如从官方下载的 ONNX），改 `--provider cpu` 即可：
+**Q: 输出 "VI"/"VO"/"VIVO" 等奇怪字符**
 
-```bash
-python3 asr_test.py --provider cpu
-```
+这是模型在低置信度时的"乱猜"（将环境噪声或句首气流声误识别为英文字符）。解决方法：
+- 说话前稍等 1 秒再开口
+- 降低增益减少底噪：`--capture-volume 88`
+- 使用热词纠偏
 
-**Q: VAD 太灵敏 / 太迟钝**
+#### 6.2.5 参数调优指南
 
-- 太灵敏（环境噪声被误识别为语音）：降低 `--vad-threshold` 到 0.7
-- 太迟钝（正常说话不被检测）：提高 `--vad-threshold` 到 0.3
-- 停顿较长时被切句：增大 `--vad-min-silence` 到 1.0
+**场景化推荐配置**：
 
-```bash
-# 安静环境，提高灵敏度
-python3 asr_test.py --vad-threshold 0.3
+| 场景 | 命令 |
+|------|------|
+| **日常使用（推荐）** | `python3 asr_test.py` |
+| 安静环境 + 近距离 | `python3 asr_test.py --disable-alc --capture-volume 88` |
+| 嘈杂环境 | `python3 asr_test.py --capture-volume 88 --rule1-min-trailing-silence 5.5` |
+| 需要热词纠偏 | `python3 asr_test.py --decoding-method modified_beam_search --hotwords-file hotwords.txt` |
+| 减少重复字 | `python3 asr_test.py --blank-penalty 0.2` |
+| 减少句尾丢字 | `python3 asr_test.py --rule2-min-trailing-silence 2.0` |
 
-# 嘈杂环境，降低误触发
-python3 asr_test.py --vad-threshold 0.7 --vad-min-speech 0.5
-```
+**blank_penalty 调优**：
+
+| blank_penalty | 重复字 | 丢字 | 适用场景 |
+|---------------|--------|------|---------|
+| 0.0 | 少 | 多 | 说话快速清晰 |
+| **0.2-0.3** | **少** | **少** | **推荐平衡** |
+| 0.5+ | 多 | 很少 | 不推荐 |
+
+**ALC vs 固定增益**：
+
+| 模式 | 优点 | 缺点 | 适用场景 |
+|------|------|------|---------|
+| **ALC 开启（默认）** | 自动适应距离/音量变化 | 偶尔句首延迟 | 日常使用，距离不固定 |
+| 固定增益 (`--disable-alc`) | 无延迟，可预测 | 距离敏感 | 距离固定（如桌面麦克风） |
 
 #### 6.2.5 使用官方 sherpa-onnx 命令行工具
 
@@ -4249,7 +4302,7 @@ for t, r in zip(texts, result):
 ```bash
 cd ~/ros2_ws/src/xflz_eai_car1/interaction/car1_speech/tools
 
-# 默认参数运行（默认唤醒词 + 录音满增益 + ALC）
+# 默认参数运行（ALC 自动增益 + 默认唤醒词）
 python3 kws_test.py
 
 # 使用自定义唤醒词文件
@@ -4262,7 +4315,7 @@ python3 kws_test.py --keywords-threshold 0.15
 python3 kws_test.py --keywords-threshold 0.4
 
 # 关闭 ALC 自动增益
-python3 kws_test.py --no-mic-boost
+python3 kws_test.py --disable-alc
 ```
 
 检测到唤醒词时输出：
@@ -4299,8 +4352,10 @@ python3 kws_test.py --no-mic-boost
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--capture-volume` | `100` | 麦克风录音增益 0-100% |
-| `--no-mic-boost` | 不传 | 禁用 ALC 自动增益 + Mic 输入切换 |
+| `--capture-volume` | `88` | 麦克风 PGA 增益 0-100%（88% ≈ +18dB） |
+| `--enable-alc` | 默认启用 | ALC 自动增益 + Noise Gate |
+| `--disable-alc` | 不传 | 关闭 ALC，使用固定 PGA 增益 |
+| `--voice-preset` | 不传 | 应用 ASR 预设（mic +18dB, ALC off） |
 | `--card` | `0` | ALSA 声卡编号 |
 
 #### 6.3.5 常见问题

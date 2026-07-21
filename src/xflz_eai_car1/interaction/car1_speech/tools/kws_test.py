@@ -36,11 +36,23 @@ import sherpa_onnx
 
 # Import AudioMixer for consistent gain control with audio_test.py
 from audio_mixer import AudioMixer, capture_volume_pct_to_db
+import subprocess
 
 
 # ---------------------------------------------------------------------------
 # Mixer helpers (consistent with audio_test.py)
 # ---------------------------------------------------------------------------
+
+def switch_input_to_mic(card):
+    """Switch ES8388 input mux from Line to Mic inputs."""
+    subprocess.run(
+        ["amixer", "-c", str(card), "sset", "Left Line Mux", "MicL"],
+        capture_output=True, check=False)
+    subprocess.run(
+        ["amixer", "-c", str(card), "sset", "Right Line Mux", "MicR"],
+        capture_output=True, check=False)
+    print("  Input mux: MicL / MicR")
+
 
 def apply_capture_volume(card, pct):
     """Apply mic capture volume using AudioMixer (same as audio_test.py).
@@ -143,6 +155,9 @@ Examples:
     # Audio mixer setup (consistent with audio_test.py best practices)
     # -----------------------------------------------------------------------
     print("Audio mixer setup...")
+
+    # CRITICAL: Switch input mux to microphone (ES8388 may default to Line input)
+    switch_input_to_mic(args.card)
 
     if args.voice_preset:
         # Use optimized ASR preset (mic +18dB, ALC off)

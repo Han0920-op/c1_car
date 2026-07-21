@@ -6,6 +6,22 @@ Uses sherpa-onnx built-in endpoint detection (same as RK3588 version).
 This preserves the recognizer's streaming context across the entire session,
 which is critical for Zipformer accuracy.
 
+Recording defaults (consistent with audio_test.py and kws_test.py):
+  - Mic PGA: +18dB (--capture-volume 88, optimized for 30-50cm)
+  - ALC: OFF (avoids noise floor pumping during silence)
+  - Use --voice-preset for quick setup with recommended gains
+
+VAD endpoint detection (tuned to reduce word loss):
+  - rule1_min_trailing_silence: 3.0s (was 2.4s in RK3588)
+  - rule2_min_trailing_silence: 2.0s (was 1.2s, increased to prevent tail loss)
+  - rule3_min_utterance_length: 2.0s (was 300s, now requires 2s minimum speech)
+  - blank_penalty: 0.3 (was 0.0, helps reduce word omissions)
+
+Hotwords (default enabled with hotwords.txt):
+  - Used to bias recognition toward specific names/phrases
+  - Helps fix "小飞" → "小飞机" type errors
+  - Score 2.0 gives strong preference to hotwords
+
 Mimics the behavior of:
   sherpa-onnx-alsa --tokens=~/models/zipformer/tokens.txt \\
                    --encoder=~/models/zipformer/encoder.rknn \\
@@ -15,75 +31,30 @@ Mimics the behavior of:
                    --decoding-method=greedy_search plughw:0,0
 
 Usage:
-  python3 asr_test.py                                       # default params
+  python3 asr_test.py                                       # optimized defaults + hotwords
+  python3 asr_test.py --voice-preset                        # explicit ASR preset
   python3 asr_test.py --provider cpu                        # CPU fallback
-  python3 asr_test.py --no-mic-boost                        # disable ALC
-  python3 asr_test.py --capture-volume 60                   # lower mic volume
+  python3 asr_test.py --capture-volume 100                  # max mic gain (+24dB)
+  python3 asr_test.py --enable-alc                          # enable ALC (not recommended)
+  python3 asr_test.py --hotwords-file my_hotwords.txt       # custom hotwords
+  python3 asr_test.py --hotwords-file ""                    # disable hotwords
+  python3 asr_test.py --rule2-min-trailing-silence 1.5      # faster endpoint (more tail loss)
 """
 
 import argparse
-import math
 import signal
-import subprocess
 import sys
 
 import sherpa_onnx
 
+# Import AudioMixer for consistent gain control with audio_test.py
+from audio_mixer import AudioMixer, capture_volume_pct_to_db
+import subprocess
+
 
 # ---------------------------------------------------------------------------
-# Mixer helpers (ES8388 / RK3576) — same logic validated in audio_test.py
+# Mixer helpers (consistent with audio_test.py and kws_test.py)
 # ---------------------------------------------------------------------------
-
-def pct_to_db(pct):
-    """Convert volume percentage to dB: 100% → 0dB, 50% → -6dB, 25% → -12dB."""
-    if pct >= 100:
-        return 0.0
-    if pct <= 0:
-        return -96.0
-    return 20.0 * math.log10(pct / 100.0)
-
-
-def apply_capture_volume(card, pct):
-    """Set capture volume from percentage.
-
-    Capture path: Left/Right Channel (preamp, 0..+24dB) + Capture Digital (-96..0dB).
-    Preamp stays at max (+24dB) for best SNR; Capture Digital handles attenuation.
-    """
-    # Preamp at max (24dB) — best signal-to-noise ratio
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Left Channel", "--", "24.0dB"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Right Channel", "--", "24.0dB"],
-        capture_output=True, check=False)
-
-    # Digital attenuation: 100% → 0dB, 50% → -6dB, 25% → -12dB
-    db_val = pct_to_db(pct)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "Capture Digital", "--", f"{db_val:.1f}dB"],
-        capture_output=True, check=False)
-    print(f"  Capture volume: {pct}% ({db_val:.1f} dB) + preamp 24 dB")
-
-
-def enable_alc(card):
-    """Enable ALC (Automatic Level Control) for better low-volume pickup."""
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Function", "Stereo"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Target", "12"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Max PGA", "7"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Attack Time", "5"],
-        capture_output=True, check=False)
-    subprocess.run(
-        ["amixer", "-c", str(card), "sset", "ALC Capture Decay Time", "0"],
-        capture_output=True, check=False)
-    print("  ALC: enabled (Stereo, target=12, max_pga=7)")
-
 
 def switch_input_to_mic(card):
     """Switch ES8388 input mux from Line to Mic inputs."""
@@ -96,6 +67,33 @@ def switch_input_to_mic(card):
     print("  Input mux: MicL / MicR")
 
 
+def apply_capture_volume(card, pct):
+    """Apply mic capture volume using AudioMixer (same as audio_test.py).
+
+    - 0%:        Mute mic
+    - 1-49%:     PGA 0dB, digital cut -30..0dB (attenuation, hurts SNR)
+    - 50%:       Neutral (PGA 0dB, digital 0dB)
+    - 51-100%:   PGA boost 0..+24dB (analog gain, best SNR)
+    """
+    mixer = AudioMixer(card=card)
+    if pct <= 0:
+        mixer.mute_mic()
+        print("  Capture volume: MUTED")
+        return
+    mixer.unmute_mic()
+    preamp_db, digital_db = capture_volume_pct_to_db(pct)
+    mixer.set_mic_preamp_db(preamp_db)
+    mixer.set_capture_digital_db(digital_db)
+    print(f"  Capture volume: {pct}% → PGA {preamp_db:+.1f}dB, digital {digital_db:+.1f}dB")
+
+
+def apply_voice_preset(card):
+    """Apply optimized ASR defaults (same as audio_test.py --voice-preset)."""
+    mixer = AudioMixer(card=card)
+    mixer.apply_voice_preset()
+    print("  Voice preset: mic +18dB (88%), ALC off, speaker -3dB")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -106,9 +104,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 asr_test.py
-  python3 asr_test.py --provider cpu
-  python3 asr_test.py --no-mic-boost
+  python3 asr_test.py                                # optimized defaults (mic +18dB)
+  python3 asr_test.py --voice-preset                 # explicit ASR preset
+  python3 asr_test.py --provider cpu                 # CPU fallback (no RKNN)
+  python3 asr_test.py --capture-volume 100           # max mic gain (+24dB PGA)
+  python3 asr_test.py --enable-alc                   # enable ALC (not recommended)
         """,
     )
 
@@ -136,32 +136,45 @@ Examples:
 
     # ---- Decoding ----
     parser.add_argument("--decoding-method", default="greedy_search",
-                        choices=["greedy_search", "modified_beam_search"])
-    parser.add_argument("--blank-penalty", type=float, default=0.0,
-                        help="Penalty on blank symbol (default: 0.0, same as RK3588)")
+                        choices=["greedy_search", "modified_beam_search"],
+                        help="Decoding method (default: greedy_search). "
+                             "Use modified_beam_search for hotwords (more partial result updates)")
+    parser.add_argument("--blank-penalty", type=float, default=0.25,
+                        help="Penalty on blank symbol (default: 0.25). "
+                             "Lower = less word duplication, higher = less word omission")
 
     # ---- Endpoint detection (built-in, replaces external VAD) ----
-    parser.add_argument("--rule1-min-trailing-silence", type=float, default=2.4,
-                        help="Rule 1: min trailing silence for endpoint (default: 2.4s)")
-    parser.add_argument("--rule2-min-trailing-silence", type=float, default=1.2,
-                        help="Rule 2: min trailing silence after non-empty result (default: 1.2s)")
+    parser.add_argument("--rule1-min-trailing-silence", type=float, default=4.5,
+                        help="Rule 1: min trailing silence for endpoint (default: 4.5s, "
+                             "increased from 3.0s to reduce noise-triggered false endpoints)")
+    parser.add_argument("--rule2-min-trailing-silence", type=float, default=1.5,
+                        help="Rule 2: min trailing silence after non-empty result (default: 1.5s, "
+                             "balanced between responsiveness and tail loss prevention)")
     parser.add_argument("--rule3-min-utterance-length", type=float, default=300.0,
-                        help="Rule 3: min utterance length to trigger endpoint (default: 300s = effectively disabled)")
+                        help="Rule 3: min utterance length to trigger endpoint (default: 300.0s, "
+                             "effectively disabled - use rule1/rule2 for endpoint control)")
 
     # ---- Feature extraction ----
     parser.add_argument("--feature-dim", type=int, default=80)
 
     # ---- Hotwords ----
     parser.add_argument("--hotwords-file", type=str, default="",
-                        help="Path to hotwords file for biasing")
-    parser.add_argument("--hotwords-score", type=float, default=1.5)
+                        help="Path to hotwords file for biasing (requires --decoding-method=modified_beam_search). "
+                             "One phrase per line, tokens separated by space, e.g. '小 飞 你 好'")
+    parser.add_argument("--hotwords-score", type=float, default=2.0,
+                        help="Hotword score bonus per token (default: 2.0, higher = stronger bias)")
 
     # ---- Capture volume & mic boost ----
     parser.add_argument("--card", type=int, default=0)
-    parser.add_argument("--capture-volume", type=int, default=100,
-                        help="Set mic capture volume 0-100%% (default: 100)")
-    parser.add_argument("--no-mic-boost", action="store_true",
-                        help="Disable ALC (automatic level control) + Mic input switching")
+    parser.add_argument("--capture-volume", type=int, default=95,
+                        help="Mic capture volume 0-100%% (default: 95 = +22dB PGA, "
+                             "balanced between signal strength and noise floor)")
+    parser.add_argument("--voice-preset", action="store_true",
+                        help="Apply ASR-optimized defaults (mic +18dB, ALC off) — same as audio_test.py")
+    parser.add_argument("--enable-alc", action="store_true", default=True,
+                        help="Enable ALC with Noise Gate (default: enabled, auto-adjusts gain for varying distance)")
+    parser.add_argument("--disable-alc", action="store_true",
+                        help="Disable ALC, use fixed PGA gain (predictable but distance-sensitive)")
 
     # ---- Debug ----
     parser.add_argument("--debug", action="store_true")
@@ -169,16 +182,30 @@ Examples:
     args = parser.parse_args()
 
     # -----------------------------------------------------------------------
-    # Audio mixer setup (on by default for best recognition)
+    # Audio mixer setup (consistent with audio_test.py and kws_test.py)
     # -----------------------------------------------------------------------
     print("Audio mixer setup...")
-    pct = max(0, min(100, args.capture_volume))
-    apply_capture_volume(args.card, pct)
-    if not args.no_mic_boost:
-        enable_alc(args.card)
-        switch_input_to_mic(args.card)
+
+    # CRITICAL: Switch input mux to microphone (ES8388 may default to Line input)
+    switch_input_to_mic(args.card)
+
+    if args.voice_preset:
+        # Use optimized ASR preset (mic +18dB, ALC off)
+        apply_voice_preset(args.card)
     else:
-        print("  Mic boost: disabled")
+        # Manual capture volume
+        pct = max(0, min(100, args.capture_volume))
+        apply_capture_volume(args.card, pct)
+
+        # ALC configuration
+        mixer = AudioMixer(card=args.card)
+        if args.disable_alc:
+            mixer.set_alc(False)
+            print("  ALC: off (fixed gain)")
+        else:
+            # ALC on + Noise Gate: auto-adjust gain, but mute during silence
+            mixer.set_alc(True, target_pct=80, max_pga_step=5, noise_gate=True)
+            print("  ALC: enabled (target=80%, max_pga=5, noise_gate=ON)")
 
     # -----------------------------------------------------------------------
     # Build recognizer (with built-in endpoint detection, matches RK3588 config)
@@ -194,6 +221,15 @@ Examples:
     print(f"  blank_penalty: {args.blank_penalty}")
     print(f"  rule1 silence: {args.rule1_min_trailing_silence}s")
     print(f"  rule2 silence: {args.rule2_min_trailing_silence}s")
+    print(f"  rule3 min_utt: {args.rule3_min_utterance_length}s")
+    if args.hotwords_file:
+        import os
+        if os.path.exists(args.hotwords_file):
+            print(f"  hotwords: {args.hotwords_file} (score={args.hotwords_score})")
+        else:
+            print(f"  hotwords: {args.hotwords_file} NOT FOUND (will be ignored)")
+    else:
+        print(f"  hotwords: none")
 
     recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
         tokens=args.tokens,
