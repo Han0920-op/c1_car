@@ -83,12 +83,35 @@ def setup_capture(card, volume_pct, mic_boost=True):
 
 
 def setup_playback(card, volume_pct):
-    """Set playback mixer levels and enable speaker amplifier."""
-    db_val = pct_to_db(max(0, min(100, volume_pct)))
-    for ctl in ["Output 1", "Output 2", "PCM"]:
+    """Set playback mixer levels and enable speaker amplifier.
+
+    Follows audio_test.py convention:
+      - PCM held at 0dB (preserve dynamic range)
+      - Output 1/2 mapped to -30..-12dB (capped at -12dB for 4Ω 3W speaker safety)
+      - 100% → -12dB, 50% → -21dB, 0% → mute
+    """
+    pct = max(0, min(100, volume_pct))
+
+    # Set PCM to 0dB (preserve dynamic range)
+    subprocess.run(
+        ["amixer", "-c", str(card), "sset", "PCM", "--", "0dB"],
+        capture_output=True, check=False)
+
+    # Map 0-100% → -30..-12dB (speaker safety cap at -12dB)
+    if pct <= 0:
+        # Mute speaker
+        for ctl in ["Speaker", "spk switch"]:
+            subprocess.run(
+                ["amixer", "-c", str(card), "sset", ctl, "off"],
+                capture_output=True, check=False)
+        return
+
+    db_val = -30.0 + (pct / 100.0) * 18.0  # 0% → -30dB, 100% → -12dB
+    for ctl in ["Output 1", "Output 2"]:
         subprocess.run(
             ["amixer", "-c", str(card), "sset", ctl, "--", f"{db_val:.1f}dB"],
             capture_output=True, check=False)
+
     for ctl in ["Speaker", "spk switch"]:
         subprocess.run(
             ["amixer", "-c", str(card), "sset", ctl, "on"],
