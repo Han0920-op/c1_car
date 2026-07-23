@@ -935,6 +935,9 @@ void CameraPublisher::pointcloudPublisher(AS_CAM_PTR pCamera, const AS_SDK_Data_
                 stPointCloudRgb.points.push_back(p);
             }
         }
+        stPointCloudRgb.width = static_cast<uint32_t>(stPointCloudRgb.points.size());
+        stPointCloudRgb.height = 1;
+        stPointCloudRgb.is_dense = false;
         pcl::toROSMsg(stPointCloudRgb, pointCloudMsgRgb);
         pointCloudMsgRgb.header.stamp = this->get_clock()->now();
 
