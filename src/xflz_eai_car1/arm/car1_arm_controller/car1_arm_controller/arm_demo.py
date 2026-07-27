@@ -90,7 +90,7 @@ def main(args=None):
 
         # 3. 移动到抓取位置（使用关节角度）
         print("\n3. 移动到抓取位置")
-        demo.move_joints([0.0, -1.05, -1.05, -1.2, 0.0], duration=2.0)
+        demo.move_joints([0.0, 1.05, 1.05, 1.2, 0.0], duration=2.0)
         time.sleep(3.0)
 
         # 4. 闭合夹爪
@@ -100,12 +100,13 @@ def main(args=None):
 
         # 5. 提升
         print("\n5. 提升")
-        demo.move_joints([0.0, -0.85, -1.05, -1.2, 0.0], duration=2.0)
+        demo.move_joints([0.0, 0.85, 1.05, 1.2, 0.0], duration=2.0)
         time.sleep(3.0)
 
         # 6. 移动到目标位置（使用 IK）
         print("\n6. 移动到目标位置（IK）")
-        demo.move_to_pose(0.20, 0.10, 0.10)
+        # demo.move_to_pose(0.25, 0.04, -0.04)
+        demo.move_joints([0.5, 0.85, 1.05, 1.2, 0.0], duration=2.0)
         time.sleep(3.0)
 
         # 7. 释放
@@ -117,6 +118,8 @@ def main(args=None):
         print("\n8. 回到零位")
         demo.go_home()
         time.sleep(3.0)
+        demo.set_gripper(False)
+        time.sleep(2.0)
 
         print("\n=== 演示完成 ===\n")
 
