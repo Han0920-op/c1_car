@@ -3214,6 +3214,142 @@ ros2 service call /navigation_grasp_transport/start std_srvs/srv/Trigger
 
 ---
 
+### 5.8 手眼标定（深度相机-机械臂标定）
+
+> **目标**：标定深度相机相对于机械臂末端的精确变换矩阵（arm_link4 → camera_depth_optical_frame）  
+> **所需时间**：30-60 分钟（含数据采集）  
+> **前置条件**：
+>   - bringup（base_driver + servo_controller + robot_state_publisher）
+>   - arm_controller
+>   - depth_camera（HP60C 驱动）
+
+#### 5.8.1 原理简介
+
+手眼标定解决 AX=XB 方程：
+
+- **A** = 机械臂末端相对基座的变换（base_link → arm_link4，从 TF 树获取）
+- **B** = 标定板相对相机的变换（camera → tag，由 AprilTag 检测得到）
+- **X** = 相机相对机械臂末端的变换（arm_link4 → camera，待求）
+
+采集 8-14 个不同姿态的数据，通过 Tsai-Lenz 或 Horaud 算法求解 X，最终更新 URDF 中的 `camera_mount_joint`。
+
+#### 5.8.2 数据采集
+
+```bash
+ros2 launch eye_hand_calibration collect_data.launch.py
+```
+
+等待 10s 所有节点启动后，在另一个终端触发采集：
+
+```bash
+ros2 service call /eye_hand_calib/collect/start std_srvs/srv/Trigger
+```
+
+**流程说明**：
+1. 机械臂依次移动到 12-14 个预设姿态
+2. 每到一个姿态：等待稳定 → 读回真实舵机位置 → 等待 TF 传播 → 读取 TF → 检测 AprilTag → 保存数据
+3. 最少成功 8 个姿态才能进行标定
+
+**配置姿态**：编辑 `config/calibration_poses.yaml` 中的 `poses` 列表
+```yaml
+poses:
+  - [x, y, z, pitch]    # x/y/z: 末端目标位置(米), pitch: 俯仰角(弧度)
+```
+
+- pitch = 3.14159（π）= 相机竖直朝下
+- pitch = 2.80 ≈ 前倾 20°
+- pitch = 2.44 ≈ 前倾 40°
+
+> **建议**：pitch 变化越大，标定精度越高。但角度过大可能导致 AprilTag 跑出视野。
+
+#### 5.8.3 标定计算
+
+```bash
+# 自动查找最新会话并计算（推荐）
+ros2 launch eye_hand_calibration compute_calibration.launch.py
+
+# 指定会话目录
+ros2 launch eye_hand_calibration compute_calibration.launch.py \
+  data_dir:=/home/iflytek/.ros/eye_hand_calib/calibration_20260730_xxxxxx
+```
+
+**参数选项**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `algorithm` | `horaud` | 求解算法：`tsai`（经典）或 `horaud`（四元数法，更稳定） |
+| `pair_mode` | `first-ref` | 相对变换模式：`consecutive`（相邻对）、`all`（所有对）、`first-ref`（以首姿态为基准，推荐） |
+| `min_rotation` | `8` | 最小旋转角阈值(度)，过滤旋转太小的数值不稳定对 |
+
+使用命令行工具查看更多选项：
+
+```bash
+ros2 run eye_hand_calibration compute_hand_eye_transform --help
+```
+
+**离群点自动检测**：脚本会自动执行 leave-one-out 交叉验证，剔除导致标定结果剧烈变化的坏点（如 AprilTag 检测失败或 TF 异常的姿态）。
+
+#### 5.8.4 更新 URDF
+
+```bash
+# 先预览（不写入）
+ros2 run eye_hand_calibration generate_corrected_urdf --dry-run
+
+# 确认后写入
+ros2 run eye_hand_calibration generate_corrected_urdf
+
+# 重建 car1_description 使新 URDF 生效
+colcon build --packages-select car1_description
+source install/setup.bash
+# 重启所有 ROS2 节点
+```
+
+**注意**：
+- 脚本会备份原 URDF 为 `car1.urdf.bak`
+- 更新的是 `camera_mount_joint` 的 `origin xyz` 和 `rpy`
+- 必须修改源码 URDF（`src/` 下），然后 `colcon build` 同步到 install
+- 直接修改 install 目录的 URDF 会被 build 覆盖
+
+#### 5.8.5 标定质量说明
+
+**误差来源**：
+1. **机械臂运动学精度**：5-DOF 手臂的有效自由度有限（J3 近0°，J5 固定为0°），限制了末端指向变化范围
+2. **AprilTag 检测精度**：PnP 解算受图像分辨率、镜头畸变、光照影响
+3. **TF 传播时序**：舵机读回后需要等待 joint_states 和 robot_state_publisher 传播
+
+**典型精度**（单 AprilTag 固定位置）：
+
+| 指标 | 一般 | 良好 | 优秀 |
+|------|:---:|:---:|:---:|
+| 旋转误差 | <10° | <5° | <2° |
+| 平移误差 | <30mm | <15mm | <5mm |
+
+**提升精度的方法**：
+- 增加姿态多样性（不同 pitch、不同高度、左右大角度）
+- 确保 AprilTag 在每个姿态下位于相机视野中央区域
+- 提高 `settle_time` 给足稳定时间
+- 多次采集取平均
+
+#### 5.8.6 常见问题
+
+**Q: 所有姿态的 ee_transform 都一样？**
+A: 说明 TF 没有更新。检查 servo_controller 是否正常运行、`refresh_positions` 服务是否可调用。确认 data_collector 发布到 `/servo_controller` 而非底层舵机话题。
+
+**Q: 标定误差很大（>20°）？**
+A: 通常是某些姿态的 AprilTag 检测质量差（标签在视野边缘）。运行时会自动做离群检测剔除这些坏点。也可以用 `--pair-mode first-ref --algorithm horaud` 重新计算。
+
+**Q: URDF 更新后没变化？**
+A: 确认更新的是源码目录的 URDF，然后执行 `colcon build --packages-select car1_description` 重新安装。如果直接改了 install 目录，build 后会被覆盖。
+
+**Q: colcon build 后我的修改又没了？**
+A: `setup.py` 中的 `glob('config/*.yaml')` 在 build 时从源码目录复制文件到 install。编辑 install 下的文件无效，必须编辑 `src/.../eye_hand_calibration/config/` 下的源文件。
+
+**Q: 共 14 个姿态只成功采集了几个？**
+A: AprilTag 在某些极端角度下（如 pitch=2.44 前倾 40°）可能跑出相机视野。可以把 tag 放在更靠前的位置，或者减少极端 pitch 的姿态。
+
+---
+
+
 ## Level 6: 语音交互
 
 > **目标**：测试板载 ES8388 音频硬件，后续集成语音识别与语音合成  

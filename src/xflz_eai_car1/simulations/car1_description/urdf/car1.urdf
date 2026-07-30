@@ -813,8 +813,8 @@
     name="camera_mount_joint"
     type="fixed">
     <origin
-      xyz="-0.043626 -0.025127 0.068237"
-      rpy="0 0 -3.14038195" />
+      xyz="-0.045354 -0.007910 0.072940"
+      rpy="0.04051014 -0.15339309 3.06880636" />
     <parent
       link="arm_link4" />
     <child

@@ -15,6 +15,11 @@ landerpi/
 songjia_a1/
 xflz_robot_car1.zip
 
+# AI-generated design docs (keep local, don't commit)
+src/xflz_eai_car1/eye_hand_calibration/PLAN.md
+src/xflz_eai_car1/eye_hand_calibration/IMPLEMENTATION_SUMMARY.md
+src/xflz_eai_car1/eye_hand_calibration/README.md
+
 # Claude Code - ignore runtime/local data, keep engineering config
 .claude/settings.local.json
 .claude/projects/
