@@ -16,8 +16,6 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         # Config files
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
-        # Documentation
-        (os.path.join('share', package_name), ['README.md', 'PLAN.md', 'IMPLEMENTATION_SUMMARY.md']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
