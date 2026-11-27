@@ -11,6 +11,8 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 
+from car1_app.color_detection import denoise_mask
+
 
 class HSVDetectionTest(Node):
     def __init__(self):
@@ -63,8 +65,7 @@ class HSVDetectionTest(Node):
 
         # Morphological ops
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = denoise_mask(mask, kernel)
 
         # Publish both raw masks so you can SEE which red end catches the cube
         self.mask_lo_pub.publish(self.bridge.cv2_to_imgmsg(mask_lo, encoding='mono8'))

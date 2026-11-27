@@ -16,6 +16,12 @@ install(FILES package.xml
   DESTINATION share/${PROJECT_NAME}
 )
 
+# 按 launch 使用的可执行名安装现有 FK 演示脚本。
+install(PROGRAMS kinematics/fk_demo.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME fk_demo
+)
+
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )

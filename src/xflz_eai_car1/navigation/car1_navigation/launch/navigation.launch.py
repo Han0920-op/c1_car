@@ -8,22 +8,19 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def launch_setup(context, *args, **kwargs):
     bringup_pkg = get_package_share_directory('car1_bringup')
     peripherals_pkg = get_package_share_directory('car1_peripherals')
-    nav_pkg = get_package_search_directory('car1_navigation') if False else get_package_share_directory('car1_navigation')
+    nav_pkg = get_package_share_directory('car1_navigation')
 
-    # 直接使用源码目录下的地图路径（不依赖 install 目录）
-    maps_dir = os.path.expanduser('~/ros2_ws/src/xflz_eai_car1/slam/car1_slam/maps')
-
-    # 在运行时求值 LaunchConfiguration
+    # 默认读取已安装的地图，也支持从指定目录加载新保存的地图。
+    maps_dir = LaunchConfiguration('map_dir').perform(context)
     map_name = LaunchConfiguration('map').perform(context)
-    map_file = os.path.join(maps_dir, map_name + '.yaml')
-
-    # 使用源码目录的 RViz 配置
-    rviz_config = os.path.expanduser('~/ros2_ws/src/xflz_eai_car1/navigation/car1_navigation/rviz/navigation.rviz')
+    map_file = os.path.join(os.path.expanduser(maps_dir), map_name + '.yaml')
+    rviz_config = os.path.join(nav_pkg, 'rviz', 'navigation.rviz')
 
     # 1. Bringup
     bringup_launch = IncludeLaunchDescription(
@@ -72,7 +69,12 @@ def launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     map_arg = DeclareLaunchArgument(
         'map', default_value='slam_map',
-        description='Map name (without extension) under car1_slam/maps/')
+        description='Map name without the YAML extension')
+
+    map_dir_arg = DeclareLaunchArgument(
+        'map_dir',
+        default_value=PathJoinSubstitution([FindPackageShare('car1_slam'), 'maps']),
+        description='Directory containing the map YAML and image')
 
     use_rviz_arg = DeclareLaunchArgument(
         'use_rviz', default_value='true',
@@ -80,6 +82,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         map_arg,
+        map_dir_arg,
         use_rviz_arg,
         OpaqueFunction(function=launch_setup)
     ])

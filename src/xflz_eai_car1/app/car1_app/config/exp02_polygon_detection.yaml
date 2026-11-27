@@ -1,0 +1,11 @@
+exp02_polygon_detection:
+  ros__parameters:
+    # 静态样例默认使用系统时钟；跟随 Gazebo 时从 launch 开启仿真时间。
+    image_path: ""
+    use_sim_time: false
+    # 彩色物体配低饱和背景。纸面黑色图形改用 dark，亮图形配暗背景用 bright。
+    foreground_mode: saturation
+    threshold: 80
+    min_area: 500.0
+    # Ramer–Douglas–Peucker 容差等于轮廓周长乘以这个比例。
+    epsilon_ratio: 0.025

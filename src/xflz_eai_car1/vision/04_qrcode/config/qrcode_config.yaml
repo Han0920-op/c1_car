@@ -1,0 +1,15 @@
+generate:
+  version: 1
+  error_correction: M
+  box_size: 5
+  border: 4
+  fill_color: [0, 0, 0]
+  back_color: [255, 255, 255]
+detect:
+  scale: 0.5
+source:
+  ros:
+    rgb_topic: /ascamera_hp60c/camera_publisher/rgb0/image
+    timeout: 5.0
+display:
+  window_name: qrcode

@@ -63,6 +63,10 @@ class ObjectDetector(Node):
             depth=1
         )
 
+        # 仿真 launch 指定与 Gazebo 传感器姿态一致的光学坐标系。
+        self.declare_parameter('optical_frame', 'camera_depth_optical_frame')
+        self.optical_frame = self.get_parameter('optical_frame').value
+
         # 订阅
         self.color_sub = self.create_subscription(
             Image, '/camera/image', self.color_callback, sensor_qos)
@@ -168,10 +172,10 @@ class ObjectDetector(Node):
             f'检测: 像素({u}, {v}), 深度={z_optical:.3f}m, '
             f'光学坐标=({x_optical:.3f}, {y_optical:.3f}, {z_optical:.3f})')
 
-        # TF 变换: camera_depth_optical_frame → base_link
+        # TF 变换：相机光学坐标 → base_link
         try:
             transform = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_depth_optical_frame',
+                'base_link', self.optical_frame,
                 rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.5))
         except TransformException as e:
             self.get_logger().warn(f'TF 查询失败: {e}')
@@ -185,7 +189,7 @@ class ObjectDetector(Node):
         qx, qy, qz, qw = r.x, r.y, r.z, r.w
         rot = self._quat_to_matrix(qx, qy, qz, qw)
 
-        # camera_depth_optical_frame 下的点（已经是光学坐标系）
+        # 以相机光学坐标表示的点
         pt_optical = np.array([x_optical, y_optical, z_optical])
         # 变换到 base_link
         pt_base = rot @ pt_optical + np.array([t.x, t.y, t.z])

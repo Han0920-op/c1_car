@@ -1,0 +1,23 @@
+newmtl triangle
+Ka 0.922 0.275 0.176
+Kd 0.922 0.275 0.176
+Ks 0 0 0
+illum 1
+
+newmtl quadrilateral
+Ka 0.255 0.863 0.176
+Kd 0.255 0.863 0.176
+Ks 0 0 0
+illum 1
+
+newmtl pentagon
+Ka 0.176 0.294 0.922
+Kd 0.176 0.294 0.922
+Ks 0 0 0
+illum 1
+
+newmtl hexagon
+Ka 0.922 0.843 0.176
+Kd 0.922 0.843 0.176
+Ks 0 0 0
+illum 1

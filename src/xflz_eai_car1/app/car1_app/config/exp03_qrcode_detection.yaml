@@ -1,0 +1,7 @@
+exp03_qrcode_detection:
+  ros__parameters:
+    # 静态样例默认使用系统时钟；跟随 Gazebo 时从 launch 开启仿真时间。
+    image_path: ""
+    use_sim_time: false
+    # 课程默认在半分辨率图像上定位和解码。
+    detect_scale: 0.5

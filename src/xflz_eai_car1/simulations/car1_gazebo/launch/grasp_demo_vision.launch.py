@@ -1,5 +1,6 @@
 import os
 import subprocess
+from shlex import quote
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -18,10 +19,15 @@ def setup_simulation(context, *args, **kwargs):
     car1_description_path = get_package_share_directory('car1_description')
 
     use_sim_time = LaunchConfiguration('use_sim_time').perform(context)
+    camera_only = LaunchConfiguration('camera_only').perform(context)
+    fortress = LaunchConfiguration('fortress').perform(context).lower() == 'true'
+    server_only = LaunchConfiguration('server_only').perform(context).lower() == 'true'
+    optical_frame = 'camera_sim_optical_frame'
+    gz_msgs = 'ignition.msgs' if fortress else 'gz.msgs'
 
     # 处理 URDF
     xacro_file = os.path.join(car1_gazebo_path, 'urdf', 'car1.gazebo.xacro')
-    urdf_content = subprocess.check_output(['xacro', xacro_file]).decode('utf-8')
+    urdf_content = subprocess.check_output(['xacro', xacro_file, f'camera_only:={camera_only}']).decode('utf-8')
 
     meshes_path = os.path.join(car1_description_path, 'meshes')
     urdf_content = urdf_content.replace(
@@ -31,19 +37,20 @@ def setup_simulation(context, *args, **kwargs):
 
     # 启动 Gazebo（使用包含 Sensors 插件的自定义 world）
     world_file = os.path.join(car1_gazebo_path, 'worlds', 'camera_demo.sdf')
+    gz_args = f'-r {"-s " if server_only else ""}{quote(world_file)}'
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             os.path.join(get_package_share_directory('ros_gz_sim'),
                          'launch', 'gz_sim.launch.py')
         ]),
-        launch_arguments={'gz_args': [f'-r {world_file}']}.items()
+        launch_arguments={'gz_args': gz_args}.items()
     )
 
     # Gazebo-ROS 时钟桥接
     clock_bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
-        arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
+        arguments=[f'/clock@rosgraph_msgs/msg/Clock[{gz_msgs}.Clock'],
         output='screen'
     )
 
@@ -52,13 +59,16 @@ def setup_simulation(context, *args, **kwargs):
         package='ros_gz_bridge',
         executable='parameter_bridge',
         arguments=[
-            '/camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
-            '/camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
-            '/camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
-            '/camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+            f'/camera/image@sensor_msgs/msg/Image[{gz_msgs}.Image',
+            f'/camera/depth_image@sensor_msgs/msg/Image[{gz_msgs}.Image',
+            f'/camera/points@sensor_msgs/msg/PointCloud2[{gz_msgs}.PointCloudPacked',
+            f'/camera/camera_info@sensor_msgs/msg/CameraInfo[{gz_msgs}.CameraInfo',
         ],
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time == 'true'}]
+        parameters=[{
+            'use_sim_time': use_sim_time == 'true',
+            'override_frame_id': optical_frame,
+        }]
     )
 
     # Robot State Publisher
@@ -72,18 +82,6 @@ def setup_simulation(context, *args, **kwargs):
         }]
     )
 
-    # Joint State Publisher
-    joint_state_publisher = Node(
-        package='joint_state_publisher',
-        executable='joint_state_publisher',
-        output='screen',
-        parameters=[{
-            'source_list': ['/controller_manager/joint_states'],
-            'rate': 20.0,
-            'use_sim_time': use_sim_time == 'true'
-        }]
-    )
-
     # 生成机器人
     spawn_robot = Node(
         package='ros_gz_sim',
@@ -91,14 +89,38 @@ def setup_simulation(context, *args, **kwargs):
         output='screen',
         arguments=[
             '-topic', 'robot_description',
-            '-name', 'car1',
+            '-world', 'camera_demo', '-name', 'car1',
             '-allow_renaming', 'true',
             '-x', '0', '-y', '0', '-z', '0.1'
         ],
         parameters=[{'use_sim_time': True}]
     )
 
-    # 生成立方体 (红色方块，在机器人前方)
+    if camera_only.lower() == 'true':
+        # 固定模型用默认零位关节状态发布 TF，抓取模式使用控制器反馈。
+        joint_state_publisher = Node(
+            package='joint_state_publisher',
+            executable='joint_state_publisher',
+            output='screen',
+            parameters=[{'use_sim_time': use_sim_time == 'true'}],
+        )
+
+        # 保留红球检查，课程实验复用同一固定相机。
+        target_model = LaunchConfiguration('camera_target').perform(context)
+        spawn_target = Node(
+            package='ros_gz_sim',
+            executable='create',
+            output='screen',
+            arguments=[
+                '-world', 'camera_demo',
+                '-file', os.path.join(car1_gazebo_path, 'models', target_model, 'model.sdf'),
+                '-name', target_model, '-x', '0.28', '-y', '0', '-z', '0.035',
+            ],
+        )
+        return [gazebo, clock_bridge, camera_bridge, robot_state_publisher,
+                joint_state_publisher, spawn_robot, spawn_target]
+
+    # 保留原有演示使用的动态红方块。
     cube_sdf_path = os.path.join(car1_gazebo_path, 'models', 'cube', 'model.sdf')
     cube_x = LaunchConfiguration('cube_x').perform(context)
     cube_y = LaunchConfiguration('cube_y').perform(context)
@@ -108,7 +130,7 @@ def setup_simulation(context, *args, **kwargs):
         output='screen',
         arguments=[
             '-file', cube_sdf_path,
-            '-name', 'red_cube',
+            '-world', 'camera_demo', '-name', 'red_cube',
             '-x', cube_x, '-y', cube_y, '-z', '0.02'
         ],
         parameters=[{'use_sim_time': True}]
@@ -145,7 +167,7 @@ def setup_simulation(context, *args, **kwargs):
         executable='object_detector.py',
         name='object_detector',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time == 'true'}]
+        parameters=[{'use_sim_time': use_sim_time == 'true', 'optical_frame': optical_frame}]
     )
 
     # 视觉抓取节点
@@ -161,7 +183,6 @@ def setup_simulation(context, *args, **kwargs):
         gazebo,
         clock_bridge,
         robot_state_publisher,
-        joint_state_publisher,
         spawn_robot,
         camera_bridge,
         spawn_cube,
@@ -198,6 +219,16 @@ def setup_simulation(context, *args, **kwargs):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
+        DeclareLaunchArgument('camera_only', default_value='false', choices=['true', 'false'],
+                              description='Use a fixed robot and red sphere for camera checks'),
+        DeclareLaunchArgument('camera_target', default_value='red_ball',
+                              choices=['red_ball', 'exp01_color_targets', 'exp02_polygon_targets',
+                                       'exp03_qrcode_target'],
+                              description='Target model used only in camera-only mode'),
+        DeclareLaunchArgument('fortress', default_value='false', choices=['true', 'false'],
+                              description='Use Ignition Fortress bridge message names'),
+        DeclareLaunchArgument('server_only', default_value='false', choices=['true', 'false'],
+                              description='Run Gazebo without its GUI; sensor rendering stays enabled'),
         DeclareLaunchArgument(
             'cube_x', default_value='0.28',
             description='立方体 X 坐标 (base_link 坐标系)'

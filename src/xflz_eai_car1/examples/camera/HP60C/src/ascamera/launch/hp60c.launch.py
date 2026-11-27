@@ -1,3 +1,6 @@
+from os.path import join
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
@@ -14,7 +17,7 @@ def generate_launch_description():
         parameters=[
             {"usb_bus_no": -1},
             {"usb_path": "null"},
-            {"confiPath": "/home/iflytek/ros2_ws/src/xflz_eai_car1/examples/camera/HP60C/src/ascamera/configurationfiles"},
+            {"confiPath": join(get_package_share_directory('ascamera'), 'configurationfiles')},
             {"color_pcl": False},
             {"pub_tfTree": True},
             {"depth_width": 640},

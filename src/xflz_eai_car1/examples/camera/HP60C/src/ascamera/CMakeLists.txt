@@ -44,7 +44,6 @@ find_package(tf2_ros REQUIRED)
 # find_package(tf2_geometry_msgs REQUIRED)
 
 include_directories(
-  ${catkin_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/libs/include
 )
@@ -99,7 +98,8 @@ file(GLOB ASCAMERA_VENDOR_LIBS ${ASCAMERA_LIB_DIR}/*.so)
 install(FILES ${ASCAMERA_VENDOR_LIBS}
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch
+# 安装相机配置，启动时从包的 share 目录读取。
+install(DIRECTORY launch configurationfiles
   DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)

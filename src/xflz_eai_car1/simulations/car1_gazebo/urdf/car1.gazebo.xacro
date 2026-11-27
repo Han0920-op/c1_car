@@ -2,6 +2,8 @@
 <robot name="car1" xmlns:xacro="http://ros.org/wiki/xacro">
     <xacro:arg name="prefix" default=""/>
 
+    <xacro:arg name="camera_only" default="false"/>
+
     <!-- 引入基础 URDF -->
     <xacro:include filename="$(find car1_description)/urdf/car1.urdf"/>
 
@@ -18,23 +20,33 @@
     <!-- 应用 Transmission -->
     <xacro:car1_transmission prefix="$(arg prefix)"/>
 
-    <!-- 应用 ros2_control -->
-    <xacro:car1_gazebo_ros2_control name="GazeboSimSystem"/>
+    <xacro:if value="$(arg camera_only)">
+        <!-- 固定模型零位，隔离控制器与抓取动作，便于复查相机。 -->
+        <gazebo>
+            <static>true</static>
+        </gazebo>
+    </xacro:if>
 
-    <!-- Gazebo 插件 -->
-    <gazebo>
-        <!-- ros2_control 插件 -->
-        <plugin filename="libgz_ros2_control-system.so"
-                name="gz_ros2_control::GazeboSimROS2ControlPlugin">
-            <parameters>$(find car1_gazebo)/config/ros2_controllers.yaml</parameters>
-        </plugin>
+    <xacro:unless value="$(arg camera_only)">
+        <!-- 应用 ros2_control -->
+        <xacro:car1_gazebo_ros2_control name="GazeboSimSystem"/>
 
-        <!-- 关节状态发布器 -->
-        <plugin filename="libignition-gazebo-joint-state-publisher-system.so"
-                name="ignition::gazebo::systems::JointStatePublisher">
-            <topic>joint_states</topic>
-        </plugin>
-    </gazebo>
+        <!-- Gazebo 插件 -->
+        <gazebo>
+            <!-- ros2_control 插件 -->
+            <plugin filename="libgz_ros2_control-system.so"
+                    name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+                <parameters>$(find car1_gazebo)/config/ros2_controllers.yaml</parameters>
+            </plugin>
+
+            <!-- 关节状态发布器 -->
+            <plugin filename="libignition-gazebo-joint-state-publisher-system.so"
+                    name="ignition::gazebo::systems::JointStatePublisher">
+                <topic>joint_states</topic>
+            </plugin>
+        </gazebo>
+
+    </xacro:unless>
 
     <!-- 保留相机相关的 fixed joint，防止 Gazebo 合并 link -->
     <gazebo reference="camera_mount_joint">
@@ -44,12 +56,30 @@
         <preserveFixedJoint>true</preserveFixedJoint>
     </gazebo>
 
+    <!-- 零位时原相机 +X 向上。仅校正仿真传感器，使光轴朝车前下方约 66°。 -->
+    <xacro:property name="sim_camera_rpy" value="-3.06868039 0.57047684 3.13119010"/>
+    <link name="camera_sim_link"/>
+    <joint name="camera_sim_joint" type="fixed">
+        <parent link="camera_depth_link"/>
+        <child link="camera_sim_link"/>
+        <origin xyz="0 0 0" rpy="${sim_camera_rpy}"/>
+    </joint>
+    <link name="camera_sim_optical_frame"/>
+    <joint name="camera_sim_optical_joint" type="fixed">
+        <parent link="camera_sim_link"/>
+        <child link="camera_sim_optical_frame"/>
+        <origin xyz="0 0 0" rpy="-1.57079633 0 -1.57079633"/>
+    </joint>
+
+    <!-- Gazebo 传感器与 ROS 光学 TF 使用同一个安装旋转。 -->
     <!-- 深度相机传感器 (安思疆 HP60C 参数) -->
     <gazebo reference="camera_depth_link">
         <sensor name="depth_camera" type="rgbd_camera">
+            <pose>0 0 0 ${sim_camera_rpy}</pose>
             <topic>/camera</topic>
             <update_rate>20</update_rate>
             <camera>
+                <optical_frame_id>camera_sim_optical_frame</optical_frame_id>
                 <horizontal_fov>1.288</horizontal_fov>
                 <image>
                     <width>640</width>

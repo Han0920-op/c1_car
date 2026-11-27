@@ -64,16 +64,19 @@ def generate_launch_description():
         )
     )
 
-    # Init pose
+    # 真机上电只启动控制节点，初始化姿态需要显式启用。
+    init_pose_arg = DeclareLaunchArgument('enable_init_pose', default_value='false')
     init_pose_node = Node(
         package='controller',
         executable='init_pose',
         name='init_pose',
         parameters=[init_pose_config],
+        condition=IfCondition(LaunchConfiguration('enable_init_pose')),
         output='screen'
     )
 
     return LaunchDescription([
+        init_pose_arg,
         imu_filter_node,
         odom_publisher_node,
         ekf_node,

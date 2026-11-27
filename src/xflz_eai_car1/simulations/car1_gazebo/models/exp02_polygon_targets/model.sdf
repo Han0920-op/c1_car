@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <model name="exp02_polygon_targets">
+    <static>true</static>
+    <link name="targets">
+      <!-- 四个薄板在车体左前方分两排摆放，彩色表面便于从灰色地面分割。 -->
+      <visual name="triangle">
+        <pose>0 0.17 -0.033 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://exp02_polygon_targets/meshes/triangle.obj</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.922 0.275 0.176 1</ambient>
+          <diffuse>0.922 0.275 0.176 1</diffuse>
+        </material>
+      </visual>
+      <visual name="quadrilateral">
+        <pose>0 0.34 -0.033 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://exp02_polygon_targets/meshes/quadrilateral.obj</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.255 0.863 0.176 1</ambient>
+          <diffuse>0.255 0.863 0.176 1</diffuse>
+        </material>
+      </visual>
+      <visual name="pentagon">
+        <pose>0.19 0.17 -0.033 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://exp02_polygon_targets/meshes/pentagon.obj</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.176 0.294 0.922 1</ambient>
+          <diffuse>0.176 0.294 0.922 1</diffuse>
+        </material>
+      </visual>
+      <visual name="hexagon">
+        <pose>0.19 0.34 -0.033 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://exp02_polygon_targets/meshes/hexagon.obj</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.922 0.843 0.176 1</ambient>
+          <diffuse>0.922 0.843 0.176 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

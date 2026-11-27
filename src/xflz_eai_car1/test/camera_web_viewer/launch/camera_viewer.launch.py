@@ -1,3 +1,6 @@
+from os.path import join
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
@@ -5,7 +8,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     ld = LaunchDescription()
 
-    confi_path = '/home/iflytek/ros2_ws/src/xflz_eai_car1/examples/camera/HP60C/src/ascamera/configurationfiles'
+    confi_path = join(get_package_share_directory('ascamera'), 'configurationfiles')
 
     # HP60C camera node (color_pcl enabled so the point cloud carries RGB)
     ascamera_node = Node(

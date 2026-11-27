@@ -13,6 +13,9 @@ and the camera NEVER streams. So we keep the driver's native topic names:
   /ascamera_hp60c/camera_publisher/depth0/points
 Downstream nodes (visual_grasp) subscribe to these native names directly.
 """
+from os.path import join
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
@@ -25,7 +28,7 @@ def generate_launch_description():
         respawn=False,
         output='both',
         parameters=[
-            {"confiPath": "/home/iflytek/ros2_ws/src/xflz_eai_car1/examples/camera/HP60C/src/ascamera/configurationfiles"},
+            {"confiPath": join(get_package_share_directory('ascamera'), 'configurationfiles')},
             {"usb_bus_no": -1},
             {"usb_path": "null"},
             {"color_pcl": False},

@@ -13,12 +13,21 @@ def generate_launch_description():
     nav_pkg = get_package_share_directory('car1_navigation')
     nav2_params = os.path.join(nav_pkg, 'config', 'nav2_params.yaml')
 
+    # 行为树与导航包一起安装，从包路径解析 XML。
+    bt_dir = os.path.join(nav_pkg, 'config', 'behavior_trees')
+
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     sim_time_arg = DeclareLaunchArgument('use_sim_time', default_value='false')
 
     configured_params = RewrittenYaml(
         source_file=nav2_params,
-        param_rewrites={'use_sim_time': use_sim_time},
+        param_rewrites={
+            'use_sim_time': use_sim_time,
+            'default_nav_to_pose_bt_xml': os.path.join(
+                bt_dir, 'navigate_to_pose_without_backup.xml'),
+            'default_nav_through_poses_bt_xml': os.path.join(
+                bt_dir, 'navigate_through_poses_without_backup.xml'),
+        },
         convert_types=True
     )
 

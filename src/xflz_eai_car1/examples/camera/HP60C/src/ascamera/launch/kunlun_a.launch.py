@@ -1,3 +1,6 @@
+from os.path import join
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
@@ -18,7 +21,7 @@ def generate_launch_description():
             {"fps": -1},
             {"usb_bus_no": -1},
             {"usb_path": "null"},
-            {"confiPath": "./ascamera/configurationfiles"},
+            {"confiPath": join(get_package_share_directory('ascamera'), 'configurationfiles')},
             {"color_pcl": False},
         ],
         remappings=[]

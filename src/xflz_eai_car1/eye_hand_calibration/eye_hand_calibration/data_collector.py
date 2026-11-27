@@ -21,7 +21,6 @@
 """
 
 import os
-import sys
 import time
 import math
 import yaml
@@ -61,9 +60,6 @@ class DataCollectorNode(Node):
       - 深度图中标签中心的深度值
       - RGB 和深度图像（可选保存）
     """
-
-    # IK 求解器路径（硬编码，install后__file__路径会变，不能用__file__推导）
-    _IK_PATH = '/home/iflytek/ros2_ws/src/xflz_eai_car1/arm/kinematics/kinematics'
 
     def __init__(self):
         super().__init__('data_collector')
@@ -377,14 +373,12 @@ class DataCollectorNode(Node):
         直接发底层舵机话题移动机械臂（绕过 arm_controller）。
         IK 求解器由 x/y 坐标自动算出 J1（偏航角），无需外部传入 yaw。
         """
-        # 使用硬编码绝对路径导入 IK 求解器
-        # （用 __file__ 推导在 colcon install 后路径会变，不可靠）
+        # 从 ROS 工作区已安装的运动学包复用 IK 求解器。
         try:
-            if self._IK_PATH not in sys.path:
-                sys.path.insert(0, self._IK_PATH)
-            from ik_analytical import solve_analytical_ik_auto_pitch, Point3D
+            from kinematics.config import Point3D
+            from kinematics.ik_analytical import solve_analytical_ik_auto_pitch
         except ImportError as e:
-            self.get_logger().error(f'IK 求解器导入失败: {e}  路径: {self._IK_PATH}')
+            self.get_logger().error(f'IK 求解器导入失败: {e}')
             return False
 
         # IK 求解

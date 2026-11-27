@@ -1,0 +1,12 @@
+exp01_color_detection:
+  ros__parameters:
+    # 静态样例默认使用系统时钟；跟随 Gazebo 时从 launch 开启仿真时间。
+    image_path: ""
+    use_sim_time: false
+    min_area: 250.0
+    hsv:
+      # 下界 H 大于上界表示跨过 179 → 0，S/V 仍是普通闭区间。
+      red: {lower: [170, 100, 70], upper: [10, 255, 255]}
+      green: {lower: [40, 90, 70], upper: [85, 255, 255]}
+      blue: {lower: [95, 90, 70], upper: [135, 255, 255]}
+      yellow: {lower: [20, 90, 70], upper: [35, 255, 255]}

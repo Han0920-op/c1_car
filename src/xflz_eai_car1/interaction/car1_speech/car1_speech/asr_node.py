@@ -8,7 +8,6 @@ Supports: iFlytek, Baidu, Google, Whisper, etc.
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Bool
-from sensor_msgs.msg import Audio
 
 
 class ASRNode(Node):

@@ -1,39 +1,23 @@
-# xflz_robot_car1_ros2_ws
+# C1 智能小车 ROS 2 工作区
 
-#### 介绍
-{**以下是 Gitee 平台说明，您可以替换此简介**
-Gitee 是 OSCHINA 推出的基于 Git 的代码托管平台（同时支持 SVN）。专为开发者提供稳定、高效、安全的云端软件开发协作平台
-无论是个人、团队、或是企业，都能够用 Gitee 实现代码托管、项目管理、协作开发。企业项目请看 [https://gitee.com/enterprises](https://gitee.com/enterprises)}
+本项目用于学习相机感知、机械臂、底盘、建图和导航。学习环境为 Ubuntu 22.04、ROS 2 Humble 和 Gazebo Ignition Fortress。三个基础视觉实验均可单独运行，默认只输出识别结果。
 
-#### 软件架构
-软件架构说明
+| 我想做什么 | 从哪里开始 |
+|---|---|
+| 第一次运行、了解 23 个功能包和三个实验的代码 | [初学者学习指南](docs/LEARNING_GUIDE.md) |
+| 在 Gazebo 看相机原图、掩膜和检测结果 | [仿真指南](docs/SIMULATION_GUIDE.md) |
+| 把同一实验切换到 HP60C | [真机指南](docs/REAL_ROBOT_GUIDE.md) |
+| 核对已通过、尚未验收的功能及修改文件 | [最终验收报告](docs/TEST_REPORT.md) |
+| 按课程逐步学习 | [颜色识别](docs/EXP01_COLOR_DETECTION.md)、[多边形描绘](docs/EXP02_POLYGON_DETECTION.md)、[二维码生成与识别](docs/EXP03_QRCODE_DETECTION.md) |
 
+安装依赖后，在仓库根目录用一张图片做首次自检。成功后可在另一已加载工作区的终端运行 `ros2 run rqt_image_view rqt_image_view`，选择 `/exp01_color_detection/result`。
 
-#### 安装教程
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select car1_app
+source install/setup.bash
+ros2 launch car1_app exp01_color_detection.launch.py \
+  image_path:="$(ros2 pkg prefix --share car1_app)/images/exp01_colors.png"
+```
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
-
-#### 使用说明
-
-1.  xxxx
-2.  xxxx
-3.  xxxx
-
-#### 参与贡献
-
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
-
-
-#### 特技
-
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+[课程主页](https://course-generate-agent.pages.dev/courses/core/exp001-robot-vision/) · [项目开发规范](AGENTS.md) · [源码审计](docs/PROJECT_AUDIT.md)

@@ -3,7 +3,8 @@ from ament_index_python.packages import get_package_share_directory
 
 from launch_ros.actions import Node
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.substitutions import LaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 
@@ -20,6 +21,7 @@ def generate_launch_description():
         robot_desc = f.read()
 
     bringup_description = LaunchDescription([
+        DeclareLaunchArgument('enable_init_pose', default_value='false'),
         # 1. Board-level driver (serial communication with STM32)
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -52,6 +54,7 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(chassis_pkg, 'launch/chassis_controller.launch.py')),
+            launch_arguments={'enable_init_pose': LaunchConfiguration('enable_init_pose')}.items(),
         ),
     ])
 

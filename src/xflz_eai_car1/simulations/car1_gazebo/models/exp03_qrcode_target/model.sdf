@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <model name="exp03_qrcode_target">
+    <static>true</static>
+    <link name="target">
+      <!-- 向车前偏移 0.14 m、向左偏移 0.18 m，避开相机画面右侧的车体。白板边长 0.22 m，含四格静区；黑色模块高于板面 0.4 mm，避免闪烁。 -->
+      <visual name="white_board">
+        <pose>0.14 0.18 -0.028 0 0 0</pose>
+        <cast_shadows>false</cast_shadows>
+        <geometry><box><size>0.22 0.22 0.01</size></box></geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
+          <emissive>0.5 0.5 0.5 1</emissive>
+        </material>
+      </visual>
+      <visual name="black_modules">
+        <pose>0.14 0.18 -0.0226 0 0 0</pose>
+        <cast_shadows>false</cast_shadows>
+        <geometry>
+          <mesh><uri>model://exp03_qrcode_target/meshes/modules.obj</uri></mesh>
+        </geometry>
+        <material>
+          <ambient>0 0 0 1</ambient>
+          <diffuse>0 0 0 1</diffuse>
+          <specular>0 0 0 1</specular>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
